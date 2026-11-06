@@ -47,23 +47,26 @@ var _ = cssutil.WriteCSS(`
 	border-radius: 6px;
 	background-color: alpha(@theme_fg_color, 0.04);
 }
-.glup-md-codeblock-bar {
-	padding: 4px 8px;
+.glup-md-codeblock-bar,
+.glup-md-code-header {
+	padding: 4px 8px 4px 12px;
 	background-color: alpha(@theme_fg_color, 0.06);
 	border-bottom: 1px solid alpha(@borders, 0.4);
 	border-top-left-radius: 5px;
 	border-top-right-radius: 5px;
 }
-.glup-md-codeblock-lang {
+.glup-md-codeblock-lang,
+.glup-md-code-lang {
 	font-family: monospace;
 	font-size: 0.85em;
 	opacity: 0.7;
 	font-weight: 600;
 }
-.glup-md-codeblock-copy {
-	padding: 2px 4px;
-	min-height: 20px;
-	min-width: 20px;
+.glup-md-codeblock-copy,
+.glup-md-code-copy {
+	padding: 2px;
+	min-height: 24px;
+	min-width: 24px;
 }
 .glup-md-codeblock-text {
 	font-family: monospace;
@@ -129,7 +132,11 @@ type View struct {
 	committedBox *gtk.Box
 	tailBox      *gtk.Box
 
+	committedWidgets []gtk.Widgetter
+	tailWidgets      []gtk.Widgetter
+
 	mu       sync.Mutex
+	engine   *Engine
 	streamer *Streamer
 	closed   atomic.Bool
 	epoch    uint64
@@ -167,8 +174,11 @@ func (v *View) AppendDelta(delta string) {
 	}
 	v.mu.Lock()
 	if v.streamer == nil {
+		if v.engine == nil {
+			v.engine = NewEngine()
+		}
 		epoch := v.epoch
-		v.streamer = NewStreamer(DefaultInterval, func(patch RenderPatch) {
+		v.streamer = NewStreamerWithEngine(DefaultInterval, v.engine, func(patch RenderPatch) {
 			v.schedulePatch(epoch, patch)
 		})
 	}
@@ -186,22 +196,16 @@ func (v *View) SetStatic(markdown string) {
 	}
 	v.stopStreamer()
 
-	clearBox(v.committedBox)
-	clearBox(v.tailBox)
-	v.tailBox.SetVisible(false)
+	v.clearCommitted()
+	v.clearTail()
 
-	blocks := ParseStatic(markdown)
-	if len(blocks) == 0 {
-		v.committedBox.SetVisible(false)
-		return
-	}
+	v.mu.Lock()
+	v.engine = NewEngine()
+	v.engine.Append(markdown)
+	p, _ := v.engine.Flush()
+	v.mu.Unlock()
 
-	for _, blk := range blocks {
-		if w := renderBlock(v.ctx, blk.Node, blk.Source); w != nil {
-			v.committedBox.Append(w)
-		}
-	}
-	v.committedBox.SetVisible(true)
+	v.applyPatch(p)
 }
 
 // Finalize flushes any pending streaming tokens and commits all remaining blocks.
@@ -212,7 +216,7 @@ func (v *View) Finalize(fullText string) {
 	v.mu.Lock()
 	s := v.streamer
 	v.streamer = nil
-	epoch := v.epoch
+	eng := v.engine
 	v.mu.Unlock()
 
 	if s != nil {
@@ -220,14 +224,14 @@ func (v *View) Finalize(fullText string) {
 		return
 	}
 
-	if fullText != "" {
-		patch := RenderPatch{
-			Committed: ParseStatic(fullText),
-			Tail:      nil,
-			Final:     true,
-		}
-		v.schedulePatch(epoch, patch)
+	if eng == nil {
+		eng = NewEngine()
+		v.mu.Lock()
+		v.engine = eng
+		v.mu.Unlock()
 	}
+	patch := eng.Finalize(fullText)
+	v.applyPatch(patch)
 }
 
 // Close stops any active background streaming worker and prevents further UI updates.
@@ -269,32 +273,84 @@ func (v *View) schedulePatch(epoch uint64, patch RenderPatch) {
 }
 
 func (v *View) applyPatch(patch RenderPatch) {
+	if patch.ResetCommitted {
+		v.clearCommitted()
+		v.clearTail()
+	}
+
 	if len(patch.Committed) > 0 {
 		for _, blk := range patch.Committed {
 			if w := renderBlock(v.ctx, blk.Node, blk.Source); w != nil {
+				v.committedWidgets = append(v.committedWidgets, w)
 				v.committedBox.Append(w)
 			}
 		}
 		v.committedBox.SetVisible(true)
 	}
 
-	clearBox(v.tailBox)
+	v.clearTail()
 	if patch.Tail != nil && !patch.Final {
 		if w := renderBlock(v.ctx, patch.Tail.Node, patch.Tail.Source); w != nil {
+			v.tailWidgets = append(v.tailWidgets, w)
 			v.tailBox.Append(w)
 			v.tailBox.SetVisible(true)
-		} else {
-			v.tailBox.SetVisible(false)
 		}
-	} else {
-		v.tailBox.SetVisible(false)
 	}
 }
 
-func clearBox(b *gtk.Box) {
-	for child := b.FirstChild(); child != nil; child = b.FirstChild() {
-		b.Remove(child)
+func (v *View) clearCommitted() {
+	for _, w := range v.committedWidgets {
+		v.committedBox.Remove(w)
 	}
+	v.committedWidgets = v.committedWidgets[:0]
+	v.committedBox.SetVisible(false)
+}
+
+func (v *View) clearTail() {
+	for _, w := range v.tailWidgets {
+		v.tailBox.Remove(w)
+	}
+	v.tailWidgets = v.tailWidgets[:0]
+	v.tailBox.SetVisible(false)
+}
+
+// CommittedWidgets returns the rendered widgets for all visible blocks (committed and active tail).
+func (v *View) CommittedWidgets() []gtk.Widgetter {
+	total := len(v.committedWidgets) + len(v.tailWidgets)
+	if total == 0 {
+		return nil
+	}
+	res := make([]gtk.Widgetter, 0, total)
+	res = append(res, v.committedWidgets...)
+	res = append(res, v.tailWidgets...)
+	return res
+}
+
+// CodeBlock represents a rendered fenced or indented code block widget.
+type CodeBlock struct {
+	*gtk.Box
+	LangLabel *gtk.Label
+	CopyBtn   *gtk.Button
+	TextView  *gtk.TextView
+}
+
+// ListBlock represents a rendered markdown list widget.
+type ListBlock struct {
+	*gtk.Box
+	Items []*ListItemBlock
+}
+
+// ListItemBlock represents an individual list item in a rendered markdown list.
+type ListItemBlock struct {
+	*gtk.Box
+	Bullet  *gtk.Label
+	Content *gtk.Box
+}
+
+// TableGrid represents a rendered markdown table widget.
+type TableGrid struct {
+	*gtk.Grid
+	Labels []*gtk.Label
 }
 
 func renderBlock(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
@@ -356,6 +412,7 @@ func renderBlock(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 		listBox := gtk.NewBox(gtk.OrientationVertical, 4)
 		listBox.AddCSSClass("glup-md-list")
 		idx := n.Start
+		var items []*ListItemBlock
 		for item := n.FirstChild(); item != nil; item = item.NextSibling() {
 			if listItem, ok := item.(*ast.ListItem); ok {
 				itemBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
@@ -384,58 +441,21 @@ func renderBlock(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 				itemBox.Append(bullet)
 				itemBox.Append(contentBox)
 				listBox.Append(itemBox)
+				items = append(items, &ListItemBlock{
+					Box:     itemBox,
+					Bullet:  bullet,
+					Content: contentBox,
+				})
 			}
 		}
-		return listBox
+		return &ListBlock{
+			Box:   listBox,
+			Items: items,
+		}
 
 	case *ast.FencedCodeBlock, *ast.CodeBlock:
 		codeText, lang := extractCodeText(n, src)
-
-		codeBox := gtk.NewBox(gtk.OrientationVertical, 0)
-		codeBox.AddCSSClass("glup-md-codeblock")
-		codeBox.AddCSSClass("md-codeblock")
-
-		topBar := gtk.NewBox(gtk.OrientationHorizontal, 0)
-		topBar.AddCSSClass("glup-md-codeblock-bar")
-
-		langLabel := gtk.NewLabel(lang)
-		langLabel.AddCSSClass("glup-md-codeblock-lang")
-		langLabel.SetHExpand(true)
-		langLabel.SetXAlign(0)
-		topBar.Append(langLabel)
-
-		copyBtn := gtk.NewButtonFromIconName("edit-copy-symbolic")
-		copyBtn.AddCSSClass("flat")
-		copyBtn.AddCSSClass("glup-md-codeblock-copy")
-		copyBtn.SetTooltipText("Copy code")
-		copyBtn.ConnectClicked(func() {
-			if d := gdk.DisplayGetDefault(); d != nil {
-				d.Clipboard().SetText(codeText)
-			}
-		})
-		topBar.Append(copyBtn)
-		codeBox.Append(topBar)
-
-		buf := gtk.NewTextBuffer(nil)
-		buf.SetText(codeText)
-		if lang != "" {
-			hl.Highlight(ctx, buf.StartIter(), buf.EndIter(), lang)
-		}
-
-		tv := gtk.NewTextViewWithBuffer(buf)
-		tv.SetEditable(false)
-		tv.SetMonospace(true)
-		tv.SetCursorVisible(false)
-		tv.AddCSSClass("glup-md-codeblock-text")
-		tv.AddCSSClass("md-codeblock-text")
-
-		scroll := gtk.NewScrolledWindow()
-		scroll.SetPolicy(gtk.PolicyAutomatic, gtk.PolicyNever)
-		scroll.SetPropagateNaturalHeight(true)
-		scroll.SetChild(tv)
-
-		codeBox.Append(scroll)
-		return codeBox
+		return newCodeBlockWidget(ctx, codeText, lang)
 
 	case *ast.Blockquote:
 		quoteBox := gtk.NewBox(gtk.OrientationVertical, 4)
@@ -466,6 +486,64 @@ func renderBlock(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 	}
 }
 
+func newCodeBlockWidget(ctx context.Context, codeText, lang string) gtk.Widgetter {
+	codeBox := gtk.NewBox(gtk.OrientationVertical, 0)
+	codeBox.AddCSSClass("glup-md-codeblock")
+	codeBox.AddCSSClass("md-codeblock")
+
+	topBar := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	topBar.AddCSSClass("glup-md-codeblock-bar")
+	topBar.AddCSSClass("glup-md-code-header")
+
+	langLabel := gtk.NewLabel(lang)
+	langLabel.AddCSSClass("glup-md-codeblock-lang")
+	langLabel.AddCSSClass("glup-md-code-lang")
+	langLabel.SetHExpand(true)
+	langLabel.SetXAlign(0)
+	langLabel.SetVAlign(gtk.AlignCenter)
+	topBar.Append(langLabel)
+
+	copyBtn := gtk.NewButtonFromIconName("edit-copy-symbolic")
+	copyBtn.AddCSSClass("flat")
+	copyBtn.AddCSSClass("glup-md-codeblock-copy")
+	copyBtn.AddCSSClass("glup-md-code-copy")
+	copyBtn.SetVAlign(gtk.AlignCenter)
+	copyBtn.SetTooltipText("Copy code")
+	copyBtn.ConnectClicked(func() {
+		if d := gdk.DisplayGetDefault(); d != nil {
+			d.Clipboard().SetText(codeText)
+		}
+	})
+	topBar.Append(copyBtn)
+	codeBox.Append(topBar)
+
+	buf := gtk.NewTextBuffer(nil)
+	buf.SetText(codeText)
+	if lang != "" {
+		hl.Highlight(ctx, buf.StartIter(), buf.EndIter(), lang)
+	}
+
+	tv := gtk.NewTextViewWithBuffer(buf)
+	tv.SetEditable(false)
+	tv.SetMonospace(true)
+	tv.SetCursorVisible(false)
+	tv.AddCSSClass("glup-md-codeblock-text")
+	tv.AddCSSClass("md-codeblock-text")
+
+	scroll := gtk.NewScrolledWindow()
+	scroll.SetPolicy(gtk.PolicyAutomatic, gtk.PolicyNever)
+	scroll.SetPropagateNaturalHeight(true)
+	scroll.SetChild(tv)
+
+	codeBox.Append(scroll)
+	return &CodeBlock{
+		Box:       codeBox,
+		LangLabel: langLabel,
+		CopyBtn:   copyBtn,
+		TextView:  tv,
+	}
+}
+
 func renderTable(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 	grid := gtk.NewGrid()
 	grid.AddCSSClass("glup-md-table")
@@ -473,6 +551,7 @@ func renderTable(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 	grid.SetRowSpacing(0)
 	grid.SetHExpand(true)
 
+	var labels []*gtk.Label
 	rowIdx := 0
 	for row := n.FirstChild(); row != nil; row = row.NextSibling() {
 		isHeader := row.Kind() == east.KindTableHeader
@@ -501,12 +580,16 @@ func renderTable(ctx context.Context, n ast.Node, src []byte) gtk.Widgetter {
 				lbl.AddCSSClass("glup-md-table-cell")
 			}
 			grid.Attach(lbl, colIdx, rowIdx, 1, 1)
+			labels = append(labels, lbl)
 			colIdx++
 		}
 		rowIdx++
 	}
 
-	return grid
+	return &TableGrid{
+		Grid:   grid,
+		Labels: labels,
+	}
 }
 
 func extractCodeText(n ast.Node, src []byte) (string, string) {

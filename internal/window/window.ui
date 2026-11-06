@@ -146,15 +146,22 @@
                       <object class="GtkStackPage">
                         <property name="name">switcher</property>
                         <property name="child">
-                          <object class="GtkScrolledWindow">
+                          <object class="GtkScrolledWindow" id="horizTabScroll">
                             <property name="hscrollbar-policy">external</property>
                             <property name="vscrollbar-policy">never</property>
-                            <property name="propagate-natural-width">false</property>
-                            <property name="min-content-width">520</property>
+                            <property name="propagate-natural-width">true</property>
+                            <property name="max-content-width">2400</property>
                             <property name="hexpand">true</property>
+                            <property name="halign">fill</property>
                             <property name="child">
-                              <object class="AdwViewSwitcher" id="viewSwitcher">
-                                <property name="policy">wide</property>
+                              <object class="GtkBox" id="horizTabBox">
+                                <property name="orientation">horizontal</property>
+                                <property name="spacing">4</property>
+                                <property name="halign">start</property>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="glup-horiz-tab-strip"/>
+                                </style>
                               </object>
                             </property>
                           </object>
@@ -422,6 +429,7 @@
                                 <style>
                                   <class name="suggested-action"/>
                                   <class name="circular"/>
+                                  <class name="glup-send-btn"/>
                                 </style>
                               </object>
                             </child>
@@ -434,6 +442,7 @@
                                 <style>
                                   <class name="destructive-action"/>
                                   <class name="circular"/>
+                                  <class name="glup-send-btn"/>
                                 </style>
                               </object>
                             </child>
@@ -655,6 +664,7 @@
                       <object class="GtkBox" id="subagentsSectionBox">
                         <property name="orientation">vertical</property>
                         <property name="spacing">8</property>
+                        <property name="visible">false</property>
                         <child>
                           <object class="GtkBox">
                             <property name="orientation">horizontal</property>

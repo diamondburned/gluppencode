@@ -390,7 +390,7 @@ func TestSSESubscribeAndReconnectSynctest(t *testing.T) {
 				if count == 4 {
 					cancel()
 				}
-			})
+			}, nil)
 		}()
 
 		// Wait for attempt 1 to complete and enter the 2s retry timer.
@@ -443,6 +443,69 @@ func TestSSESubscribeAndReconnectSynctest(t *testing.T) {
 		}
 		if createdEv.SessionID != "ses_2" || createdEv.Session.ID != "ses_2" || createdEv.Session.Title != "New Session" {
 			t.Errorf("SessionCreatedEvent = %+v", createdEv)
+		}
+	})
+}
+
+func TestSubscribeEventsLoopImmediateCleanEOFNoBusySpin(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		var (
+			mu       sync.Mutex
+			attempts int
+		)
+
+		client := &Client{
+			BaseURL: "http://opencode.local",
+			HTTP: &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					mu.Lock()
+					attempts++
+					mu.Unlock()
+
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				}),
+			},
+		}
+
+		done := make(chan error, 1)
+		go func() {
+			done <- client.SubscribeEventsLoop(ctx, 2*time.Second, func(ev Event) {}, nil)
+		}()
+
+		// Wait for attempt 1 to complete and pause at the 2s retry timer
+		synctest.Wait()
+
+		mu.Lock()
+		att1 := attempts
+		mu.Unlock()
+
+		if att1 != 1 {
+			t.Fatalf("attempts = %d after clean EOF, want 1 (should be waiting retry delay)", att1)
+		}
+
+		// Advance time by 2s -> attempt 2
+		time.Sleep(2 * time.Second)
+		synctest.Wait()
+
+		mu.Lock()
+		att2 := attempts
+		mu.Unlock()
+
+		if att2 != 2 {
+			t.Fatalf("attempts = %d after 2s delay, want 2", att2)
+		}
+
+		cancel()
+		err := <-done
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got err %v, want context.Canceled", err)
 		}
 	})
 }
@@ -1676,3 +1739,24 @@ func TestShellEvents(t *testing.T) {
 		}
 	})
 }
+
+func TestDiscover(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("uses OPENCODE_SERVER_URL and OPENCODE_SERVER_PASSWORD", func(t *testing.T) {
+		t.Setenv("OPENCODE_SERVER_URL", "http://127.0.0.1:5555/")
+		t.Setenv("OPENCODE_SERVER_PASSWORD", "secret123")
+
+		c, err := Discover(ctx)
+		if err != nil {
+			t.Fatalf("Discover failed: %v", err)
+		}
+		if c.BaseURL != "http://127.0.0.1:5555" {
+			t.Errorf("BaseURL = %q, want http://127.0.0.1:5555", c.BaseURL)
+		}
+		if c.Password != "secret123" {
+			t.Errorf("Password = %q, want secret123", c.Password)
+		}
+	})
+}
+

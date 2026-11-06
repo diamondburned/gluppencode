@@ -14,6 +14,13 @@ func TestParseMentions(t *testing.T) {
 	if err := os.WriteFile(testFile, []byte("package main"), 0644); err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}
+	nestedFile := filepath.Join(tempDir, "internal", "window", "window.go")
+	if err := os.MkdirAll(filepath.Dir(nestedFile), 0755); err != nil {
+		t.Fatalf("failed to create nested dir: %v", err)
+	}
+	if err := os.WriteFile(nestedFile, []byte("package window"), 0644); err != nil {
+		t.Fatalf("failed to create nested file: %v", err)
+	}
 
 	skills := []opencode.SkillInfo{
 		{ID: "review", Name: "code-review", Description: "Reviews code"},

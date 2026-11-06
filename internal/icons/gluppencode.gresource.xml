@@ -27,6 +27,7 @@
     <file preprocess="xml-stripblanks" alias="list-add-symbolic.svg">scalable/actions/list-add-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="mail-reply-sender-symbolic.svg">scalable/actions/mail-reply-sender-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="menu-large-symbolic.svg">scalable/actions/menu-large-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="object-select-symbolic.svg">scalable/actions/object-select-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="open-in-new-symbolic.svg">scalable/actions/open-in-new-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="pan-up-symbolic.svg">scalable/actions/expand-less-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="paper-plane-symbolic.svg">scalable/actions/paper-plane-symbolic.svg</file>

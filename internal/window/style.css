@@ -24,13 +24,14 @@
 	margin-bottom: 0;
 }
 
-.glup-sidebar-section-header {
-	padding: 10px 12px 4px 12px;
+sidebar .navigation-sidebar > .header > header.glup-sidebar-project-header,
+.glup-sidebar-project-header {
+	margin: 0;
+	padding: 0;
 }
 
-.glup-sidebar-project-header {
-	padding: 8px 10px 4px 10px;
-	margin: 0;
+.glup-sidebar-project-header-box {
+	padding: 0;
 }
 
 .glup-sidebar-folder-icon {
@@ -43,16 +44,17 @@
 }
 
 sidebar .navigation-sidebar > row.glup-sidebar-conversation-row {
-	min-height: 0;
+	min-height: 30px;
 	padding: 0;
-	margin: 0 6px 2px 14px;
+	margin: 1px 6px 1px 14px;
 	border-radius: 8px;
 }
 
 sidebar .navigation-sidebar > row > box.glup-sidebar-conversation-box,
 sidebar .navigation-sidebar > row > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
-	min-height: 28px;
-	padding: 2px 10px 2px 8px;
+	min-height: 30px;
+	margin: 0;
+	padding: 2px 10px;
 	border-spacing: 6px;
 	border-radius: 8px;
 }
@@ -61,6 +63,30 @@ sidebar .navigation-sidebar > row > box.glup-sidebar-row-vbox {
 	min-height: 0;
 	padding: 0;
 	border-spacing: 2px;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more {
+	min-height: 30px;
+	padding: 0;
+	margin: 1px 6px 2px 14px;
+	border-radius: 8px;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	margin: 0;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more > box.glup-sidebar-row-vbox > button.glup-sidebar-show-more {
+	margin: 1px 0 4px 0;
+	padding: 2px 10px;
+	min-height: 26px;
+	border-radius: 8px;
+	font-size: 0.82em;
+	opacity: 0.72;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more > box.glup-sidebar-row-vbox > button.glup-sidebar-show-more:hover {
+	opacity: 1;
 }
 
 sidebar .navigation-sidebar > row.glup-has-show-more,
@@ -91,34 +117,6 @@ sidebar .navigation-sidebar > row.glup-has-show-more:selected:hover > box.glup-s
 
 sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
 	background-color: color-mix(in srgb, currentColor 19%, transparent);
-}
-
-.glup-sidebar-project-header-sep,
-.glup-sidebar-project-sep {
-	border-top: 1px solid alpha(@borders, 0.65);
-	margin: 6px 0 0 0;
-	padding-top: 8px;
-}
-
-.glup-sidebar-section-title {
-	font-weight: 700;
-	font-size: 0.95em;
-}
-
-.glup-sidebar-section-path {
-	font-size: 0.8em;
-	opacity: 0.65;
-}
-
-.glup-sidebar-show-more {
-	font-size: 0.8em;
-	padding: 2px 6px;
-	margin: 2px 0 4px 6px;
-	opacity: 0.75;
-}
-
-.glup-sidebar-show-more:hover {
-	opacity: 1;
 }
 
 .glup-user-images {
@@ -281,9 +279,14 @@ sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-
 	opacity: 0.75;
 }
 
-.glup-compaction-body {
-	padding: 4px 16px;
-	opacity: 0.88;
+.glup-compaction-body,
+.glup-compaction-summary {
+	padding: 10px 14px;
+	margin: 4px 0;
+	background-color: alpha(@theme_fg_color, 0.035);
+	border: 1px solid alpha(@borders, 0.5);
+	border-radius: 8px;
+	opacity: 0.9;
 }
 
 .glup-timeline-notice {
@@ -314,8 +317,8 @@ sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-
 }
 
 .glup-composer-placeholder {
-	padding: 6px 4px;
-	font-size: 0.95em;
+	padding: 7px 4px;
+	font-size: 1em;
 	opacity: 0.55;
 }
 
@@ -343,7 +346,7 @@ menubutton.glup-composer-selector-btn > button {
 	border-radius: 6px;
 	font-size: 0.9em;
 	opacity: 0.85;
-	min-height: 24px;
+	min-height: 28px;
 }
 
 menubutton.glup-composer-selector-btn > button:hover,
@@ -387,11 +390,12 @@ menubutton.glup-composer-selector-btn > button:checked {
 	opacity: 0.9;
 }
 
-.glup-composer-frame button.circular,
+.glup-composer-frame button.circular:not(.glup-composer-flat-btn),
+.glup-send-btn,
 #sendBtn,
 #stopBtn {
-	min-width: 32px;
-	min-height: 32px;
+	min-width: 30px;
+	min-height: 30px;
 	padding: 0;
 	border-radius: 999px;
 }
@@ -423,10 +427,102 @@ menubutton.glup-composer-selector-btn > button:checked {
 .glup-composer-text,
 .glup-composer-text text {
 	background: transparent;
+	color: @window_fg_color;
+	caret-color: @window_fg_color;
 }
 
 .glup-composer-text {
 	padding: 7px 4px;
+}
+
+GtkSourceAssistant.completion {
+	background-color: @popover_bg_color;
+	color: @popover_fg_color;
+	border-radius: 10px;
+	padding: 4px;
+}
+
+GtkSourceAssistant.completion list {
+	background: transparent;
+	padding: 0;
+}
+
+GtkSourceAssistant.completion list row {
+	padding: 2px 6px;
+	margin: 1px 0;
+	min-height: 28px;
+	border-radius: 6px;
+}
+
+GtkSourceAssistant.completion list row:hover:not(:selected) {
+	background-color: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+GtkSourceAssistant.completion list row:selected {
+	background-color: color-mix(in srgb, currentColor 12%, transparent);
+	color: @popover_fg_color;
+}
+
+GtkSourceAssistant.completion list row cell.icon {
+	padding: 4px 6px 4px 2px;
+	min-width: 16px;
+	min-height: 16px;
+	opacity: 0.75;
+}
+
+GtkSourceAssistant.completion list row cell.typed-text {
+	margin-left: 2px;
+	margin-right: 8px;
+	min-height: 24px;
+}
+
+GtkSourceAssistant.completion list row cell.after {
+	margin-left: 6px;
+	margin-right: 4px;
+}
+
+GtkSourceAssistant.completion list row box.more,
+GtkSourceAssistant.completion box.details {
+	min-height: 0;
+	min-width: 0;
+	padding: 0;
+	margin: 0;
+	border: none;
+	opacity: 0;
+	font-size: 0;
+}
+
+GtkSourceAssistant.completion box.details * {
+	min-height: 0;
+	min-width: 0;
+	padding: 0;
+	margin: 0;
+}
+
+.glup-horiz-tab-strip {
+	padding: 2px 4px;
+}
+
+.glup-horiz-tab-btn {
+	min-width: 140px;
+	min-height: 32px;
+	padding: 2px 8px;
+	border-radius: 6px;
+	font-weight: 500;
+}
+
+.glup-horiz-tab-btn.glup-horiz-tab-active {
+	background-color: color-mix(in srgb, currentColor 10%, transparent);
+	font-weight: 600;
+}
+
+.glup-horiz-tab-proj {
+	font-size: 0.8em;
+	opacity: 0.65;
+}
+
+.glup-horiz-tab-title {
+	font-size: 0.9em;
 }
 
 .glup-status-bar {
@@ -437,6 +533,7 @@ menubutton.glup-composer-selector-btn > button:checked {
 
 .glup-status-chip {
 	font-size: 0.82em;
+	min-height: 18px;
 	padding: 4px 10px;
 	border-radius: 6px;
 }
@@ -484,6 +581,18 @@ menubutton.glup-composer-selector-btn > button:checked {
 	font-weight: 700;
 	color: #ffffff;
 	background-color: #3b82f6;
+	border-radius: 8px;
+	padding: 4px 10px;
+	border: 2px solid transparent;
+}
+
+.glup-agent-pill-active {
+	border-color: alpha(#ffffff, 0.85);
+	box-shadow: 0 0 0 1px alpha(@theme_fg_color, 0.25);
+}
+
+.glup-model-selected-icon {
+	color: @accent_color;
 }
 
 .glup-agent-build {
@@ -526,32 +635,13 @@ menubutton.glup-composer-selector-btn > button:checked {
 	min-height: 14px;
 }
 
-.glup-md-table {
-	border: 1px solid alpha(@borders, 0.6);
-	border-radius: 8px;
-	margin: 8px 0;
-	background-color: alpha(@theme_fg_color, 0.02);
-}
-
-.glup-md-table-header {
-	font-weight: 700;
-	padding: 6px 12px;
-	border-bottom: 1px solid alpha(@borders, 0.6);
-	background-color: alpha(@theme_fg_color, 0.05);
-}
-
-.glup-md-table-cell {
-	padding: 6px 12px;
-	border-bottom: 1px solid alpha(@borders, 0.25);
-}
-
 /* Revert Banner & Undo Button */
 .glup-revert-banner {
 	background-color: alpha(@accent_bg_color, 0.12);
 	border: 1px solid alpha(@accent_color, 0.3);
 	border-radius: 8px;
 	padding: 8px 12px;
-	margin: 10px 12px;
+	margin: 10px 0;
 }
 
 .glup-revert-banner-icon {
@@ -587,6 +677,10 @@ menubutton.glup-composer-selector-btn > button:checked {
 }
 
 .glup-user-undo-btn {
+	min-width: 22px;
+	min-height: 22px;
+	padding: 1px;
+	border-radius: 6px;
 	opacity: 0.5;
 	transition: opacity 120ms ease;
 }
@@ -596,14 +690,6 @@ menubutton.glup-composer-selector-btn > button:checked {
 	opacity: 1.0;
 }
 
-viewswitcher button image {
-	min-width: 0px;
-	min-height: 0px;
-	margin: 0px -6px 0px 0px;
-	padding: 0px;
-	opacity: 0;
-}
-
-viewswitcher button {
-	min-width: 110px;
+.glup-search-list row:selected .dim-label {
+	opacity: 0.8;
 }

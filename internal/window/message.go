@@ -52,12 +52,14 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 	contentBox.SetHExpand(true)
 
 	trimmed := strings.TrimSpace(textContent)
-	var mdView *mdstream.View
+	var userMD *mdstream.View
 	if trimmed != "" {
-		mdView = mdstream.NewView(ctx)
-		mdView.SetStatic(trimmed)
-		mdView.SetMarginEnd(24) // reserve space so bottom-right undo icon never overlaps text
-		contentBox.Append(mdView)
+		userMD = mdstream.NewView(ctx)
+		userMD.SetStatic(trimmed)
+		userMD.SetVAlign(gtk.AlignCenter)
+		userMD.SetMarginEnd(26) // reserve space so bottom-right undo icon never overlaps text
+		contentBox.SetVAlign(gtk.AlignCenter)
+		contentBox.Append(userMD)
 	}
 
 	if len(files) > 0 {
@@ -101,7 +103,7 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 
 	w := &UserMessageWidget{
 		Box:     box,
-		mdView:  mdView,
+		mdView:  userMD,
 		undoBtn: undoBtn,
 	}
 
@@ -191,6 +193,12 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		onOpenSubagent:  onOpenSubagent,
 	}
 
+	actionBtn.ConnectClicked(func() {
+		if tw.childSessionID != "" && tw.onOpenSubagent != nil {
+			tw.onOpenSubagent(tw.childSessionID)
+		}
+	})
+
 	return tw
 }
 
@@ -276,11 +284,6 @@ func (t *ToolWidget) setChildSessionID(id string) {
 	t.childSessionID = id
 	setViewSessionButtonContent(t.actionBtn)
 	t.actionBtn.SetVisible(true)
-	t.actionBtn.ConnectClicked(func() {
-		if t.onOpenSubagent != nil {
-			t.onOpenSubagent(t.childSessionID)
-		}
-	})
 }
 
 // SetMetadata updates tool metadata such as child subagent session IDs.
@@ -553,8 +556,9 @@ func summarizeToolInput(m map[string]any) string {
 	for _, key := range []string{"description", "query", "url", "path", "pattern", "name", "id", "action", "command"} {
 		if val, ok := m[key].(string); ok && val != "" {
 			val = strings.ReplaceAll(val, "\n", " ")
-			if len(val) > 80 {
-				val = val[:80] + "…"
+			runes := []rune(val)
+			if len(runes) > 80 {
+				val = string(runes[:80]) + "…"
 			}
 			return val
 		}
@@ -686,12 +690,11 @@ func (w *AssistantMessageWidget) LoadContent(parts []opencode.ContentPart) {
 	for i, part := range parts {
 		switch part.Type {
 		case "reasoning":
-			txt := strings.TrimSpace(part.Text)
-			if txt == "" {
+			if strings.TrimSpace(part.Text) == "" {
 				continue
 			}
 			mv := w.newReasoningView()
-			mv.SetStatic(txt)
+			mv.SetStatic(part.Text)
 			w.reasoningViews[i] = mv
 
 		case "tool":
@@ -703,12 +706,11 @@ func (w *AssistantMessageWidget) LoadContent(parts []opencode.ContentPart) {
 			w.tools[part.ID] = tw
 
 		case "text":
-			txt := strings.TrimSpace(part.Text)
-			if txt == "" {
+			if strings.TrimSpace(part.Text) == "" {
 				continue
 			}
 			mv := mdstream.NewView(w.ctx)
-			mv.SetStatic(txt)
+			mv.SetStatic(part.Text)
 			w.textViews[i] = mv
 			w.partsBox.Append(mv)
 		}
@@ -827,6 +829,8 @@ func NewCompactionWidget(ctx context.Context, msg opencode.Message) *CompactionW
 
 	bodyBox := gtk.NewBox(gtk.OrientationVertical, 0)
 	bodyBox.AddCSSClass("glup-compaction-body")
+	bodyBox.AddCSSClass("glup-compaction-summary")
+	bodyBox.SetVisible(false)
 	root.Append(bodyBox)
 
 	cw := &CompactionWidget{
@@ -856,6 +860,7 @@ func (cw *CompactionWidget) Update(msg opencode.Message) {
 		mv := mdstream.NewView(cw.ctx)
 		mv.SetStatic(summary)
 		cw.bodyBox.Append(mv)
+		cw.bodyBox.SetVisible(true)
 	}
 }
 
@@ -930,17 +935,21 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 
 	subArrow := gtk.NewImageFromIconName("subdirectory-arrow-right-symbolic")
 	subArrow.AddCSSClass("glup-tool-icon")
+	subArrow.SetVAlign(gtk.AlignCenter)
 
 	icon := gtk.NewImageFromIconName(iconName)
 	icon.AddCSSClass("glup-tool-icon")
+	icon.SetVAlign(gtk.AlignCenter)
 
 	titleLbl := gtk.NewLabel(titleText)
 	titleLbl.AddCSSClass("glup-tool-title")
 	titleLbl.SetXAlign(0)
+	titleLbl.SetVAlign(gtk.AlignCenter)
 
 	descLbl := gtk.NewLabel(desc)
 	descLbl.SetHExpand(true)
 	descLbl.SetXAlign(0)
+	descLbl.SetVAlign(gtk.AlignCenter)
 	descLbl.SetEllipsize(pango.EllipsizeEnd)
 	descLbl.AddCSSClass("glup-tool-subtitle")
 
@@ -968,6 +977,25 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 		})
 		headerRow.Append(btn)
 	}
+
+	state := strings.ToLower(strings.TrimSpace(msg.Status))
+	if state == "" {
+		state = "completed"
+	}
+	statusLabel := gtk.NewLabel(state)
+	statusLabel.SetVAlign(gtk.AlignCenter)
+	statusLabel.AddCSSClass("glup-tool-status")
+	if state == "completed" {
+		statusLabel.SetVisible(false)
+	} else {
+		statusLabel.SetVisible(true)
+		if state == "running" || state == "streaming" {
+			statusLabel.AddCSSClass("glup-tool-status-running")
+		} else if state == "error" || state == "failed" {
+			statusLabel.AddCSSClass("glup-tool-status-error")
+		}
+	}
+	headerRow.Append(statusLabel)
 
 	root.Append(headerRow)
 
@@ -1100,10 +1128,14 @@ func NewRevertBannerWidget(ctx context.Context, onRedo func()) *RevertBannerWidg
 
 // Update updates the banner title, diff badge, and diff content for staged reverts.
 func (b *RevertBannerWidget) Update(revertedCount int, diff string) {
-	if revertedCount <= 1 {
+	count := revertedCount
+	if count <= 0 {
+		count = 1
+	}
+	if count == 1 {
 		b.titleLabel.SetText("1 reverted message")
 	} else {
-		b.titleLabel.SetText(fmt.Sprintf("%d reverted messages", revertedCount))
+		b.titleLabel.SetText(fmt.Sprintf("%d reverted messages", count))
 	}
 
 	trimmedDiff := strings.TrimSpace(diff)

@@ -35,7 +35,12 @@ type serviceConfig struct {
 // Discover discovers the running OpenCode V2 server URL and password.
 func Discover(ctx context.Context) (*Client, error) {
 	baseURL := "http://127.0.0.1:4096"
-	if out, err := exec.CommandContext(ctx, "opencode", "service", "status").Output(); err == nil {
+	var password string
+
+	if envURL := os.Getenv("OPENCODE_SERVER_URL"); envURL != "" {
+		baseURL = envURL
+		password = os.Getenv("OPENCODE_SERVER_PASSWORD")
+	} else if out, err := exec.CommandContext(ctx, "opencode", "service", "status").Output(); err == nil {
 		u := strings.TrimSpace(string(out))
 		if strings.HasPrefix(u, "http://0.0.0.0:") {
 			u = "http://127.0.0.1:" + strings.TrimPrefix(u, "http://0.0.0.0:")
@@ -45,13 +50,14 @@ func Discover(ctx context.Context) (*Client, error) {
 		}
 	}
 
-	var password string
-	if cfgDir, err := os.UserConfigDir(); err == nil {
-		data, err := os.ReadFile(filepath.Join(cfgDir, "opencode", "service.json"))
-		if err == nil {
-			var cfg serviceConfig
-			if json.Unmarshal(data, &cfg) == nil {
-				password = cfg.Password
+	if password == "" {
+		if cfgDir, err := os.UserConfigDir(); err == nil {
+			data, err := os.ReadFile(filepath.Join(cfgDir, "opencode", "service.json"))
+			if err == nil {
+				var cfg serviceConfig
+				if json.Unmarshal(data, &cfg) == nil {
+					password = cfg.Password
+				}
 			}
 		}
 	}
@@ -1049,14 +1055,23 @@ func (c *Client) SubscribeEvents(ctx context.Context, fn func(Event)) error {
 
 // SubscribeEventsLoop continuously subscribes to /api/event, reconnecting after
 // retryDelay whenever the stream disconnects or fails until ctx is canceled.
-func (c *Client) SubscribeEventsLoop(ctx context.Context, retryDelay time.Duration, fn func(Event)) error {
+// Optional onReconnect callback is invoked each time a reconnection occurs.
+func (c *Client) SubscribeEventsLoop(ctx context.Context, retryDelay time.Duration, fn func(Event), onReconnect func()) error {
 	if retryDelay <= 0 {
 		retryDelay = 2 * time.Second
 	}
+	first := true
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if !first {
+			if onReconnect != nil {
+				onReconnect()
+			}
+		}
+		first = false
+
 		_ = c.SubscribeEvents(ctx, fn)
 		if err := ctx.Err(); err != nil {
 			return err

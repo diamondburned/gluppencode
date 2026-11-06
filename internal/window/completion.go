@@ -1,12 +1,18 @@
 package window
 
 import (
+	"context"
 	"fmt"
 	"html"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 	"unicode"
+	"unicode/utf8"
+	"unsafe"
 
 	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
@@ -68,6 +74,8 @@ var proposalType = coreglib.RegisterSubclass[*CompletionProposal](
 	}),
 )
 
+var proposalRegistry sync.Map
+
 func newProposal(kind ProposalKind, iconName, triggerText, label, detail string) *CompletionProposal {
 	p := proposalType.New()
 	p.Kind = kind
@@ -75,6 +83,9 @@ func newProposal(kind ProposalKind, iconName, triggerText, label, detail string)
 	p.TriggerText = triggerText
 	p.Label = label
 	p.Detail = detail
+	if ptr := p.Object.Native(); ptr != 0 {
+		proposalRegistry.Store(ptr, p)
+	}
 	return p
 }
 
@@ -86,8 +97,8 @@ func proposalFromProposaller(prop gtksource.CompletionProposaller) *CompletionPr
 		return p
 	}
 	if obj := coreglib.BaseObject(prop); obj != nil {
-		if p, ok := obj.Cast().(*CompletionProposal); ok {
-			return p
+		if v, ok := proposalRegistry.Load(obj.Native()); ok {
+			return v.(*CompletionProposal)
 		}
 	}
 	return nil
@@ -97,6 +108,13 @@ func proposalFromProposaller(prop gtksource.CompletionProposaller) *CompletionPr
 type CompletionProvider struct {
 	coreglib.Object
 	window *Window
+
+	cachedDir       string
+	cachedQuery     string
+	cachedFiles     []opencode.FoundFile
+	fetching        bool
+	activeProposals []uintptr
+	mu              sync.Mutex
 }
 
 var completionProviderType = coreglib.RegisterSubclass[*CompletionProvider](
@@ -127,10 +145,34 @@ var completionProviderType = coreglib.RegisterSubclass[*CompletionProvider](
 	}),
 )
 
+type rawCompletionProvider struct {
+	*coreglib.Object
+}
+
+func wrapGTKSourceCompletionProvider(obj *coreglib.Object) *gtksource.CompletionProvider {
+	if obj == nil {
+		return nil
+	}
+	raw := &rawCompletionProvider{Object: obj}
+	return (*gtksource.CompletionProvider)(unsafe.Pointer(raw))
+}
+
+type rawCompletionProposal struct {
+	*coreglib.Object
+}
+
+func wrapGTKSourceCompletionProposal(obj *coreglib.Object) gtksource.CompletionProposaller {
+	if obj == nil {
+		return nil
+	}
+	raw := &rawCompletionProposal{Object: obj}
+	return (*gtksource.CompletionProposal)(unsafe.Pointer(raw))
+}
+
 func newCompletionProvider(w *Window) *gtksource.CompletionProvider {
 	cp := completionProviderType.New()
 	cp.window = w
-	return cp.Cast().(*gtksource.CompletionProvider)
+	return wrapGTKSourceCompletionProvider(&cp.Object)
 }
 
 func (p *CompletionProvider) isTrigger(iter *gtk.TextIter, ch uint32) bool {
@@ -141,7 +183,7 @@ func (p *CompletionProvider) isTrigger(iter *gtk.TextIter, ch uint32) bool {
 	if iter == nil || iter.IsStart() {
 		return true
 	}
-	cur := *iter
+	cur := iter.Copy()
 	if rune(cur.Char()) == r {
 		if cur.IsStart() {
 			return true
@@ -159,14 +201,30 @@ func (p *CompletionProvider) isTrigger(iter *gtk.TextIter, ch uint32) bool {
 	return unicode.IsSpace(rune(cur.Char()))
 }
 
-func (p *CompletionProvider) populate(context *gtksource.CompletionContext) (*gio.ListModel, error) {
-	trigger, query, _ := p.extractTriggerAndQuery(context)
+func (p *CompletionProvider) populate(compCtx *gtksource.CompletionContext) (*gio.ListModel, error) {
+	trigger, query, _ := p.extractTriggerAndQuery(compCtx)
 	if trigger == 0 {
 		return nil, nil
 	}
 
+	p.mu.Lock()
+	for _, ptr := range p.activeProposals {
+		proposalRegistry.Delete(ptr)
+	}
+	p.activeProposals = p.activeProposals[:0]
+	p.mu.Unlock()
+
 	store := gio.NewListStore(gtksource.GTypeCompletionProposal)
 	lowerQuery := strings.ToLower(query)
+
+	addProposal := func(prop *CompletionProposal) {
+		if ptr := prop.Object.Native(); ptr != 0 {
+			p.mu.Lock()
+			p.activeProposals = append(p.activeProposals, ptr)
+			p.mu.Unlock()
+		}
+		store.Append(&prop.Object)
+	}
 
 	switch trigger {
 	case '/':
@@ -185,9 +243,9 @@ func (p *CompletionProvider) populate(context *gtksource.CompletionContext) (*gi
 		seen := make(map[string]bool)
 		for _, b := range builtins {
 			seen[strings.TrimPrefix(b.name, "/")] = true
-			if lowerQuery == "" || strings.Contains(strings.ToLower(b.name), lowerQuery) || strings.Contains(strings.ToLower(b.desc), lowerQuery) {
+			if lowerQuery == "" || strings.Contains(strings.ToLower(b.name), lowerQuery) {
 				prop := newProposal(ProposalCommand, b.icon, b.name, b.name, b.desc)
-				store.Append(&prop.Object)
+				addProposal(prop)
 			}
 		}
 
@@ -200,9 +258,9 @@ func (p *CompletionProvider) populate(context *gtksource.CompletionContext) (*gi
 				}
 				seen[cname] = true
 				trig := "/" + cname
-				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) || strings.Contains(strings.ToLower(cmd.Description), lowerQuery) {
+				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) {
 					prop := newProposal(ProposalCommand, "terminal-symbolic", trig, trig, cmd.Description)
-					store.Append(&prop.Object)
+					addProposal(prop)
 				}
 			}
 		}
@@ -216,39 +274,65 @@ func (p *CompletionProvider) populate(context *gtksource.CompletionContext) (*gi
 				if label == "@" {
 					label = trig
 				}
-				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) || strings.Contains(strings.ToLower(sk.Name), lowerQuery) || strings.Contains(strings.ToLower(sk.Description), lowerQuery) {
+				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) || strings.Contains(strings.ToLower(sk.Name), lowerQuery) {
 					prop := newProposal(ProposalSkill, "system-run-symbolic", trig, label, sk.Description)
 					prop.SkillID = sk.ID
-					store.Append(&prop.Object)
+					addProposal(prop)
 				}
 			}
 
 			// Agents
 			for _, ag := range p.window.agents {
 				trig := "@" + ag.Name
-				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) || strings.Contains(strings.ToLower(ag.Description), lowerQuery) {
+				if lowerQuery == "" || strings.Contains(strings.ToLower(trig), lowerQuery) || strings.Contains(strings.ToLower(ag.Name), lowerQuery) {
 					prop := newProposal(ProposalAgent, "system-users-symbolic", trig, trig, ag.Description)
 					prop.AgentName = ag.Name
-					store.Append(&prop.Object)
+					addProposal(prop)
 				}
 			}
 
 			// Files
 			dir := p.window.activeDirectory()
-			if p.window.client != nil {
-				files, err := p.window.client.FindFiles(p.window.ctx, dir, query, 15)
-				if err == nil {
-					for _, f := range files {
-						trig := "@" + f.Path
-						icon := "text-x-generic-symbolic"
-						if f.Type == "directory" {
-							icon = "folder-symbolic"
+			p.mu.Lock()
+			cached := p.cachedFiles
+			needFetch := (dir != p.cachedDir || query != p.cachedQuery) && !p.fetching
+			if needFetch {
+				p.fetching = true
+			}
+			p.mu.Unlock()
+
+			if needFetch && p.window.client != nil {
+				go func(fetchDir, fetchQuery string) {
+					ctx, cancel := context.WithTimeout(p.window.ctx, 3*time.Second)
+					defer cancel()
+					files, err := p.window.client.FindFiles(ctx, fetchDir, fetchQuery, 15)
+					coreglib.IdleAdd(func() {
+						p.mu.Lock()
+						p.fetching = false
+						p.cachedDir = fetchDir
+						p.cachedQuery = fetchQuery
+						if err == nil {
+							p.cachedFiles = files
+						} else {
+							p.cachedFiles = nil
 						}
-						prop := newProposal(ProposalFile, icon, trig, trig, f.Type)
-						prop.FilePath = f.Path
-						store.Append(&prop.Object)
-					}
+						p.mu.Unlock()
+						if err == nil && p.window != nil && p.window.ctx.Err() == nil {
+							p.window.syncComposerCompletionPopup()
+						}
+					})
+				}(dir, query)
+			}
+
+			for _, f := range cached {
+				trig := "@" + f.Path
+				icon := "text-x-generic-symbolic"
+				if f.Type == "directory" {
+					icon = "folder-symbolic"
 				}
+				prop := newProposal(ProposalFile, icon, trig, trig, f.Type)
+				prop.FilePath = f.Path
+				addProposal(prop)
 			}
 		}
 	}
@@ -268,11 +352,26 @@ func (p *CompletionProvider) display(context *gtksource.CompletionContext, propo
 			cell.SetIconName(prop.IconName)
 		}
 	case gtksource.SourceCompletionColumnBefore:
-		cell.SetText(prop.KindBadge())
+		cell.SetText("")
 	case gtksource.SourceCompletionColumnTypedText:
-		cell.SetMarkup(fmt.Sprintf("<b>%s</b>", html.EscapeString(prop.TriggerText)))
-	case gtksource.SourceCompletionColumnComment, gtksource.SourceCompletionColumnAfter:
-		cell.SetText(prop.Detail)
+		displayText := prop.TriggerText
+		if utf8.RuneCountInString(displayText) > 40 {
+			runes := []rune(displayText)
+			displayText = string(runes[:16]) + "…" + string(runes[len(runes)-22:])
+		}
+		cell.SetMarkup(fmt.Sprintf("<b>%s</b>", html.EscapeString(displayText)))
+	case gtksource.SourceCompletionColumnAfter:
+		singleLine := strings.Join(strings.Fields(prop.Detail), " ")
+		if utf8.RuneCountInString(singleLine) > 28 {
+			singleLine = string([]rune(singleLine)[:27]) + "…"
+		}
+		if singleLine != "" {
+			cell.SetMarkup(fmt.Sprintf("<span alpha=\"65%%\" size=\"small\">%s</span>", html.EscapeString(singleLine)))
+		} else {
+			cell.SetText("")
+		}
+	case gtksource.SourceCompletionColumnComment, gtksource.SourceCompletionColumnDetails:
+		cell.SetText("")
 	}
 }
 
@@ -282,7 +381,13 @@ func (p *CompletionProvider) activate(context *gtksource.CompletionContext, prop
 		return
 	}
 
-	buf := context.Buffer()
+	var buf *gtksource.Buffer
+	var begin, end *gtk.TextIter
+	var ok bool
+	if context != nil {
+		buf = context.Buffer()
+		begin, end, ok = context.Bounds()
+	}
 	if buf == nil && p.window != nil {
 		buf = p.window.inputBuffer
 	}
@@ -290,16 +395,27 @@ func (p *CompletionProvider) activate(context *gtksource.CompletionContext, prop
 		return
 	}
 
-	begin, end, ok := context.Bounds()
 	if !ok || begin == nil || end == nil {
-		return
+		_, _, startIter := p.extractTriggerAndQuery(context)
+		if startIter == nil {
+			return
+		}
+		cursor := buf.IterAtMark(buf.GetInsert())
+		if cursor == nil {
+			_, cursor = buf.Bounds()
+		}
+		if cursor == nil {
+			return
+		}
+		begin = startIter
+		end = cursor
 	}
 
-	startIter := *begin
+	startIter := begin.Copy()
 	if !startIter.IsStart() {
-		prev := startIter
+		prev := startIter.Copy()
 		prev.BackwardChar()
-		ch := prev.Char()
+		ch := rune(prev.Char())
 		if ch == '/' || ch == '@' {
 			startIter = prev
 		}
@@ -307,32 +423,42 @@ func (p *CompletionProvider) activate(context *gtksource.CompletionContext, prop
 
 	replacement := prop.TriggerText + " "
 	buf.BeginUserAction()
-	buf.Delete(&startIter, end)
-	buf.Insert(&startIter, replacement)
+	buf.Delete(startIter, end)
+	buf.Insert(startIter, replacement)
 	buf.EndUserAction()
 }
 
 func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionContext) (trigger rune, query string, startIter *gtk.TextIter) {
-	buf := ctx.Buffer()
+	var buf *gtksource.Buffer
+	var begin, endPtr *gtk.TextIter
+	var ok bool
+	if ctx != nil {
+		buf = ctx.Buffer()
+		begin, endPtr, ok = ctx.Bounds()
+	}
+	if buf == nil && p.window != nil {
+		buf = p.window.inputBuffer
+	}
 	if buf == nil {
 		return 0, "", nil
 	}
 
 	var end *gtk.TextIter
-	begin, endPtr, ok := ctx.Bounds()
 	if ok && begin != nil && endPtr != nil {
 		str := buf.Text(begin, endPtr, false)
 		if strings.HasPrefix(str, "/") {
-			return '/', strings.TrimPrefix(str, "/"), begin
+			return '/', strings.TrimPrefix(str, "/"), begin.Copy()
 		}
 		if strings.HasPrefix(str, "@") {
-			return '@', strings.TrimPrefix(str, "@"), begin
+			return '@', strings.TrimPrefix(str, "@"), begin.Copy()
 		}
 		end = endPtr
 	}
 
 	if end == nil {
-		end = buf.IterAtMark(buf.GetInsert())
+		if mark := buf.GetInsert(); mark != nil {
+			end = buf.IterAtMark(mark)
+		}
 	}
 	if end == nil {
 		_, end = buf.Bounds()
@@ -341,16 +467,21 @@ func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionCon
 		return 0, "", nil
 	}
 
-	lineStart := *end
+	lineStart := end.Copy()
 	lineStart.SetLineOffset(0)
-	lineText := buf.Text(&lineStart, end, false)
+	lineText := buf.Text(lineStart, end, false)
 	for i := len(lineText) - 1; i >= 0; i-- {
 		ch := lineText[i]
 		if ch == '/' || ch == '@' {
-			if i == 0 || unicode.IsSpace(rune(lineText[i-1])) {
-				triggerIter := lineStart
-				triggerIter.SetLineOffset(i)
-				return rune(ch), lineText[i+1:], &triggerIter
+			isStartOrSpace := i == 0
+			if !isStartOrSpace {
+				prevRune, _ := utf8.DecodeLastRuneInString(lineText[:i])
+				isStartOrSpace = unicode.IsSpace(prevRune)
+			}
+			if isStartOrSpace {
+				triggerIter := lineStart.Copy()
+				triggerIter.SetLineOffset(utf8.RuneCountInString(lineText[:i]))
+				return rune(ch), lineText[i+1:], triggerIter
 			}
 		}
 		if unicode.IsSpace(rune(ch)) {
@@ -359,6 +490,18 @@ func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionCon
 	}
 
 	return 0, "", nil
+}
+
+func utf16Len(s string) int {
+	var count int
+	for _, r := range s {
+		if r >= 0x10000 {
+			count += 2
+		} else {
+			count++
+		}
+	}
+	return count
 }
 
 // parseMentions extracts @-prefixed tokens from text and builds PromptOptions mentions.
@@ -372,13 +515,20 @@ func parseMentions(text string, skills []opencode.SkillInfo, agents []opencode.A
 		if text[i] != '@' {
 			continue
 		}
-		if i > 0 && !unicode.IsSpace(rune(text[i-1])) {
-			continue
+		if i > 0 {
+			prevRune, _ := utf8.DecodeLastRuneInString(text[:i])
+			if !unicode.IsSpace(prevRune) {
+				continue
+			}
 		}
 
 		end := i + 1
-		for end < n && !unicode.IsSpace(rune(text[end])) && text[end] != ',' && text[end] != ';' {
-			end++
+		for end < n {
+			r, size := utf8.DecodeRuneInString(text[end:])
+			if unicode.IsSpace(r) || r == ',' || r == ';' {
+				break
+			}
+			end += size
 		}
 		token := text[i:end]
 		name := strings.TrimPrefix(token, "@")
@@ -395,8 +545,8 @@ func parseMentions(text string, skills []opencode.SkillInfo, agents []opencode.A
 				opts.Agents = append(opts.Agents, opencode.PromptAgentInput{
 					Name: ag.Name,
 					Mention: &opencode.PromptMention{
-						Start: i,
-						End:   end,
+						Start: utf16Len(text[:i]),
+						End:   utf16Len(text[:end]),
 						Text:  token,
 					},
 				})
@@ -416,8 +566,8 @@ func parseMentions(text string, skills []opencode.SkillInfo, agents []opencode.A
 				opts.Skills = append(opts.Skills, opencode.PromptSkillInput{
 					ID: sk.ID,
 					Mention: &opencode.PromptMention{
-						Start: i,
-						End:   end,
+						Start: utf16Len(text[:i]),
+						End:   utf16Len(text[:end]),
 						Text:  token,
 					},
 				})
@@ -434,35 +584,25 @@ func parseMentions(text string, skills []opencode.SkillInfo, agents []opencode.A
 		if workspaceDir != "" {
 			candidatePath := filepath.Join(workspaceDir, name)
 			if _, err := os.Stat(candidatePath); err == nil {
+				absPath := candidatePath
+				if !filepath.IsAbs(absPath) {
+					if p, err := filepath.Abs(absPath); err == nil {
+						absPath = p
+					}
+				}
+				uri := (&url.URL{Scheme: "file", Path: filepath.ToSlash(absPath)}).String()
 				opts.Paths = append(opts.Paths, opencode.PromptFileInput{
-					URI:  "file://" + candidatePath,
+					URI:  uri,
 					Name: filepath.Base(candidatePath),
 					Mention: &opencode.PromptMention{
-						Start: i,
-						End:   end,
+						Start: utf16Len(text[:i]),
+						End:   utf16Len(text[:end]),
 						Text:  token,
 					},
 				})
 				i = end
 				continue
 			}
-		}
-
-		// Fallback for files with path separators or file extensions
-		if strings.Contains(name, "/") || strings.Contains(name, ".") {
-			abs := name
-			if !filepath.IsAbs(abs) && workspaceDir != "" {
-				abs = filepath.Join(workspaceDir, name)
-			}
-			opts.Paths = append(opts.Paths, opencode.PromptFileInput{
-				URI:  "file://" + abs,
-				Name: filepath.Base(name),
-				Mention: &opencode.PromptMention{
-					Start: i,
-					End:   end,
-					Text:  token,
-				},
-			})
 		}
 
 		i = end

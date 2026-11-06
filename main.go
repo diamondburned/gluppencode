@@ -8,7 +8,6 @@ import (
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	"github.com/diamondburned/gotkit/app"
-	"github.com/diamondburned/gotkit/gtkutil/cssutil"
 	"libdb.so/gluppencode/internal/opencode"
 	"libdb.so/gluppencode/internal/window"
 
@@ -16,17 +15,14 @@ import (
 	_ "libdb.so/gluppencode/internal/icons"
 )
 
-var _ = cssutil.WriteCSS(`
-	window.background {
-		background-color: @window_bg_color;
-	}
-`)
+var appID = "so.libdb.gluppencode"
 
 func main() {
 	adw.Init()
 	gtksource.Init()
 
-	a := app.New(context.Background(), "so.libdb.gluppencode", "Gluppencode")
+	a := app.New(context.Background(), appID, "Gluppencode")
+	a.SetResourceBasePath("/so/libdb/gluppencode")
 	a.ConnectActivate(func() {
 		ctx := a.Context()
 		client, err := opencode.Discover(ctx)
@@ -40,3 +36,4 @@ func main() {
 
 	os.Exit(a.Run(os.Args))
 }
+

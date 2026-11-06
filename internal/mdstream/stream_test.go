@@ -9,6 +9,7 @@ import (
 	"testing/synctest"
 	"time"
 
+	glibv2 "github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/yuin/goldmark/ast"
 )
@@ -540,13 +541,13 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 		}
 
 		view.SetStatic("Paragraph with `code` span.")
-		child := view.committedBox.FirstChild()
-		if child == nil {
+		widgets := view.CommittedWidgets()
+		if len(widgets) == 0 {
 			t.Fatal("committedBox has no children after SetStatic")
 		}
-		lbl, ok := child.(*gtk.Label)
+		lbl, ok := widgets[0].(*gtk.Label)
 		if !ok {
-			t.Fatalf("expected *gtk.Label, got %T", child)
+			t.Fatalf("expected *gtk.Label, got %T", widgets[0])
 		}
 		if !lbl.HasCSSClass("glup-md-paragraph") {
 			t.Errorf("label missing class glup-md-paragraph")
@@ -555,46 +556,26 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 
 	t.Run("code block rendering", func(t *testing.T) {
 		view.SetStatic("```go\nfunc add(a, b int) int { return a + b }\n```")
-		child := view.committedBox.FirstChild()
-		if child == nil {
+		widgets := view.CommittedWidgets()
+		if len(widgets) == 0 {
 			t.Fatal("committedBox has no children after SetStatic")
 		}
-		codeBox, ok := child.(*gtk.Box)
+		codeBlock, ok := widgets[0].(*CodeBlock)
 		if !ok {
-			t.Fatalf("expected *gtk.Box for codeblock, got %T", child)
+			t.Fatalf("expected *CodeBlock for codeblock, got %T", widgets[0])
 		}
-		if !codeBox.HasCSSClass("glup-md-codeblock") {
-			t.Errorf("codeBox missing class glup-md-codeblock")
+		if !codeBlock.HasCSSClass("glup-md-codeblock") {
+			t.Errorf("codeBlock missing class glup-md-codeblock")
 		}
 
-		topBarWidget := codeBox.FirstChild()
-		if topBarWidget == nil {
-			t.Fatal("codeBox has no top bar")
-		}
-		topBar, ok := topBarWidget.(*gtk.Box)
-		if !ok {
-			t.Fatalf("expected *gtk.Box for topBar, got %T", topBarWidget)
-		}
-		if !topBar.HasCSSClass("glup-md-codeblock-bar") {
-			t.Errorf("topBar missing class glup-md-codeblock-bar")
+		if codeBlock.LangLabel == nil || codeBlock.LangLabel.Text() != "go" {
+			t.Errorf("langLabel = %v, want 'go'", codeBlock.LangLabel)
 		}
 
-		langLabelWidget := topBar.FirstChild()
-		langLabel, ok := langLabelWidget.(*gtk.Label)
-		if !ok || langLabel.Text() != "go" {
-			t.Errorf("langLabel = %v, want 'go'", langLabel)
+		if codeBlock.TextView == nil {
+			t.Fatal("expected TextView inside codeBlock")
 		}
-
-		scrollWidget := gtk.BaseWidget(topBarWidget).NextSibling()
-		scroll, ok := scrollWidget.(*gtk.ScrolledWindow)
-		if !ok {
-			t.Fatalf("expected *gtk.ScrolledWindow for code text, got %T", scrollWidget)
-		}
-		tv, ok := scroll.Child().(*gtk.TextView)
-		if !ok {
-			t.Fatalf("expected *gtk.TextView inside code scroll, got %T", scroll.Child())
-		}
-		buf := tv.Buffer()
+		buf := codeBlock.TextView.Buffer()
 		start := buf.StartIter()
 		end := buf.EndIter()
 		text := buf.Slice(start, end, true)
@@ -605,29 +586,27 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 
 	t.Run("list rendering", func(t *testing.T) {
 		view.SetStatic("- item one\n- item two")
-		child := view.committedBox.FirstChild()
-		listBox, ok := child.(*gtk.Box)
-		if !ok {
-			t.Fatalf("expected *gtk.Box for list, got %T", child)
+		widgets := view.CommittedWidgets()
+		if len(widgets) == 0 {
+			t.Fatal("committedBox has no children after SetStatic")
 		}
-		if !listBox.HasCSSClass("glup-md-list") {
-			t.Errorf("listBox missing class glup-md-list")
+		listBlock, ok := widgets[0].(*ListBlock)
+		if !ok {
+			t.Fatalf("expected *ListBlock for list, got %T", widgets[0])
+		}
+		if !listBlock.HasCSSClass("glup-md-list") {
+			t.Errorf("listBlock missing class glup-md-list")
 		}
 
-		item1 := listBox.FirstChild()
-		if item1 == nil {
-			t.Fatal("listBox has no children")
+		if len(listBlock.Items) == 0 {
+			t.Fatal("listBlock has no children")
 		}
-		itemBox, ok := item1.(*gtk.Box)
-		if !ok {
-			t.Fatalf("expected *gtk.Box for listItem, got %T", item1)
-		}
-		if !itemBox.HasCSSClass("glup-md-listitem") {
+		item1 := listBlock.Items[0]
+		if !item1.HasCSSClass("glup-md-listitem") {
 			t.Errorf("itemBox missing class glup-md-listitem")
 		}
-		bullet := itemBox.FirstChild().(*gtk.Label)
-		if bullet.Text() != "•" {
-			t.Errorf("bullet = %q, want •", bullet.Text())
+		if item1.Bullet == nil || item1.Bullet.Text() != "•" {
+			t.Errorf("bullet = %v, want •", item1.Bullet)
 		}
 	})
 
@@ -635,14 +614,14 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 		tableMD := "| Header A | Header B |\n| :--- | :---: |\n| Cell 1 | Cell 2 |"
 		view.SetStatic(tableMD)
 
-		child := view.committedBox.FirstChild()
-		if child == nil {
+		widgets := view.CommittedWidgets()
+		if len(widgets) == 0 {
 			t.Fatal("committedBox has no children after SetStatic")
 		}
 
-		grid, ok := child.(*gtk.Grid)
+		grid, ok := widgets[0].(*TableGrid)
 		if !ok {
-			t.Fatalf("child is not *gtk.Grid (expected direct Grid without GtkScrolledWindow wrapper): %T", child)
+			t.Fatalf("child is not *TableGrid: %T", widgets[0])
 		}
 		if !grid.HasCSSClass("glup-md-table") {
 			t.Errorf("grid missing class glup-md-table")
@@ -652,12 +631,7 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 		}
 
 		// Verify header and cell labels
-		var labels []*gtk.Label
-		for c := grid.FirstChild(); c != nil; c = gtk.BaseWidget(c).NextSibling() {
-			if lbl, ok := c.(*gtk.Label); ok {
-				labels = append(labels, lbl)
-			}
-		}
+		labels := grid.Labels
 		if len(labels) != 4 {
 			t.Fatalf("expected 4 table labels (2 headers + 2 cells), got %d", len(labels))
 		}
@@ -727,4 +701,72 @@ func splitEveryN(s string, n int) []string {
 		s = s[n:]
 	}
 	return out
+}
+
+func TestViewDedup(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK cannot be initialized")
+	}
+
+	flushGTK := func() {
+		for glibv2.MainContextDefault().Iteration(false) {
+		}
+	}
+
+	t.Run("SetStatic followed by Finalize produces exactly 2 widgets", func(t *testing.T) {
+		view := NewView(context.Background())
+		view.SetStatic("para1\n\npara2")
+		view.Finalize("para1\n\npara2")
+		flushGTK()
+		if got := len(view.CommittedWidgets()); got != 2 {
+			t.Errorf("len(CommittedWidgets()) = %d, want 2", got)
+		}
+	})
+
+	t.Run("SetStatic then AppendDelta then Finalize produces exactly 3 widgets", func(t *testing.T) {
+		view := NewView(context.Background())
+		view.SetStatic("para1\n\n")
+		view.AppendDelta("para2\n\npara3")
+		view.Finalize("para1\n\npara2\n\npara3")
+		flushGTK()
+		if got := len(view.CommittedWidgets()); got != 3 {
+			t.Errorf("len(CommittedWidgets()) = %d, want 3", got)
+		}
+	})
+
+	t.Run("AppendDelta then Finalize with different text produces exactly 3 widgets", func(t *testing.T) {
+		view := NewView(context.Background())
+		view.AppendDelta("old1\n\nold2")
+		time.Sleep(50 * time.Millisecond)
+		flushGTK()
+		view.Finalize("new1\n\nnew2\n\nnew3")
+		flushGTK()
+		if got := len(view.CommittedWidgets()); got != 3 {
+			t.Errorf("len(CommittedWidgets()) = %d, want 3", got)
+		}
+	})
+
+	t.Run("SetStatic followed by AppendDelta continues paragraph without splitting", func(t *testing.T) {
+		view := NewView(context.Background())
+		view.SetStatic("Hello")
+		view.AppendDelta(" world\n\nNext para\n\nThird")
+		view.Finalize("Hello world\n\nNext para\n\nThird")
+		flushGTK()
+		widgets := view.CommittedWidgets()
+		if len(widgets) != 3 {
+			t.Fatalf("len(CommittedWidgets()) = %d, want 3", len(widgets))
+		}
+		lbl0, ok := widgets[0].(*gtk.Label)
+		if !ok || lbl0.Text() != "Hello world" {
+			t.Errorf("block 0 text = %q, want 'Hello world'", lbl0.Text())
+		}
+		lbl1, ok := widgets[1].(*gtk.Label)
+		if !ok || lbl1.Text() != "Next para" {
+			t.Errorf("block 1 text = %q, want 'Next para'", lbl1.Text())
+		}
+		lbl2, ok := widgets[2].(*gtk.Label)
+		if !ok || lbl2.Text() != "Third" {
+			t.Errorf("block 2 text = %q, want 'Third'", lbl2.Text())
+		}
+	})
 }

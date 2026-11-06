@@ -1,6 +1,6 @@
 module libdb.so/gluppencode
 
-go 1.25.0
+go 1.27
 
 require (
 	github.com/diamondburned/chatkit v0.0.0-20261031204703-9ef48f54f871

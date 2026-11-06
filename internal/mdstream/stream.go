@@ -38,9 +38,10 @@ type BlockAST struct {
 
 // RenderPatch represents an incremental update emitted by the streaming markdown engine.
 type RenderPatch struct {
-	Committed []BlockAST // Newly frozen prefix blocks since last patch (append once, never touch again)
-	Tail      *BlockAST  // Current active tail block(s) to replace the single tail widget (nil if empty or finalized)
-	Final     bool
+	Committed      []BlockAST // Newly frozen prefix blocks since last patch (append once, never touch again)
+	Tail           *BlockAST  // Current active tail block(s) to replace the single tail widget (nil if empty or finalized)
+	Final          bool
+	ResetCommitted bool
 }
 
 // ParseBlock parses a raw markdown snippet into a BlockAST whose Source and
@@ -158,10 +159,14 @@ func (e *Engine) Flush() (RenderPatch, bool) {
 // Finalize flushes any remaining tokens and commits all remaining top-level blocks.
 // If fullText is non-empty, the engine ensures the accumulated buffer matches fullText.
 func (e *Engine) Finalize(fullText string) RenderPatch {
+	var resetCommitted bool
 	if fullText != "" {
 		fullBytes := []byte(fullText)
 		if e.committedOffset > len(fullBytes) || !bytes.Equal(e.buf[:e.committedOffset], fullBytes[:e.committedOffset]) {
+			resetCommitted = true
 			e.committedOffset = 0
+		} else if e.committedOffset == 0 && len(e.buf) > 0 && string(e.buf) != fullText {
+			resetCommitted = true
 		}
 		e.buf = fullBytes
 	}
@@ -174,9 +179,10 @@ func (e *Engine) Finalize(fullText string) RenderPatch {
 	e.lastTailRaw = ""
 
 	return RenderPatch{
-		Committed: committed,
-		Tail:      nil,
-		Final:     true,
+		Committed:      committed,
+		Tail:           nil,
+		Final:          true,
+		ResetCommitted: resetCommitted,
 	}
 }
 
@@ -748,15 +754,18 @@ type Streamer struct {
 // Batcher is an alias for Streamer.
 type Batcher = Streamer
 
-// NewStreamer creates and starts a new background markdown Streamer.
-func NewStreamer(interval time.Duration, onPatch func(RenderPatch)) *Streamer {
+// NewStreamerWithEngine creates and starts a new background markdown Streamer with a pre-initialized Engine.
+func NewStreamerWithEngine(interval time.Duration, engine *Engine, onPatch func(RenderPatch)) *Streamer {
 	if interval <= 0 {
 		interval = DefaultInterval
+	}
+	if engine == nil {
+		engine = NewEngine()
 	}
 	s := &Streamer{
 		interval:   interval,
 		onPatch:    onPatch,
-		engine:     NewEngine(),
+		engine:     engine,
 		notifyCh:   make(chan struct{}, 1),
 		finalizeCh: make(chan string, 1),
 		closeCh:    make(chan struct{}),
@@ -764,6 +773,11 @@ func NewStreamer(interval time.Duration, onPatch func(RenderPatch)) *Streamer {
 	}
 	go s.loop()
 	return s
+}
+
+// NewStreamer creates and starts a new background markdown Streamer.
+func NewStreamer(interval time.Duration, onPatch func(RenderPatch)) *Streamer {
+	return NewStreamerWithEngine(interval, nil, onPatch)
 }
 
 // NewBatcher creates and starts a new background markdown Batcher.
