@@ -35,8 +35,12 @@ import (
 var windowUI string
 
 type pendingPrompt struct {
-	text   string
-	widget *UserMessageWidget
+	inboxID   string
+	text      string
+	files     []opencode.FileAttachment
+	delivery  opencode.InboxDelivery
+	cancelled bool
+	widget    *UserMessageWidget
 }
 
 type convTimeline struct {
@@ -47,7 +51,7 @@ type convTimeline struct {
 	compactionMap  map[string]*CompactionWidget
 	messageWidgets map[string]gtk.Widgetter
 	revertBanner   *RevertBannerWidget
-	pendingPrompts []pendingPrompt
+	pendingPrompts []*pendingPrompt
 	seenMsgIDs     map[string]bool
 	messages       []opencode.Message
 	nextCursor     string
@@ -66,6 +70,24 @@ type convTimeline struct {
 func (c *convTimeline) closeStreams() {
 	for _, aw := range c.assistantMap {
 		aw.CloseStreams()
+	}
+}
+
+func (c *convTimeline) keepPendingAtBottom() {
+	if c == nil || c.timelineBox == nil {
+		return
+	}
+	for _, p := range c.pendingPrompts {
+		if p != nil && p.widget != nil && p.widget.Parent() != nil {
+			if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(p.widget) {
+				c.timelineBox.ReorderChildAfter(p.widget, last)
+			}
+		}
+	}
+	if c.revertBanner != nil && c.revertBanner.Visible() && c.revertBanner.Parent() != nil {
+		if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.revertBanner) {
+			c.timelineBox.ReorderChildAfter(c.revertBanner, last)
+		}
 	}
 }
 
@@ -94,6 +116,11 @@ func (t *sessionTab) activeConv() *convTimeline {
 		}
 	}
 	return t.main
+}
+
+type agentRowData struct {
+	row     *gtk.ListBoxRow
+	agentID string
 }
 
 type modelRowData struct {
@@ -174,7 +201,7 @@ type Window struct {
 	subagentsSectionBox  *gtk.Box
 	sheetBackToParentBtn *gtk.Button
 	subagentListBox      *gtk.ListBox
-	agentButtonsBox      *adw.WrapBox
+	agentListBox         *gtk.ListBox
 	modelSearchEntry     *gtk.SearchEntry
 	modelListBox         *gtk.ListBox
 
@@ -184,6 +211,7 @@ type Window struct {
 	tabOrder     []string               // root session IDs in display order
 	childToRoot  map[string]string      // child session ID -> root session ID
 	agents       []opencode.Agent
+	agentRows    []agentRowData
 	models       []opencode.ModelInfo
 	modelNames   map[string]string
 	modelRows    []modelRowData
@@ -277,7 +305,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		subagentsSectionBox:   builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
 		sheetBackToParentBtn:  builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
 		subagentListBox:       builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
-		agentButtonsBox:       builder.GetObject("agentButtonsBox").Cast().(*adw.WrapBox),
+		agentListBox:          builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
 		modelSearchEntry:      builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
 		modelListBox:          builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
 		tabs:                  make(map[string]*sessionTab),
@@ -323,6 +351,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 			inputScroll.SetPolicy(gtk.PolicyNever, gtk.PolicyExternal)
 		}
 		w.syncComposerCompletionPopup()
+	})
+	w.agentPopover.ConnectMap(func() {
+		w.rebuildAgentPills()
 	})
 	w.modelPopover.ConnectMap(func() {
 		w.rebuildModelList()
@@ -454,11 +485,26 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	adwWin.AddController(winKeyCtrl)
 
-	// Composer Enter / Shift+Enter handling and Ctrl+V clipboard image pasting.
+	// Composer Enter / Ctrl+Enter / Shift+Enter handling and Ctrl+V clipboard image pasting.
+	steerKeyCtrl := gtk.NewEventControllerKey()
+	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
+	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
+		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
+			w.sendPromptWithDelivery(opencode.DeliverySteer)
+			return true
+		}
+		return false
+	})
+	w.inputView.AddController(steerKeyCtrl)
+
 	keyCtrl := gtk.NewEventControllerKey()
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && !state.Has(gdk.ShiftMask) {
-			w.sendPrompt()
+			if state.Has(gdk.ControlMask) {
+				w.sendPromptWithDelivery(opencode.DeliverySteer)
+			} else {
+				w.sendPromptWithDelivery(opencode.DeliveryQueue)
+			}
 			return true
 		}
 		if (keyval == gdk.KEY_v || keyval == gdk.KEY_V) && state.Has(gdk.ControlMask) {
@@ -476,7 +522,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.inputView.AddController(keyCtrl)
 	w.inputView.ConnectPasteClipboard(w.onPasteClipboard)
 	w.attachBtn.ConnectClicked(w.chooseAndAttachFile)
-	w.sendBtn.ConnectClicked(w.sendPrompt)
+	w.sendBtn.ConnectClicked(func() {
+		w.sendPromptWithDelivery(opencode.DeliveryQueue)
+	})
 	w.stopBtn.ConnectClicked(w.interruptSession)
 
 	// Subagent selection in the bottom sheet.
@@ -492,6 +540,20 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 			if sr.row.Object.Native() == row.Object.Native() {
 				w.openSubagent(tab, sr.session)
 				w.bottomSheet.SetOpen(false)
+				return
+			}
+		}
+	})
+
+	// Agent selection in the agent popover.
+	w.agentListBox.ConnectRowActivated(func(row *gtk.ListBoxRow) {
+		if row == nil {
+			return
+		}
+		for _, ar := range w.agentRows {
+			if ar.row.Object.Native() == row.Object.Native() {
+				w.switchAgent(ar.agentID)
+				w.agentPopover.Popdown()
 				return
 			}
 		}
@@ -2060,7 +2122,23 @@ func (w *Window) loadChildSubagents(rootSessionID string) {
 func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 	sessionID := conv.session.ID
 	gtkutil.Async(w.ctx, func() func() {
-		page, err := w.client.ListMessagesPage(w.ctx, sessionID, 50, "")
+		var (
+			page       *opencode.MessagePage
+			err        error
+			inboxItems []opencode.InboxItem
+			wg         sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, "")
+		}()
+		go func() {
+			defer wg.Done()
+			inboxItems, _ = w.client.ListInbox(w.ctx, sessionID)
+		}()
+		wg.Wait()
+
 		return func() {
 			conv.loadingInitial = false
 			if err != nil {
@@ -2106,8 +2184,35 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				}
 			}
 			conv.runningTools = runningTools
+
+			// Filter out any pendingPrompts that were already delivered in page.Messages
+			remainingPending := conv.pendingPrompts[:0]
+			for _, p := range conv.pendingPrompts {
+				if p == nil || p.cancelled || (p.inboxID != "" && conv.seenMsgIDs[p.inboxID]) {
+					continue
+				}
+				remainingPending = append(remainingPending, p)
+				if p.widget != nil {
+					conv.timelineBox.Append(p.widget)
+				}
+			}
+			conv.pendingPrompts = remainingPending
+
+			for _, item := range inboxItems {
+				if item.ID == "" || conv.seenMsgIDs[item.ID] || (item.Type != "" && item.Type != "user") {
+					continue
+				}
+				w.onInboxEnqueued(tab, conv, opencode.InboxEvent{
+					SessionID: sessionID,
+					InboxID:   item.ID,
+					Delivery:  item.Delivery,
+					Item:      &item,
+				})
+			}
+
 			tab.page.SetBadgeNumber(0)
 			w.applyRevertState(tab, conv)
+			conv.keepPendingAtBottom()
 			conv.scroll.ScrollToBottom()
 			glib.TimeoutAdd(50, func() bool {
 				conv.scroll.ScrollToBottom()
@@ -2283,13 +2388,12 @@ func (w *Window) reconcileTail(sessionID string) {
 						msgID := msg.ID
 						msgText := msg.Text
 						if matched.widget != nil {
+							matched.widget.SetWaiting(false, "")
 							conv.messageWidgets[msgID] = matched.widget
 							matched.widget.SetOnUndo(func() {
 								w.stageRevertToMessage(tab, conv, msgID, msgText)
 							})
-							if insertIdx < len(conv.messages)-1 {
-								conv.timelineBox.ReorderChildAfter(matched.widget, findPrevWidget(insertIdx))
-							}
+							conv.timelineBox.ReorderChildAfter(matched.widget, findPrevWidget(insertIdx))
 						}
 						return
 					}
@@ -2305,6 +2409,7 @@ func (w *Window) reconcileTail(sessionID string) {
 					}
 				},
 			)
+			conv.keepPendingAtBottom()
 
 			if appended {
 				conv.scroll.ScrollToBottom()
@@ -2693,9 +2798,10 @@ func (w *Window) rebuildAgentButtons() {
 }
 
 func (w *Window) rebuildAgentPills() {
-	for child := w.agentButtonsBox.FirstChild(); child != nil; child = w.agentButtonsBox.FirstChild() {
-		w.agentButtonsBox.Remove(child)
+	for child := w.agentListBox.FirstChild(); child != nil; child = w.agentListBox.FirstChild() {
+		w.agentListBox.Remove(child)
 	}
+	w.agentRows = nil
 	primary := opencode.PrimaryAgents(w.agents)
 	if len(primary) == 0 {
 		primary = []opencode.Agent{
@@ -2715,38 +2821,52 @@ func (w *Window) rebuildAgentPills() {
 		agentID := ag.ID
 		isActive := strings.EqualFold(agentID, activeAgent)
 
-		btn := gtk.NewButton()
-		btn.AddCSSClass("glup-agent-pill")
+		row := gtk.NewListBoxRow()
+		box := gtk.NewBox(gtk.OrientationHorizontal, 8)
+		box.SetMarginTop(6)
+		box.SetMarginBottom(6)
+		box.SetMarginStart(10)
+		box.SetMarginEnd(10)
+
+		vbox := gtk.NewBox(gtk.OrientationVertical, 2)
+		vbox.SetHExpand(true)
+
+		titleLbl := gtk.NewLabel(formatAgentDisplayName(agentID))
+		titleLbl.SetXAlign(0)
+		titleLbl.SetEllipsize(pango.EllipsizeEnd)
+		titleLbl.AddCSSClass("glup-agent-pill-label")
 		switch strings.ToLower(agentID) {
 		case "build", "plan", "bare", "orchestrator":
-			btn.AddCSSClass("glup-agent-" + strings.ToLower(agentID))
+			titleLbl.AddCSSClass("glup-agent-text-" + strings.ToLower(agentID))
 		}
-		if isActive {
-			btn.AddCSSClass("glup-agent-pill-active")
+		vbox.Append(titleLbl)
+
+		if desc := strings.TrimSpace(ag.Description); desc != "" {
+			subLbl := gtk.NewLabel(desc)
+			subLbl.SetXAlign(0)
+			subLbl.SetEllipsize(pango.EllipsizeEnd)
+			subLbl.AddCSSClass("caption")
+			subLbl.AddCSSClass("dim-label")
+			vbox.Append(subLbl)
+			row.SetTooltipText(desc)
 		}
 
-		pillBox := gtk.NewBox(gtk.OrientationHorizontal, 5)
-		pillBox.SetHAlign(gtk.AlignCenter)
-		pillBox.SetVAlign(gtk.AlignCenter)
-		if isActive {
-			checkIcon := gtk.NewImageFromIconName("object-select-symbolic")
-			checkIcon.SetPixelSize(14)
-			checkIcon.SetVAlign(gtk.AlignCenter)
-			pillBox.Append(checkIcon)
-		}
-		lbl := gtk.NewLabel(formatAgentDisplayName(agentID))
-		lbl.SetVAlign(gtk.AlignCenter)
-		pillBox.Append(lbl)
-		btn.SetChild(pillBox)
+		box.Append(vbox)
 
-		if ag.Description != "" {
-			btn.SetTooltipText(ag.Description)
+		if isActive {
+			checkImg := gtk.NewImageFromIconName("object-select-symbolic")
+			checkImg.SetPixelSize(16)
+			checkImg.SetVAlign(gtk.AlignCenter)
+			checkImg.AddCSSClass("glup-model-selected-icon")
+			box.Append(checkImg)
 		}
-		btn.ConnectClicked(func() {
-			w.switchAgent(agentID)
-			w.agentPopover.Popdown()
+
+		row.SetChild(box)
+		w.agentListBox.Append(row)
+		w.agentRows = append(w.agentRows, agentRowData{
+			row:     row,
+			agentID: agentID,
 		})
-		w.agentButtonsBox.Append(btn)
 	}
 }
 
@@ -2983,7 +3103,7 @@ func (w *Window) createNewSession() {
 	})
 }
 
-func (w *Window) sendPrompt() {
+func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	tab := w.currentTab()
 	if tab == nil {
 		return
@@ -3057,6 +3177,7 @@ func (w *Window) sendPrompt() {
 			sessionID := conv.session.ID
 			uw := NewUserMessageWidget(w.ctx, text)
 			conv.timelineBox.Append(uw)
+			conv.keepPendingAtBottom()
 			conv.scroll.ScrollToBottom()
 			w.setConvActive(sessionID, true)
 
@@ -3095,31 +3216,43 @@ func (w *Window) sendPrompt() {
 		text = strings.Join(parts, " ")
 	}
 
+	if delivery == "" {
+		delivery = opencode.DeliveryQueue
+	}
+
 	sessionID := conv.session.ID
 	uw := NewUserMessageWidget(w.ctx, text, files...)
-	conv.pendingPrompts = append(conv.pendingPrompts, pendingPrompt{text: text, widget: uw})
+	uw.SetWaiting(true, delivery)
+
+	p := &pendingPrompt{
+		text:     text,
+		files:    files,
+		delivery: delivery,
+		widget:   uw,
+	}
+	w.bindPendingPromptCallbacks(conv, p)
+	conv.pendingPrompts = append(conv.pendingPrompts, p)
 	conv.timelineBox.Append(uw)
+	conv.keepPendingAtBottom()
 	conv.scroll.ScrollToBottom()
 	w.setConvActive(sessionID, true)
 
 	opts := parseMentions(text, w.skills, w.agents, w.activeDirectory())
 	opts.Files = files
+	opts.Delivery = delivery
 
 	gtkutil.Async(w.ctx, func() func() {
-		var err error
-		if len(opts.Paths) > 0 || len(opts.Agents) > 0 || len(opts.Skills) > 0 {
-			err = w.client.PromptWithOptions(w.ctx, sessionID, opts)
-		} else {
-			err = w.client.PromptWithFiles(w.ctx, sessionID, text, files)
-		}
+		item, err := w.client.SendPrompt(w.ctx, sessionID, opts)
 		return func() {
 			if err != nil {
 				slog.Error("failed to send prompt", "err", err)
 				app.Error(w.ctx, err)
 				w.setConvActive(sessionID, false)
-				conv.timelineBox.Remove(uw)
-				for i, p := range conv.pendingPrompts {
-					if p.widget == uw {
+				if p.widget != nil && p.widget.Parent() != nil {
+					conv.timelineBox.Remove(p.widget)
+				}
+				for i, cur := range conv.pendingPrompts {
+					if cur == p {
 						conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
 						break
 					}
@@ -3132,9 +3265,185 @@ func (w *Window) sendPrompt() {
 					w.pendingFiles = files
 					w.rebuildAttachmentTray()
 				}
+				return
+			}
+			if item != nil && item.ID != "" {
+				p.inboxID = item.ID
+				if item.Delivery != "" {
+					p.delivery = item.Delivery
+				}
+				if p.cancelled {
+					inboxID := p.inboxID
+					gtkutil.Async(w.ctx, func() func() {
+						_, _ = w.client.CancelInbox(w.ctx, sessionID, inboxID)
+						return func() {}
+					})
+					return
+				}
+				if conv.seenMsgIDs[p.inboxID] {
+					msgID := p.inboxID
+					msgText := p.text
+					if p.widget != nil {
+						p.widget.SetWaiting(false, "")
+						conv.messageWidgets[msgID] = p.widget
+						p.widget.SetOnUndo(func() {
+							w.stageRevertToMessage(tab, conv, msgID, msgText)
+						})
+					}
+					for i, cur := range conv.pendingPrompts {
+						if cur == p {
+							conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
+							break
+						}
+					}
+					return
+				}
+				if p.widget != nil {
+					p.widget.SetWaiting(true, p.delivery)
+				}
 			}
 		}
 	})
+}
+
+func (w *Window) bindPendingPromptCallbacks(conv *convTimeline, p *pendingPrompt) {
+	if p == nil || p.widget == nil {
+		return
+	}
+	p.widget.SetOnSteer(func() {
+		w.steerPendingPrompt(conv, p)
+	})
+	p.widget.SetOnCancel(func() {
+		w.cancelPendingPrompt(conv, p)
+	})
+}
+
+func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
+	if conv == nil || p == nil || p.cancelled {
+		return
+	}
+	p.delivery = opencode.DeliverySteer
+	if p.widget != nil {
+		p.widget.SetWaiting(true, opencode.DeliverySteer)
+	}
+	if p.inboxID == "" {
+		return
+	}
+	sessionID := conv.session.ID
+	inboxID := p.inboxID
+	gtkutil.Async(w.ctx, func() func() {
+		_, err := w.client.UpdateInboxDelivery(w.ctx, sessionID, inboxID, opencode.DeliverySteer)
+		return func() {
+			if err != nil {
+				slog.Error("failed to steer inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
+				app.Error(w.ctx, err)
+			}
+		}
+	})
+}
+
+func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
+	if conv == nil || p == nil || p.cancelled {
+		return
+	}
+	p.cancelled = true
+	if p.widget != nil && p.widget.Parent() != nil {
+		conv.timelineBox.Remove(p.widget)
+	}
+	for i, cur := range conv.pendingPrompts {
+		if cur == p {
+			conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
+			break
+		}
+	}
+	start, end := w.inputBuffer.Bounds()
+	if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" && p.text != "" {
+		w.inputBuffer.SetText(p.text)
+	}
+	if len(p.files) > 0 && len(w.pendingFiles) == 0 {
+		w.pendingFiles = slices.Clone(p.files)
+		w.rebuildAttachmentTray()
+	}
+	if p.inboxID == "" {
+		return
+	}
+	sessionID := conv.session.ID
+	inboxID := p.inboxID
+	gtkutil.Async(w.ctx, func() func() {
+		_, err := w.client.CancelInbox(w.ctx, sessionID, inboxID)
+		return func() {
+			if err != nil {
+				slog.Error("failed to cancel inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
+			}
+		}
+	})
+}
+
+func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencode.InboxEvent) {
+	if conv == nil {
+		return
+	}
+	inboxID := ev.InboxID
+	if inboxID == "" && ev.Item != nil {
+		inboxID = ev.Item.ID
+	}
+	delivery := ev.Delivery
+	if delivery == "" && ev.Item != nil {
+		delivery = ev.Item.Delivery
+	}
+	if delivery == "" {
+		delivery = opencode.DeliveryQueue
+	}
+	var itemText string
+	var itemFiles []opencode.FileAttachment
+	if ev.Item != nil {
+		if ev.Item.Type != "" && ev.Item.Type != "user" {
+			return
+		}
+		itemText = strings.TrimSpace(ev.Item.Content.Text)
+		itemFiles = ev.Item.Content.Files
+	}
+
+	if inboxID != "" && conv.seenMsgIDs[inboxID] {
+		return
+	}
+
+	for _, p := range conv.pendingPrompts {
+		if p == nil || p.cancelled {
+			continue
+		}
+		if (inboxID != "" && p.inboxID == inboxID) || (p.inboxID == "" && itemText != "" && p.text == itemText) {
+			if inboxID != "" {
+				p.inboxID = inboxID
+			}
+			p.delivery = delivery
+			if p.widget != nil {
+				p.widget.SetWaiting(true, delivery)
+			}
+			conv.keepPendingAtBottom()
+			return
+		}
+	}
+
+	if itemText == "" && len(itemFiles) == 0 {
+		return
+	}
+	uw := NewUserMessageWidget(w.ctx, itemText, itemFiles...)
+	uw.SetWaiting(true, delivery)
+	p := &pendingPrompt{
+		inboxID:  inboxID,
+		text:     itemText,
+		files:    itemFiles,
+		delivery: delivery,
+		widget:   uw,
+	}
+	w.bindPendingPromptCallbacks(conv, p)
+	conv.pendingPrompts = append(conv.pendingPrompts, p)
+	if conv.loaded {
+		conv.timelineBox.Append(uw)
+		conv.keepPendingAtBottom()
+		conv.scroll.ScrollToBottom()
+	}
 }
 
 func (w *Window) setupCompletion() {
@@ -3259,7 +3568,7 @@ func computeMessageInsertIndex(
 func reconcileConvMessages(
 	currentMessages *[]opencode.Message,
 	seenIDs map[string]bool,
-	pendingPrompts *[]pendingPrompt,
+	pendingPrompts *[]*pendingPrompt,
 	pageMessages []opencode.Message,
 	isInFlight func(id string) bool,
 	onInsert func(msg opencode.Message, insertIdx int, matchedPending *pendingPrompt),
@@ -3279,13 +3588,24 @@ func reconcileConvMessages(
 		}
 		var matched *pendingPrompt
 		if msg.Type == "user" && pendingPrompts != nil {
+			matchIdx := -1
 			for i, p := range *pendingPrompts {
-				if p.text == msg.Text {
-					promptCopy := p
-					matched = &promptCopy
-					*pendingPrompts = append((*pendingPrompts)[:i], (*pendingPrompts)[i+1:]...)
+				if p != nil && msg.ID != "" && p.inboxID == msg.ID {
+					matchIdx = i
 					break
 				}
+			}
+			if matchIdx == -1 {
+				for i, p := range *pendingPrompts {
+					if p != nil && (p.inboxID == "" || msg.ID == "") && p.text == msg.Text {
+						matchIdx = i
+						break
+					}
+				}
+			}
+			if matchIdx >= 0 {
+				matched = (*pendingPrompts)[matchIdx]
+				*pendingPrompts = append((*pendingPrompts)[:matchIdx], (*pendingPrompts)[matchIdx+1:]...)
 			}
 		}
 		if seenIDs != nil {
@@ -3464,6 +3784,7 @@ func (w *Window) applyRevertState(tab *sessionTab, conv *convTimeline) {
 	}
 	conv.revertBanner.Update(len(hiddenIDs), revert.Diff)
 	conv.revertBanner.SetVisible(true)
+	conv.keepPendingAtBottom()
 	conv.scroll.ScrollToBottom()
 }
 
@@ -3762,6 +4083,7 @@ func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgI
 	})
 	conv.seenMsgIDs[msgID] = true
 	conv.timelineBox.Append(aw)
+	conv.keepPendingAtBottom()
 	return aw
 }
 
@@ -3942,7 +4264,55 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			}
 		}
 
-	case "session.inbox.delivered", "session.inbox.enqueued", "session.synthetic",
+	case "session.inbox.enqueued":
+		var d opencode.InboxEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			tab, conv := w.resolveConv(d.SessionID)
+			if tab != nil {
+				tab.main.session.Time.Updated = time.Now().UnixMilli()
+			}
+			if conv != nil {
+				conv.session.Time.Updated = time.Now().UnixMilli()
+				w.onInboxEnqueued(tab, conv, d)
+			}
+		}
+
+	case "session.inbox.delivery.changed":
+		var d opencode.InboxEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			_, conv := w.resolveConv(d.SessionID)
+			if conv != nil && d.InboxID != "" {
+				for _, p := range conv.pendingPrompts {
+					if p != nil && p.inboxID == d.InboxID {
+						p.delivery = d.Delivery
+						if p.widget != nil {
+							p.widget.SetWaiting(true, d.Delivery)
+						}
+						break
+					}
+				}
+			}
+		}
+
+	case "session.inbox.cancelled":
+		var d opencode.InboxEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			_, conv := w.resolveConv(d.SessionID)
+			if conv != nil && d.InboxID != "" {
+				for i, p := range conv.pendingPrompts {
+					if p != nil && p.inboxID == d.InboxID {
+						p.cancelled = true
+						if p.widget != nil && p.widget.Parent() != nil {
+							conv.timelineBox.Remove(p.widget)
+						}
+						conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
+						break
+					}
+				}
+			}
+		}
+
+	case "session.inbox.delivered", "session.synthetic",
 		"session.compaction.started", "session.compaction.ended", "session.compaction.failed":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {

@@ -303,7 +303,7 @@ func TestReconcileTailOrderingAndUndo(t *testing.T) {
 		}
 		inFlight := map[string]bool{"a2": true}
 		seenIDs := map[string]bool{"u1": true, "a1": true, "a2": true}
-		pendingPrompts := []pendingPrompt{
+		pendingPrompts := []*pendingPrompt{
 			{text: "second prompt"},
 		}
 		page := []opencode.Message{
@@ -362,6 +362,40 @@ func TestReconcileTailOrderingAndUndo(t *testing.T) {
 		}
 		if !slices.Equal(gotIDs, wantIDs) {
 			t.Fatalf("expected message order %v, got %v", wantIDs, gotIDs)
+		}
+	})
+
+	t.Run("pending prompt matches by inboxID first", func(t *testing.T) {
+		currentMessages := []opencode.Message{
+			{ID: "u1", Type: "user", Text: "first prompt"},
+		}
+		seenIDs := map[string]bool{"u1": true}
+		p1 := &pendingPrompt{inboxID: "inb_1", text: "same text"}
+		p2 := &pendingPrompt{inboxID: "inb_2", text: "same text"}
+		pendingPrompts := []*pendingPrompt{p1, p2}
+
+		page := []opencode.Message{
+			{ID: "u1", Type: "user", Text: "first prompt"},
+			{ID: "inb_2", Type: "user", Text: "same text"},
+		}
+
+		var gotMatched *pendingPrompt
+		reconcileConvMessages(
+			&currentMessages,
+			seenIDs,
+			&pendingPrompts,
+			page,
+			nil,
+			func(_ opencode.Message, _ int, matched *pendingPrompt) {
+				gotMatched = matched
+			},
+		)
+
+		if gotMatched != p2 {
+			t.Fatalf("expected matched pending prompt p2 (inb_2), got %+v", gotMatched)
+		}
+		if len(pendingPrompts) != 1 || pendingPrompts[0] != p1 {
+			t.Fatalf("expected p1 to remain in pendingPrompts, got %+v", pendingPrompts)
 		}
 	})
 

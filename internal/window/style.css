@@ -19,6 +19,11 @@
 	margin: 10px 0;
 }
 
+.glup-user-card-queued {
+	background-color: alpha(@card_bg_color, 0.65);
+	border: 1px dashed alpha(@accent_color, 0.55);
+}
+
 .glup-user-card .glup-md-view {
 	margin-top: 0;
 	margin-bottom: 0;
@@ -676,17 +681,46 @@ GtkSourceAssistant.completion box.details * {
 	border-radius: 4px;
 }
 
-.glup-user-undo-btn {
+.glup-user-undo-btn,
+.glup-user-cancel-btn {
 	min-width: 22px;
 	min-height: 22px;
 	padding: 1px;
 	border-radius: 6px;
-	opacity: 0.5;
+	opacity: 0.55;
 	transition: opacity 120ms ease;
 }
 
+.glup-user-cancel-btn {
+	opacity: 0.7;
+}
+
+.glup-user-cancel-btn:hover {
+	color: @error_color;
+	opacity: 1.0;
+}
+
+.glup-user-steer-btn {
+	min-height: 22px;
+	padding: 1px 7px;
+	border-radius: 6px;
+	font-size: 0.8em;
+	font-weight: 600;
+	color: @accent_color;
+	background-color: alpha(@accent_bg_color, 0.14);
+	border: 1px solid alpha(@accent_color, 0.3);
+	opacity: 0.9;
+	transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.glup-user-steer-btn:hover {
+	opacity: 1.0;
+	background-color: alpha(@accent_bg_color, 0.25);
+}
+
 .glup-user-card:hover .glup-user-undo-btn,
-.glup-user-undo-btn:hover {
+.glup-user-undo-btn:hover,
+.glup-user-card:hover .glup-user-cancel-btn {
 	opacity: 1.0;
 }
 

@@ -30,14 +30,69 @@ var _ = cssutil.WriteCSS(styleCSS)
 // UserMessageWidget displays a user post inside a card box.
 type UserMessageWidget struct {
 	*gtk.Box
-	mdView  *mdstream.View
-	undoBtn *gtk.Button
-	onUndo  func()
+	mdView    *mdstream.View
+	undoBtn   *gtk.Button
+	steerBtn  *gtk.Button
+	cancelBtn *gtk.Button
+	onUndo    func()
+	onSteer   func()
+	onCancel  func()
+	waiting   bool
+	delivery  opencode.InboxDelivery
 }
 
 // SetOnUndo sets the callback invoked when the user clicks the Undo button on this card.
 func (u *UserMessageWidget) SetOnUndo(fn func()) {
 	u.onUndo = fn
+}
+
+// SetOnSteer sets the callback invoked when the user clicks the Steer button on a queued card.
+func (u *UserMessageWidget) SetOnSteer(fn func()) {
+	u.onSteer = fn
+}
+
+// SetOnCancel sets the callback invoked when the user clicks the Cancel/withhold button on a waiting card.
+func (u *UserMessageWidget) SetOnCancel(fn func()) {
+	u.onCancel = fn
+}
+
+// Waiting reports whether this user message card is currently waiting in the inbox to be delivered.
+func (u *UserMessageWidget) Waiting() bool {
+	return u.waiting
+}
+
+// Delivery returns the current inbox delivery mode when the card is waiting.
+func (u *UserMessageWidget) Delivery() opencode.InboxDelivery {
+	return u.delivery
+}
+
+// SetWaiting configures whether the user prompt card is waiting to be sent (showing Steer and Cancel/withhold
+// instead of Revert) or already delivered (showing the Revert button).
+func (u *UserMessageWidget) SetWaiting(waiting bool, delivery opencode.InboxDelivery) {
+	u.waiting = waiting
+	u.delivery = delivery
+	if waiting {
+		u.Box.AddCSSClass("glup-user-card-queued")
+		u.undoBtn.SetVisible(false)
+		u.cancelBtn.SetVisible(true)
+		showSteer := delivery != opencode.DeliverySteer
+		u.steerBtn.SetVisible(showSteer)
+		if u.mdView != nil {
+			if showSteer {
+				u.mdView.SetMarginEnd(104)
+			} else {
+				u.mdView.SetMarginEnd(32)
+			}
+		}
+	} else {
+		u.Box.RemoveCSSClass("glup-user-card-queued")
+		u.steerBtn.SetVisible(false)
+		u.cancelBtn.SetVisible(false)
+		u.undoBtn.SetVisible(true)
+		if u.mdView != nil {
+			u.mdView.SetMarginEnd(26)
+		}
+	}
 }
 
 // NewUserMessageWidget creates a new UserMessageWidget displaying user text and file attachments.
@@ -57,7 +112,7 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 		userMD = mdstream.NewView(ctx)
 		userMD.SetStatic(trimmed)
 		userMD.SetVAlign(gtk.AlignCenter)
-		userMD.SetMarginEnd(26) // reserve space so bottom-right undo icon never overlaps text
+		userMD.SetMarginEnd(26) // reserve space so bottom-right action icons never overlap text
 		contentBox.SetVAlign(gtk.AlignCenter)
 		contentBox.Append(userMD)
 	}
@@ -91,25 +146,66 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 
 	overlay.SetChild(contentBox)
 
+	actionsBox := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	actionsBox.SetHAlign(gtk.AlignEnd)
+	actionsBox.SetVAlign(gtk.AlignEnd)
+
+	steerBtn := gtk.NewButton()
+	steerBtn.AddCSSClass("flat")
+	steerBtn.AddCSSClass("glup-user-steer-btn")
+	steerBtn.SetTooltipText("Steer (send immediately)")
+	steerBtn.SetVAlign(gtk.AlignCenter)
+	steerBtn.SetVisible(false)
+	steerInner := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	steerInner.SetVAlign(gtk.AlignCenter)
+	steerIcon := gtk.NewImageFromIconName("paper-plane-symbolic")
+	steerIcon.SetPixelSize(13)
+	steerLbl := gtk.NewLabel("Steer")
+	steerInner.Append(steerIcon)
+	steerInner.Append(steerLbl)
+	steerBtn.SetChild(steerInner)
+
+	cancelBtn := gtk.NewButtonFromIconName("window-close-symbolic")
+	cancelBtn.AddCSSClass("flat")
+	cancelBtn.AddCSSClass("glup-user-cancel-btn")
+	cancelBtn.SetTooltipText("Cancel / withhold prompt")
+	cancelBtn.SetVAlign(gtk.AlignCenter)
+	cancelBtn.SetVisible(false)
+
 	undoBtn := gtk.NewButtonFromIconName("edit-undo-symbolic")
 	undoBtn.AddCSSClass("flat")
 	undoBtn.AddCSSClass("glup-user-undo-btn")
 	undoBtn.SetTooltipText("Revert to here")
-	undoBtn.SetHAlign(gtk.AlignEnd)
-	undoBtn.SetVAlign(gtk.AlignEnd)
+	undoBtn.SetVAlign(gtk.AlignCenter)
 
-	overlay.AddOverlay(undoBtn)
+	actionsBox.Append(steerBtn)
+	actionsBox.Append(cancelBtn)
+	actionsBox.Append(undoBtn)
+
+	overlay.AddOverlay(actionsBox)
 	box.Append(overlay)
 
 	w := &UserMessageWidget{
-		Box:     box,
-		mdView:  userMD,
-		undoBtn: undoBtn,
+		Box:       box,
+		mdView:    userMD,
+		undoBtn:   undoBtn,
+		steerBtn:  steerBtn,
+		cancelBtn: cancelBtn,
 	}
 
 	undoBtn.ConnectClicked(func() {
 		if w.onUndo != nil {
 			w.onUndo()
+		}
+	})
+	steerBtn.ConnectClicked(func() {
+		if w.onSteer != nil {
+			w.onSteer()
+		}
+	})
+	cancelBtn.ConnectClicked(func() {
+		if w.onCancel != nil {
+			w.onCancel()
 		}
 	})
 

@@ -1760,3 +1760,100 @@ func TestDiscover(t *testing.T) {
 	})
 }
 
+func TestInboxEndpoints(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		capturedPromptBody PromptRequest
+		capturedPatchBody  map[string]any
+		cancelledInboxID   string
+	)
+
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/prompt":
+					if err := json.NewDecoder(req.Body).Decode(&capturedPromptBody); err != nil {
+						t.Fatalf("decode prompt body: %v", err)
+					}
+					resp := `{"data":{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"queue","content":{"text":"queued prompt"}}}`
+					return &http.Response{
+						StatusCode: http.StatusCreated,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(resp)),
+					}, nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/inbox":
+					resp := `{"data":[{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"queue","content":{"text":"queued prompt"}}]}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(resp)),
+					}, nil
+				case req.Method == http.MethodPatch && req.URL.Path == "/api/session/ses_123/inbox/inb_1":
+					if err := json.NewDecoder(req.Body).Decode(&capturedPatchBody); err != nil {
+						t.Fatalf("decode patch body: %v", err)
+					}
+					resp := `{"data":{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"steer","content":{"text":"queued prompt"}}}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(resp)),
+					}, nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/session/ses_123/inbox/inb_1":
+					cancelledInboxID = "inb_1"
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":{"id":"inb_1"}}`)),
+					}, nil
+				default:
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       io.NopCloser(strings.NewReader("not found")),
+					}, nil
+				}
+			}),
+		},
+	}
+
+	item, err := client.SendPrompt(ctx, "ses_123", PromptOptions{
+		Text:     "queued prompt",
+		Delivery: DeliveryQueue,
+	})
+	if err != nil {
+		t.Fatalf("SendPrompt failed: %v", err)
+	}
+	if capturedPromptBody.Delivery != DeliveryQueue {
+		t.Errorf("capturedPromptBody.Delivery = %q, want %q", capturedPromptBody.Delivery, DeliveryQueue)
+	}
+	if item == nil || item.ID != "inb_1" || item.Delivery != DeliveryQueue {
+		t.Errorf("SendPrompt returned unexpected item: %+v", item)
+	}
+
+	items, err := client.ListInbox(ctx, "ses_123")
+	if err != nil {
+		t.Fatalf("ListInbox failed: %v", err)
+	}
+	if len(items) != 1 || items[0].ID != "inb_1" || items[0].Content.Text != "queued prompt" {
+		t.Errorf("ListInbox returned unexpected items: %+v", items)
+	}
+
+	if _, err := client.UpdateInboxDelivery(ctx, "ses_123", "inb_1", DeliverySteer); err != nil {
+		t.Fatalf("UpdateInboxDelivery failed: %v", err)
+	}
+	if capturedPatchBody["delivery"] != "steer" {
+		t.Errorf("capturedPatchBody = %+v, want delivery=steer", capturedPatchBody)
+	}
+
+	if _, err := client.CancelInbox(ctx, "ses_123", "inb_1"); err != nil {
+		t.Fatalf("CancelInbox failed: %v", err)
+	}
+	if cancelledInboxID != "inb_1" {
+		t.Errorf("cancelledInboxID = %q, want inb_1", cancelledInboxID)
+	}
+}
+
+

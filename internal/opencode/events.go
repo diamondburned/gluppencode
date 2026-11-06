@@ -140,6 +140,15 @@ type RevertCommittedEvent struct {
 	MessageID string `json:"messageID"`
 }
 
+// InboxEvent is emitted for "session.inbox.enqueued", "session.inbox.delivered",
+// "session.inbox.cancelled", and "session.inbox.delivery.changed".
+type InboxEvent struct {
+	SessionID string        `json:"sessionID"`
+	InboxID   string        `json:"inboxID"`
+	Delivery  InboxDelivery `json:"delivery,omitempty"`
+	Item      *InboxItem    `json:"item,omitempty"`
+}
+
 // ShellEvent is emitted for "shell.created", "shell.exited", and "shell.deleted".
 type ShellEvent struct {
 	ID      string    `json:"id,omitempty"`

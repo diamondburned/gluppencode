@@ -844,6 +844,56 @@ func (c *Client) ListMessages(ctx context.Context, sessionID string, limit int) 
 	return page.Messages, nil
 }
 
+// InboxDelivery specifies how a prompt or inbox item should be delivered.
+type InboxDelivery string
+
+const (
+	// DeliveryQueue enqueues the prompt to be delivered when the session is ready.
+	DeliveryQueue InboxDelivery = "queue"
+	// DeliverySteer delivers the prompt at the next step boundary, waking or steering execution.
+	DeliverySteer InboxDelivery = "steer"
+)
+
+// InboxContent holds the text and file attachments inside an InboxItem.
+type InboxContent struct {
+	Text  string           `json:"text,omitempty"`
+	Files []FileAttachment `json:"files,omitempty"`
+}
+
+// InboxItem represents a pending item in a session's durable inbox.
+type InboxItem struct {
+	ID       string           `json:"id"`
+	Type     string           `json:"type"` // "user", "synthetic", "compaction"
+	Text     string           `json:"text,omitempty"`
+	Files    []FileAttachment `json:"files,omitempty"`
+	Content  InboxContent     `json:"content,omitempty"`
+	Delivery InboxDelivery    `json:"delivery,omitempty"`
+	Time     struct {
+		Created int64 `json:"created"`
+	} `json:"time"`
+}
+
+// UnmarshalJSON unmarshals an InboxItem, populating both top-level Text/Files and Content.
+func (i *InboxItem) UnmarshalJSON(b []byte) error {
+	type rawInboxItem InboxItem
+	var raw rawInboxItem
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*i = InboxItem(raw)
+	if i.Text == "" && i.Content.Text != "" {
+		i.Text = i.Content.Text
+	} else if i.Content.Text == "" && i.Text != "" {
+		i.Content.Text = i.Text
+	}
+	if len(i.Files) == 0 && len(i.Content.Files) > 0 {
+		i.Files = i.Content.Files
+	} else if len(i.Content.Files) == 0 && len(i.Files) > 0 {
+		i.Content.Files = i.Files
+	}
+	return nil
+}
+
 // PromptMention describes the text and character span of an @ mention in a prompt.
 type PromptMention struct {
 	Start int    `json:"start"`
@@ -865,11 +915,12 @@ type PromptSkillInput struct {
 
 // PromptOptions holds text and rich attachments for a prompt request.
 type PromptOptions struct {
-	Text   string
-	Files  []FileAttachment   // inline base64 images
-	Paths  []PromptFileInput  // file:/// URI attachments with optional Mention
-	Agents []PromptAgentInput // @agent mentions
-	Skills []PromptSkillInput // @skill mentions
+	Text     string
+	Files    []FileAttachment   // inline base64 images
+	Paths    []PromptFileInput  // file:/// URI attachments with optional Mention
+	Agents   []PromptAgentInput // @agent mentions
+	Skills   []PromptSkillInput // @skill mentions
+	Delivery InboxDelivery      // "queue" or "steer"
 }
 
 // PromptFileSource indicates how file content is provided in prompt inputs.
@@ -889,15 +940,16 @@ type PromptFileInput struct {
 
 // PromptRequest is the payload sent to POST /api/session/{sessionID}/prompt.
 type PromptRequest struct {
-	Text   string             `json:"text"`
-	Files  []PromptFileInput  `json:"files,omitempty"`
-	Agents []PromptAgentInput `json:"agents,omitempty"`
-	Skills []PromptSkillInput `json:"skills,omitempty"`
-	Resume bool               `json:"resume,omitempty"`
+	Text     string             `json:"text"`
+	Files    []PromptFileInput  `json:"files,omitempty"`
+	Agents   []PromptAgentInput `json:"agents,omitempty"`
+	Skills   []PromptSkillInput `json:"skills,omitempty"`
+	Delivery InboxDelivery      `json:"delivery,omitempty"`
+	Resume   bool               `json:"resume,omitempty"`
 }
 
-// PromptWithOptions sends a user prompt with attachments, file paths, and mentions to a session.
-func (c *Client) PromptWithOptions(ctx context.Context, sessionID string, opts PromptOptions) error {
+// SendPrompt sends a user prompt with options to a session and returns the created inbox item.
+func (c *Client) SendPrompt(ctx context.Context, sessionID string, opts PromptOptions) (*InboxItem, error) {
 	var inputFiles []PromptFileInput
 	for _, f := range opts.Files {
 		uri := f.Data
@@ -931,14 +983,32 @@ func (c *Client) PromptWithOptions(ctx context.Context, sessionID string, opts P
 	}
 
 	req := PromptRequest{
-		Text:   text,
-		Files:  inputFiles,
-		Agents: opts.Agents,
-		Skills: opts.Skills,
-		Resume: true,
+		Text:     text,
+		Files:    inputFiles,
+		Agents:   opts.Agents,
+		Skills:   opts.Skills,
+		Delivery: opts.Delivery,
+		Resume:   true,
 	}
 	path := fmt.Sprintf("/api/session/%s/prompt", url.PathEscape(sessionID))
-	return c.doJSON(ctx, http.MethodPost, path, req, nil)
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodPost, path, req, &raw); err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	var item InboxItem
+	if err := decodeDataOrDirect(raw, &item); err != nil {
+		return nil, nil
+	}
+	return &item, nil
+}
+
+// PromptWithOptions sends a user prompt with attachments, file paths, and mentions to a session.
+func (c *Client) PromptWithOptions(ctx context.Context, sessionID string, opts PromptOptions) error {
+	_, err := c.SendPrompt(ctx, sessionID, opts)
+	return err
 }
 
 // PromptWithFiles sends a user prompt with file attachments to a session.
@@ -954,6 +1024,56 @@ func (c *Client) Prompt(ctx context.Context, sessionID, text string) error {
 	return c.PromptWithOptions(ctx, sessionID, PromptOptions{
 		Text: text,
 	})
+}
+
+// ListInbox lists pending inbox items for a session (GET /api/session/{sessionID}/inbox).
+func (c *Client) ListInbox(ctx context.Context, sessionID string) ([]InboxItem, error) {
+	path := fmt.Sprintf("/api/session/%s/inbox", url.PathEscape(sessionID))
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var items []InboxItem
+	if err := decodeDataOrDirect(raw, &items); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+// UpdateInboxDelivery updates the delivery mode of a pending inbox item
+// (PATCH /api/session/{sessionID}/inbox/{inboxID}).
+func (c *Client) UpdateInboxDelivery(ctx context.Context, sessionID, inboxID string, delivery InboxDelivery) (*InboxItem, error) {
+	path := fmt.Sprintf("/api/session/%s/inbox/%s", url.PathEscape(sessionID), url.PathEscape(inboxID))
+	body := map[string]any{"delivery": delivery}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodPatch, path, body, &raw); err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	var item InboxItem
+	if err := decodeDataOrDirect(raw, &item); err != nil {
+		return nil, err
+	}
+	return &item, nil
+}
+
+// CancelInbox cancels and removes a pending inbox item (DELETE /api/session/{sessionID}/inbox/{inboxID}).
+func (c *Client) CancelInbox(ctx context.Context, sessionID, inboxID string) (*InboxItem, error) {
+	path := fmt.Sprintf("/api/session/%s/inbox/%s", url.PathEscape(sessionID), url.PathEscape(inboxID))
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	var item InboxItem
+	if err := decodeDataOrDirect(raw, &item); err != nil {
+		return nil, nil
+	}
+	return &item, nil
 }
 
 // Interrupt stops ongoing execution in a session.
