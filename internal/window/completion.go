@@ -135,6 +135,16 @@ var completionProviderType = coreglib.RegisterSubclass[*CompletionProvider](
 			Populate: func(context *gtksource.CompletionContext) (*gio.ListModel, error) {
 				return p.populate(context)
 			},
+			Refilter: func(context *gtksource.CompletionContext, model gio.ListModeller) {
+				if context == nil {
+					return
+				}
+				proposals, err := p.populate(context)
+				if err != nil {
+					return
+				}
+				context.SetProposalsForProvider(wrapGTKSourceCompletionProvider(&p.Object), proposals)
+			},
 			Display: func(context *gtksource.CompletionContext, proposal gtksource.CompletionProposaller, cell *gtksource.CompletionCell) {
 				p.display(context, proposal, cell)
 			},
@@ -177,10 +187,24 @@ func newCompletionProvider(w *Window) *gtksource.CompletionProvider {
 
 func (p *CompletionProvider) isTrigger(iter *gtk.TextIter, ch uint32) bool {
 	r := rune(ch)
+	if r == 0 || unicode.IsSpace(r) {
+		return false
+	}
+	if iter == nil {
+		return r == '/' || r == '@'
+	}
+	if p.window != nil && p.window.inputBuffer != nil {
+		end := iter.Copy()
+		if rune(end.Char()) == r {
+			end.ForwardChar()
+		}
+		trig, _, _ := extractTriggerAndQueryAt(p.window.inputBuffer, end)
+		return trig != 0
+	}
 	if r != '/' && r != '@' {
 		return false
 	}
-	if iter == nil || iter.IsStart() {
+	if iter.IsStart() {
 		return true
 	}
 	cur := iter.Copy()
@@ -382,11 +406,12 @@ func (p *CompletionProvider) activate(context *gtksource.CompletionContext, prop
 	}
 
 	var buf *gtksource.Buffer
-	var begin, end *gtk.TextIter
-	var ok bool
+	var end *gtk.TextIter
 	if context != nil {
 		buf = context.Buffer()
-		begin, end, ok = context.Bounds()
+		if _, endPtr, ok := context.Bounds(); ok && endPtr != nil {
+			end = endPtr
+		}
 	}
 	if buf == nil && p.window != nil {
 		buf = p.window.inputBuffer
@@ -395,66 +420,10 @@ func (p *CompletionProvider) activate(context *gtksource.CompletionContext, prop
 		return
 	}
 
-	if !ok || begin == nil || end == nil {
-		_, _, startIter := p.extractTriggerAndQuery(context)
-		if startIter == nil {
-			return
-		}
-		cursor := buf.IterAtMark(buf.GetInsert())
-		if cursor == nil {
-			_, cursor = buf.Bounds()
-		}
-		if cursor == nil {
-			return
-		}
-		begin = startIter
-		end = cursor
+	_, _, startIter := p.extractTriggerAndQuery(context)
+	if startIter == nil {
+		return
 	}
-
-	startIter := begin.Copy()
-	if !startIter.IsStart() {
-		prev := startIter.Copy()
-		prev.BackwardChar()
-		ch := rune(prev.Char())
-		if ch == '/' || ch == '@' {
-			startIter = prev
-		}
-	}
-
-	replacement := prop.TriggerText + " "
-	buf.BeginUserAction()
-	buf.Delete(startIter, end)
-	buf.Insert(startIter, replacement)
-	buf.EndUserAction()
-}
-
-func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionContext) (trigger rune, query string, startIter *gtk.TextIter) {
-	var buf *gtksource.Buffer
-	var begin, endPtr *gtk.TextIter
-	var ok bool
-	if ctx != nil {
-		buf = ctx.Buffer()
-		begin, endPtr, ok = ctx.Bounds()
-	}
-	if buf == nil && p.window != nil {
-		buf = p.window.inputBuffer
-	}
-	if buf == nil {
-		return 0, "", nil
-	}
-
-	var end *gtk.TextIter
-	if ok && begin != nil && endPtr != nil {
-		str := buf.Text(begin, endPtr, false)
-		if strings.HasPrefix(str, "/") {
-			return '/', strings.TrimPrefix(str, "/"), begin.Copy()
-		}
-		if strings.HasPrefix(str, "@") {
-			return '@', strings.TrimPrefix(str, "@"), begin.Copy()
-		}
-		end = endPtr
-	}
-
 	if end == nil {
 		if mark := buf.GetInsert(); mark != nil {
 			end = buf.IterAtMark(mark)
@@ -464,28 +433,78 @@ func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionCon
 		_, end = buf.Bounds()
 	}
 	if end == nil {
+		return
+	}
+
+	replacement := prop.TriggerText + " "
+	buf.BeginUserAction()
+	buf.Delete(startIter, end)
+	buf.Insert(startIter, replacement)
+	buf.PlaceCursor(startIter)
+	buf.EndUserAction()
+}
+
+func (p *CompletionProvider) extractTriggerAndQuery(ctx *gtksource.CompletionContext) (trigger rune, query string, startIter *gtk.TextIter) {
+	var buf *gtksource.Buffer
+	var end *gtk.TextIter
+	if ctx != nil {
+		buf = ctx.Buffer()
+		if _, endPtr, ok := ctx.Bounds(); ok && endPtr != nil {
+			end = endPtr
+		}
+	}
+	if buf == nil && p.window != nil {
+		buf = p.window.inputBuffer
+	}
+	if buf == nil {
+		return 0, "", nil
+	}
+	if end == nil {
+		if mark := buf.GetInsert(); mark != nil {
+			end = buf.IterAtMark(mark)
+		}
+	}
+	if end == nil {
+		_, end = buf.Bounds()
+	}
+	return extractTriggerAndQueryAt(buf, end)
+}
+
+func extractTriggerAndQueryAt(buf *gtksource.Buffer, end *gtk.TextIter) (trigger rune, query string, startIter *gtk.TextIter) {
+	if buf == nil || end == nil {
 		return 0, "", nil
 	}
 
 	lineStart := end.Copy()
 	lineStart.SetLineOffset(0)
 	lineText := buf.Text(lineStart, end, false)
-	for i := len(lineText) - 1; i >= 0; i-- {
-		ch := lineText[i]
-		if ch == '/' || ch == '@' {
-			isStartOrSpace := i == 0
-			if !isStartOrSpace {
-				prevRune, _ := utf8.DecodeLastRuneInString(lineText[:i])
-				isStartOrSpace = unicode.IsSpace(prevRune)
-			}
-			if isStartOrSpace {
-				triggerIter := lineStart.Copy()
-				triggerIter.SetLineOffset(utf8.RuneCountInString(lineText[:i]))
-				return rune(ch), lineText[i+1:], triggerIter
-			}
-		}
-		if unicode.IsSpace(rune(ch)) {
-			break
+	if len(lineText) == 0 {
+		return 0, "", nil
+	}
+	if r, _ := utf8.DecodeLastRuneInString(lineText); unicode.IsSpace(r) {
+		return 0, "", nil
+	}
+
+	lastSpace := strings.LastIndexFunc(lineText, unicode.IsSpace)
+	wordStartByte := 0
+	if lastSpace != -1 {
+		_, spaceSize := utf8.DecodeRuneInString(lineText[lastSpace:])
+		wordStartByte = lastSpace + spaceSize
+	}
+	word := lineText[wordStartByte:]
+	if strings.HasPrefix(word, "@") {
+		triggerIter := lineStart.Copy()
+		triggerIter.SetLineOffset(utf8.RuneCountInString(lineText[:wordStartByte]))
+		return '@', word[1:], triggerIter
+	}
+	if strings.HasPrefix(word, "/") {
+		bufStart, _ := buf.Bounds()
+		atBufferStart := strings.TrimSpace(lineText[:wordStartByte]) == "" &&
+			(bufStart == nil || strings.TrimSpace(buf.Text(bufStart, lineStart, false)) == "")
+		if atBufferStart {
+			triggerIter := lineStart.Copy()
+			triggerIter.SetLineOffset(utf8.RuneCountInString(lineText[:wordStartByte]))
+			return '/', word[1:], triggerIter
 		}
 	}
 

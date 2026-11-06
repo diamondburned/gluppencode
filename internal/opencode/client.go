@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"io"
@@ -117,7 +118,12 @@ func (c *Client) doJSON(ctx context.Context, method, path string, body, out any)
 		return fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
 	}
 	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
+		if resp.StatusCode == http.StatusNoContent {
+			return nil
+		}
+		if err := json.NewDecoder(resp.Body).Decode(out); err != nil && !errors.Is(err, io.EOF) {
+			return err
+		}
 	}
 	return nil
 }
@@ -854,44 +860,22 @@ const (
 	DeliverySteer InboxDelivery = "steer"
 )
 
-// InboxContent holds the text and file attachments inside an InboxItem.
-type InboxContent struct {
-	Text  string           `json:"text,omitempty"`
+// InboxPayload holds the text and file attachments of a user InboxItem.
+type InboxPayload struct {
+	Text  string           `json:"text"`
 	Files []FileAttachment `json:"files,omitempty"`
 }
 
-// InboxItem represents a pending item in a session's durable inbox.
+// InboxItem represents a pending item in a session's durable inbox. Its ID
+// becomes the message ID once the item is delivered.
 type InboxItem struct {
-	ID       string           `json:"id"`
-	Type     string           `json:"type"` // "user", "synthetic", "compaction"
-	Text     string           `json:"text,omitempty"`
-	Files    []FileAttachment `json:"files,omitempty"`
-	Content  InboxContent     `json:"content,omitempty"`
-	Delivery InboxDelivery    `json:"delivery,omitempty"`
+	ID       string        `json:"id"`
+	Type     string        `json:"type"` // "user", "synthetic", "compaction", "move"
+	Payload  InboxPayload  `json:"payload"`
+	Delivery InboxDelivery `json:"delivery,omitempty"`
 	Time     struct {
 		Created int64 `json:"created"`
 	} `json:"time"`
-}
-
-// UnmarshalJSON unmarshals an InboxItem, populating both top-level Text/Files and Content.
-func (i *InboxItem) UnmarshalJSON(b []byte) error {
-	type rawInboxItem InboxItem
-	var raw rawInboxItem
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return err
-	}
-	*i = InboxItem(raw)
-	if i.Text == "" && i.Content.Text != "" {
-		i.Text = i.Content.Text
-	} else if i.Content.Text == "" && i.Text != "" {
-		i.Content.Text = i.Text
-	}
-	if len(i.Files) == 0 && len(i.Content.Files) > 0 {
-		i.Files = i.Content.Files
-	} else if len(i.Content.Files) == 0 && len(i.Files) > 0 {
-		i.Content.Files = i.Files
-	}
-	return nil
 }
 
 // PromptMention describes the text and character span of an @ mention in a prompt.
@@ -995,9 +979,6 @@ func (c *Client) SendPrompt(ctx context.Context, sessionID string, opts PromptOp
 	if err := c.doJSON(ctx, http.MethodPost, path, req, &raw); err != nil {
 		return nil, err
 	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, nil
-	}
 	var item InboxItem
 	if err := decodeDataOrDirect(raw, &item); err != nil {
 		return nil, nil
@@ -1041,39 +1022,19 @@ func (c *Client) ListInbox(ctx context.Context, sessionID string) ([]InboxItem, 
 }
 
 // UpdateInboxDelivery updates the delivery mode of a pending inbox item
-// (PATCH /api/session/{sessionID}/inbox/{inboxID}).
-func (c *Client) UpdateInboxDelivery(ctx context.Context, sessionID, inboxID string, delivery InboxDelivery) (*InboxItem, error) {
+// (PATCH /api/session/{sessionID}/inbox/{inboxID}). The server answers 204, or
+// 409 if the item is no longer pending.
+func (c *Client) UpdateInboxDelivery(ctx context.Context, sessionID, inboxID string, delivery InboxDelivery) error {
 	path := fmt.Sprintf("/api/session/%s/inbox/%s", url.PathEscape(sessionID), url.PathEscape(inboxID))
 	body := map[string]any{"delivery": delivery}
-	var raw json.RawMessage
-	if err := c.doJSON(ctx, http.MethodPatch, path, body, &raw); err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, nil
-	}
-	var item InboxItem
-	if err := decodeDataOrDirect(raw, &item); err != nil {
-		return nil, err
-	}
-	return &item, nil
+	return c.doJSON(ctx, http.MethodPatch, path, body, nil)
 }
 
-// CancelInbox cancels and removes a pending inbox item (DELETE /api/session/{sessionID}/inbox/{inboxID}).
-func (c *Client) CancelInbox(ctx context.Context, sessionID, inboxID string) (*InboxItem, error) {
+// CancelInbox cancels a pending inbox item (DELETE /api/session/{sessionID}/inbox/{inboxID}).
+// The server answers 204 even if the item has already been delivered.
+func (c *Client) CancelInbox(ctx context.Context, sessionID, inboxID string) error {
 	path := fmt.Sprintf("/api/session/%s/inbox/%s", url.PathEscape(sessionID), url.PathEscape(inboxID))
-	var raw json.RawMessage
-	if err := c.doJSON(ctx, http.MethodDelete, path, nil, &raw); err != nil {
-		return nil, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return nil, nil
-	}
-	var item InboxItem
-	if err := decodeDataOrDirect(raw, &item); err != nil {
-		return nil, nil
-	}
-	return &item, nil
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
 // Interrupt stops ongoing execution in a session.

@@ -73,6 +73,12 @@ func (c *convTimeline) closeStreams() {
 	}
 }
 
+// steeredInFlight reports whether the user steered p before its inbox ID was known,
+// so the server still holds it under the queued delivery it was sent with.
+func (p *pendingPrompt) steeredInFlight(serverDelivery opencode.InboxDelivery) bool {
+	return p.inboxID == "" && p.delivery == opencode.DeliverySteer && serverDelivery == opencode.DeliveryQueue
+}
+
 func (c *convTimeline) keepPendingAtBottom() {
 	if c == nil || c.timelineBox == nil {
 		return
@@ -178,9 +184,9 @@ type Window struct {
 	agentPopover        *gtk.Popover
 	modelPopover        *gtk.Popover
 
-	commands               []opencode.CommandInfo
-	skills                 []opencode.SkillInfo
-	completionProvider     *gtksource.CompletionProvider
+	commands           []opencode.CommandInfo
+	skills             []opencode.SkillInfo
+	completionProvider *gtksource.CompletionProvider
 
 	agentPillLabel      *gtk.Label
 	modelStatusLabel    *gtk.Label
@@ -1123,7 +1129,6 @@ func projectName(dir string) string {
 	}
 	return base
 }
-
 
 func formatRelativeTimemark(updatedMs int64) string {
 	if updatedMs <= 0 {
@@ -3267,43 +3272,60 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 				}
 				return
 			}
-			if item != nil && item.ID != "" {
-				p.inboxID = item.ID
-				if item.Delivery != "" {
-					p.delivery = item.Delivery
+			if item == nil || item.ID == "" {
+				return
+			}
+			if p.cancelled {
+				// cancelPendingPrompt already sent the DELETE if session.inbox.enqueued
+				// bound the ID before this response did.
+				if p.inboxID == "" {
+					w.cancelInboxItem(sessionID, item.ID)
 				}
-				if p.cancelled {
-					inboxID := p.inboxID
-					gtkutil.Async(w.ctx, func() func() {
-						_, _ = w.client.CancelInbox(w.ctx, sessionID, inboxID)
-						return func() {}
-					})
-					return
-				}
-				if conv.seenMsgIDs[p.inboxID] {
-					msgID := p.inboxID
-					msgText := p.text
-					if p.widget != nil {
-						p.widget.SetWaiting(false, "")
-						conv.messageWidgets[msgID] = p.widget
-						p.widget.SetOnUndo(func() {
-							w.stageRevertToMessage(tab, conv, msgID, msgText)
-						})
-					}
-					for i, cur := range conv.pendingPrompts {
-						if cur == p {
-							conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
-							break
-						}
-					}
-					return
-				}
+				return
+			}
+			if conv.seenMsgIDs[item.ID] {
+				msgID := item.ID
+				msgText := p.text
 				if p.widget != nil {
-					p.widget.SetWaiting(true, p.delivery)
+					p.widget.SetWaiting(false, "")
+					conv.messageWidgets[msgID] = p.widget
+					p.widget.SetOnUndo(func() {
+						w.stageRevertToMessage(tab, conv, msgID, msgText)
+					})
 				}
+				for i, cur := range conv.pendingPrompts {
+					if cur == p {
+						conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
+						break
+					}
+				}
+				return
+			}
+			if p.inboxID == "" {
+				w.bindInboxDelivery(conv, p, item.ID, item.Delivery)
 			}
 		}
 	})
+}
+
+// bindInboxDelivery applies the server's view of a pending prompt. session.inbox.enqueued
+// and the SendPrompt response race, so the first one to deliver the inbox ID also replays
+// a Steer the user clicked before that ID was known.
+func (w *Window) bindInboxDelivery(conv *convTimeline, p *pendingPrompt, inboxID string, delivery opencode.InboxDelivery) {
+	steered := p.steeredInFlight(delivery)
+	if inboxID != "" {
+		p.inboxID = inboxID
+	}
+	if steered {
+		w.steerPendingPrompt(conv, p)
+		return
+	}
+	if delivery != "" {
+		p.delivery = delivery
+	}
+	if p.widget != nil {
+		p.widget.SetWaiting(true, p.delivery)
+	}
 }
 
 func (w *Window) bindPendingPromptCallbacks(conv *convTimeline, p *pendingPrompt) {
@@ -3332,11 +3354,22 @@ func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 	sessionID := conv.session.ID
 	inboxID := p.inboxID
 	gtkutil.Async(w.ctx, func() func() {
-		_, err := w.client.UpdateInboxDelivery(w.ctx, sessionID, inboxID, opencode.DeliverySteer)
+		err := w.client.UpdateInboxDelivery(w.ctx, sessionID, inboxID, opencode.DeliverySteer)
 		return func() {
-			if err != nil {
-				slog.Error("failed to steer inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
-				app.Error(w.ctx, err)
+			if err == nil {
+				return
+			}
+			if strings.HasPrefix(err.Error(), "http 409:") {
+				w.reconcileTail(sessionID)
+				return
+			}
+			slog.Error("failed to steer inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
+			app.Error(w.ctx, err)
+			if !p.cancelled && slices.Contains(conv.pendingPrompts, p) {
+				p.delivery = opencode.DeliveryQueue
+				if p.widget != nil {
+					p.widget.SetWaiting(true, opencode.DeliveryQueue)
+				}
 			}
 		}
 	})
@@ -3367,13 +3400,16 @@ func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 	if p.inboxID == "" {
 		return
 	}
-	sessionID := conv.session.ID
-	inboxID := p.inboxID
+	w.cancelInboxItem(conv.session.ID, p.inboxID)
+}
+
+func (w *Window) cancelInboxItem(sessionID, inboxID string) {
 	gtkutil.Async(w.ctx, func() func() {
-		_, err := w.client.CancelInbox(w.ctx, sessionID, inboxID)
+		err := w.client.CancelInbox(w.ctx, sessionID, inboxID)
 		return func() {
 			if err != nil {
 				slog.Error("failed to cancel inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
+				app.Error(w.ctx, err)
 			}
 		}
 	})
@@ -3384,9 +3420,6 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 		return
 	}
 	inboxID := ev.InboxID
-	if inboxID == "" && ev.Item != nil {
-		inboxID = ev.Item.ID
-	}
 	delivery := ev.Delivery
 	if delivery == "" && ev.Item != nil {
 		delivery = ev.Item.Delivery
@@ -3400,8 +3433,8 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 		if ev.Item.Type != "" && ev.Item.Type != "user" {
 			return
 		}
-		itemText = strings.TrimSpace(ev.Item.Content.Text)
-		itemFiles = ev.Item.Content.Files
+		itemText = strings.TrimSpace(ev.Item.Payload.Text)
+		itemFiles = ev.Item.Payload.Files
 	}
 
 	if inboxID != "" && conv.seenMsgIDs[inboxID] {
@@ -3413,13 +3446,7 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 			continue
 		}
 		if (inboxID != "" && p.inboxID == inboxID) || (p.inboxID == "" && itemText != "" && p.text == itemText) {
-			if inboxID != "" {
-				p.inboxID = inboxID
-			}
-			p.delivery = delivery
-			if p.widget != nil {
-				p.widget.SetWaiting(true, delivery)
-			}
+			w.bindInboxDelivery(conv, p, inboxID, delivery)
 			conv.keepPendingAtBottom()
 			return
 		}

@@ -1779,14 +1779,14 @@ func TestInboxEndpoints(t *testing.T) {
 					if err := json.NewDecoder(req.Body).Decode(&capturedPromptBody); err != nil {
 						t.Fatalf("decode prompt body: %v", err)
 					}
-					resp := `{"data":{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"queue","content":{"text":"queued prompt"}}}`
+					resp := `{"data":{"id":"inb_1","sessionID":"ses_123","time":{"created":1794007286293},"type":"user","payload":{"text":"queued prompt"},"delivery":"queue"}}`
 					return &http.Response{
 						StatusCode: http.StatusCreated,
 						Header:     http.Header{"Content-Type": []string{"application/json"}},
 						Body:       io.NopCloser(strings.NewReader(resp)),
 					}, nil
 				case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/inbox":
-					resp := `{"data":[{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"queue","content":{"text":"queued prompt"}}]}`
+					resp := `{"data":[{"id":"inb_1","sessionID":"ses_123","time":{"created":1794007286293},"type":"user","payload":{"text":"queued prompt","files":[{"data":"aGk=","mime":"image/png","name":"a.png","source":{"type":"inline"}}]},"delivery":"queue"}]}`
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -1796,19 +1796,10 @@ func TestInboxEndpoints(t *testing.T) {
 					if err := json.NewDecoder(req.Body).Decode(&capturedPatchBody); err != nil {
 						t.Fatalf("decode patch body: %v", err)
 					}
-					resp := `{"data":{"id":"inb_1","sessionID":"ses_123","type":"user","delivery":"steer","content":{"text":"queued prompt"}}}`
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Header:     http.Header{"Content-Type": []string{"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(resp)),
-					}, nil
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 				case req.Method == http.MethodDelete && req.URL.Path == "/api/session/ses_123/inbox/inb_1":
 					cancelledInboxID = "inb_1"
-					return &http.Response{
-						StatusCode: http.StatusOK,
-						Header:     http.Header{"Content-Type": []string{"application/json"}},
-						Body:       io.NopCloser(strings.NewReader(`{"data":{"id":"inb_1"}}`)),
-					}, nil
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
 				default:
 					return &http.Response{
 						StatusCode: http.StatusNotFound,
@@ -1837,18 +1828,19 @@ func TestInboxEndpoints(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListInbox failed: %v", err)
 	}
-	if len(items) != 1 || items[0].ID != "inb_1" || items[0].Content.Text != "queued prompt" {
+	if len(items) != 1 || items[0].ID != "inb_1" || items[0].Payload.Text != "queued prompt" ||
+		len(items[0].Payload.Files) != 1 || items[0].Payload.Files[0].Name != "a.png" {
 		t.Errorf("ListInbox returned unexpected items: %+v", items)
 	}
 
-	if _, err := client.UpdateInboxDelivery(ctx, "ses_123", "inb_1", DeliverySteer); err != nil {
+	if err := client.UpdateInboxDelivery(ctx, "ses_123", "inb_1", DeliverySteer); err != nil {
 		t.Fatalf("UpdateInboxDelivery failed: %v", err)
 	}
 	if capturedPatchBody["delivery"] != "steer" {
 		t.Errorf("capturedPatchBody = %+v, want delivery=steer", capturedPatchBody)
 	}
 
-	if _, err := client.CancelInbox(ctx, "ses_123", "inb_1"); err != nil {
+	if err := client.CancelInbox(ctx, "ses_123", "inb_1"); err != nil {
 		t.Fatalf("CancelInbox failed: %v", err)
 	}
 	if cancelledInboxID != "inb_1" {
@@ -1856,4 +1848,21 @@ func TestInboxEndpoints(t *testing.T) {
 	}
 }
 
+func TestInboxEventDecoding(t *testing.T) {
+	t.Parallel()
 
+	// Payload captured from an OpenCode 2.2.5 /api/event stream: the item
+	// carries no ID of its own, and the ID lives on the event as inboxID.
+	const data = `{"inboxID":"msg_1","sessionID":"ses_1","item":{"type":"user","payload":{"text":"hello queued"},"delivery":"queue"}}`
+
+	var ev InboxEvent
+	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+		t.Fatalf("Unmarshal failed: %v", err)
+	}
+	if ev.InboxID != "msg_1" || ev.Item == nil {
+		t.Fatalf("unexpected event: %+v", ev)
+	}
+	if ev.Item.Payload.Text != "hello queued" || ev.Item.Delivery != DeliveryQueue {
+		t.Errorf("unexpected item: %+v", ev.Item)
+	}
+}

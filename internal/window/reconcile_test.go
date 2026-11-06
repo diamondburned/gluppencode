@@ -469,6 +469,7 @@ func TestCompletionProviderTriggerDisplayAndActivate(t *testing.T) {
 		},
 		skills: []opencode.SkillInfo{
 			{ID: "explore", Name: "explore", Description: "Explores codebase"},
+			{ID: "claude-coworker", Name: "claude-coworker", Description: "Spawn Claude Code coworker"},
 		},
 		agents: []opencode.Agent{
 			{Name: "explore", Description: "Explores codebase"},
@@ -662,4 +663,92 @@ func TestCompletionProviderTriggerDisplayAndActivate(t *testing.T) {
 			t.Fatalf("expected buffer text '日本語 @explore ', got %q", got)
 		}
 	})
+
+	t.Run("hyphenated mention bug: @claude-co replaces full @claude-co token", func(t *testing.T) {
+		buf.SetText("bug: @claude-co")
+		_, end := buf.Bounds()
+		buf.PlaceCursor(end)
+
+		if !rawCP.isTrigger(end, uint32('-')) {
+			t.Fatal("expected isTrigger to return true for '-' inside @claude-co")
+		}
+
+		trig, query, startIter := rawCP.extractTriggerAndQuery(nil)
+		if trig != '@' {
+			t.Fatalf("expected trigger '@', got %q", trig)
+		}
+		if query != "claude-co" {
+			t.Fatalf("expected query 'claude-co', got %q", query)
+		}
+		if startIter == nil {
+			t.Fatal("expected non-nil startIter")
+		}
+
+		store, err := rawCP.populate(nil)
+		if err != nil {
+			t.Fatalf("populate failed: %v", err)
+		}
+		if store == nil || store.NItems() == 0 {
+			t.Fatal("expected proposals in store for @claude-co, got none")
+		}
+
+		var coworkerProp gtksource.CompletionProposaller
+		for i := uint(0); i < store.NItems(); i++ {
+			p := wrapGTKSourceCompletionProposal(store.Item(i))
+			if p != nil {
+				cp := proposalFromProposaller(p)
+				if cp != nil && cp.TriggerText == "@claude-coworker" {
+					coworkerProp = p
+					break
+				}
+			}
+		}
+		if coworkerProp == nil {
+			t.Fatal("could not find @claude-coworker proposal in store")
+		}
+
+		rawCP.activate(nil, coworkerProp)
+		bStart, bEnd := buf.Bounds()
+		if got := buf.Text(bStart, bEnd, false); got != "bug: @claude-coworker " {
+			t.Fatalf("expected buffer text 'bug: @claude-coworker ', got %q", got)
+		}
+	})
+}
+
+func TestPendingPromptSteeredInFlight(t *testing.T) {
+	tests := []struct {
+		name   string
+		prompt pendingPrompt
+		server opencode.InboxDelivery
+		want   bool
+	}{
+		{
+			name:   "steer clicked before the inbox ID arrived",
+			prompt: pendingPrompt{delivery: opencode.DeliverySteer},
+			server: opencode.DeliveryQueue,
+			want:   true,
+		},
+		{
+			name:   "sent with Ctrl+Enter",
+			prompt: pendingPrompt{delivery: opencode.DeliverySteer},
+			server: opencode.DeliverySteer,
+		},
+		{
+			name:   "still queued",
+			prompt: pendingPrompt{delivery: opencode.DeliveryQueue},
+			server: opencode.DeliveryQueue,
+		},
+		{
+			name:   "ID already bound, steer already sent",
+			prompt: pendingPrompt{inboxID: "msg_1", delivery: opencode.DeliverySteer},
+			server: opencode.DeliveryQueue,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.prompt.steeredInFlight(tt.server); got != tt.want {
+				t.Errorf("steeredInFlight(%q) = %v, want %v", tt.server, got, tt.want)
+			}
+		})
+	}
 }
