@@ -1,0 +1,150 @@
+package opencode
+
+import "encoding/json"
+
+// TextDeltaEvent is emitted on "session.text.delta" and "session.reasoning.delta".
+type TextDeltaEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID"`
+	Ordinal            int    `json:"ordinal"`
+	Delta              string `json:"delta"`
+}
+
+// TextEndedEvent is emitted on "session.text.ended" and "session.reasoning.ended".
+type TextEndedEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID"`
+	Ordinal            int    `json:"ordinal"`
+	Text               string `json:"text"`
+}
+
+// StepStartedEvent is emitted on "session.step.started".
+type StepStartedEvent struct {
+	SessionID          string   `json:"sessionID"`
+	AssistantMessageID string   `json:"assistantMessageID"`
+	Agent              string   `json:"agent"`
+	Model              ModelRef `json:"model"`
+}
+
+// StepStreamedEvent is emitted on "session.step.streamed".
+type StepStreamedEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID"`
+}
+
+// StepEndedEvent is emitted on "session.step.ended".
+type StepEndedEvent struct {
+	SessionID          string     `json:"sessionID"`
+	AssistantMessageID string     `json:"assistantMessageID"`
+	Cost               float64    `json:"cost,omitempty"`
+	Tokens             TokenUsage `json:"tokens,omitempty"`
+	Finish             string     `json:"finish,omitempty"`
+}
+
+// ToolEvent is emitted on "session.tool.*".
+type ToolEvent struct {
+	SessionID          string            `json:"sessionID"`
+	AssistantMessageID string            `json:"assistantMessageID"`
+	ID                 string            `json:"id"`
+	Name               string            `json:"name,omitempty"`
+	Delta              string            `json:"delta,omitempty"`
+	Text               string            `json:"text,omitempty"`
+	Input              any               `json:"input,omitempty"`
+	Content            []ToolContentItem `json:"content,omitempty"`
+	Error              any               `json:"error,omitempty"`
+	Metadata           map[string]any    `json:"metadata,omitempty"`
+}
+
+// CompactionEvent is emitted on "session.compaction.*" (started, delta, ended, failed).
+type CompactionEvent struct {
+	SessionID string     `json:"sessionID"`
+	Reason    string     `json:"reason,omitempty"`
+	InputID   string     `json:"inputID,omitempty"`
+	Text      string     `json:"text,omitempty"`
+	Model     ModelRef   `json:"model,omitempty"`
+	Tokens    TokenUsage `json:"tokens,omitempty"`
+	Error     any        `json:"error,omitempty"`
+}
+
+// SessionIDEvent is emitted on "session.idle", "session.execution.*", etc.
+type SessionIDEvent struct {
+	SessionID string `json:"sessionID"`
+}
+
+// AgentSelectedEvent is emitted on "session.agent.selected".
+type AgentSelectedEvent struct {
+	SessionID string `json:"sessionID"`
+	Agent     string `json:"agent"`
+	Previous  string `json:"previous,omitempty"`
+}
+
+// ModelSelectedEvent is emitted on "session.model.selected".
+type ModelSelectedEvent struct {
+	SessionID string   `json:"sessionID"`
+	Model     ModelRef `json:"model"`
+	Previous  ModelRef `json:"previous,omitempty"`
+}
+
+// SessionCreatedEvent is emitted on "session.created".
+type SessionCreatedEvent struct {
+	SessionID string  `json:"sessionID,omitempty"`
+	Session   Session `json:"session,omitempty"`
+}
+
+// UnmarshalJSON supports both nested {"session": {...}} / {"info": {...}} payloads
+// and flat Session / {"sessionID": "..."} payloads for session.created.
+func (e *SessionCreatedEvent) UnmarshalJSON(data []byte) error {
+	type rawEvent struct {
+		SessionID string   `json:"sessionID"`
+		Session   *Session `json:"session"`
+		Info      *Session `json:"info"`
+	}
+	var r rawEvent
+	if err := json.Unmarshal(data, &r); err != nil {
+		return err
+	}
+	e.SessionID = r.SessionID
+	if r.Session != nil {
+		e.Session = *r.Session
+	} else if r.Info != nil {
+		e.Session = *r.Info
+	} else {
+		var flat Session
+		if err := json.Unmarshal(data, &flat); err == nil && flat.ID != "" {
+			e.Session = flat
+		}
+	}
+	if e.SessionID == "" && e.Session.ID != "" {
+		e.SessionID = e.Session.ID
+	}
+	if e.Session.ID == "" && e.SessionID != "" {
+		e.Session.ID = e.SessionID
+	}
+	return nil
+}
+
+// RevertStagedEvent is emitted for "session.revert.staged".
+type RevertStagedEvent struct {
+	SessionID string        `json:"sessionID"`
+	Revert    SessionRevert `json:"revert"`
+}
+
+// RevertClearedEvent is emitted for "session.revert.cleared".
+type RevertClearedEvent struct {
+	SessionID string `json:"sessionID"`
+}
+
+// RevertCommittedEvent is emitted for "session.revert.committed".
+type RevertCommittedEvent struct {
+	SessionID string `json:"sessionID"`
+	MessageID string `json:"messageID"`
+}
+
+// ShellEvent is emitted for "shell.created", "shell.exited", and "shell.deleted".
+type ShellEvent struct {
+	ID      string    `json:"id,omitempty"`
+	ShellID string    `json:"shellID,omitempty"`
+	Status  string    `json:"status,omitempty"`
+	Info    ShellItem `json:"info,omitempty"`
+	Shell   ShellItem `json:"shell,omitempty"`
+}

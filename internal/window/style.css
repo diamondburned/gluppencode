@@ -1,0 +1,609 @@
+.glup-timeline-box {
+	padding: 8px 16px 24px 16px;
+}
+
+.glup-post-entry {
+	padding: 0;
+	margin: 0;
+}
+
+.glup-md-view {
+	margin: 8px 0;
+}
+
+.glup-user-card {
+	background-color: alpha(@card_bg_color, 0.9);
+	border: 1px solid alpha(@borders, 0.65);
+	border-radius: 10px;
+	padding: 10px 14px;
+	margin: 10px 0;
+}
+
+.glup-user-card .glup-md-view {
+	margin-top: 0;
+	margin-bottom: 0;
+}
+
+.glup-sidebar-section-header {
+	padding: 10px 12px 4px 12px;
+}
+
+.glup-sidebar-project-header {
+	padding: 8px 10px 4px 10px;
+	margin: 0;
+}
+
+.glup-sidebar-folder-icon {
+	opacity: 0.65;
+}
+
+.glup-sidebar-project-title {
+	font-weight: 700;
+	font-size: 0.95em;
+}
+
+sidebar .navigation-sidebar > row.glup-sidebar-conversation-row {
+	min-height: 0;
+	padding: 0;
+	margin: 0 6px 2px 14px;
+	border-radius: 8px;
+}
+
+sidebar .navigation-sidebar > row > box.glup-sidebar-conversation-box,
+sidebar .navigation-sidebar > row > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	min-height: 28px;
+	padding: 2px 10px 2px 8px;
+	border-spacing: 6px;
+	border-radius: 8px;
+}
+
+sidebar .navigation-sidebar > row > box.glup-sidebar-row-vbox {
+	min-height: 0;
+	padding: 0;
+	border-spacing: 2px;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more,
+sidebar .navigation-sidebar > row.glup-has-show-more:hover,
+sidebar .navigation-sidebar > row.glup-has-show-more:active,
+sidebar .navigation-sidebar > row.glup-has-show-more:selected,
+sidebar .navigation-sidebar > row.glup-has-show-more:selected:hover,
+sidebar .navigation-sidebar > row.glup-has-show-more:selected:active {
+	background-color: transparent;
+	box-shadow: none;
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more:hover > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	background-color: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	background-color: color-mix(in srgb, currentColor 16%, transparent);
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more:selected > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	background-color: color-mix(in srgb, currentColor 10%, transparent);
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more:selected:hover > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	background-color: color-mix(in srgb, currentColor 13%, transparent);
+}
+
+sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+	background-color: color-mix(in srgb, currentColor 19%, transparent);
+}
+
+.glup-sidebar-project-header-sep,
+.glup-sidebar-project-sep {
+	border-top: 1px solid alpha(@borders, 0.65);
+	margin: 6px 0 0 0;
+	padding-top: 8px;
+}
+
+.glup-sidebar-section-title {
+	font-weight: 700;
+	font-size: 0.95em;
+}
+
+.glup-sidebar-section-path {
+	font-size: 0.8em;
+	opacity: 0.65;
+}
+
+.glup-sidebar-show-more {
+	font-size: 0.8em;
+	padding: 2px 6px;
+	margin: 2px 0 4px 6px;
+	opacity: 0.75;
+}
+
+.glup-sidebar-show-more:hover {
+	opacity: 1;
+}
+
+.glup-user-images {
+	padding: 4px 0 2px 0;
+}
+
+.glup-post-parts {
+}
+
+.glup-reasoning-inline {
+	padding: 2px 0 2px 12px;
+	border-left: 3px solid alpha(@theme_fg_color, 0.25);
+	margin: 6px 0;
+	opacity: 0.78;
+}
+
+.glup-reasoning-text {
+	font-size: 0.92em;
+}
+
+.glup-tool-inline {
+	padding: 1px 0 1px 8px;
+	border-left: 2px solid alpha(@theme_fg_color, 0.25);
+	margin: 1px 0;
+}
+
+.glup-tool-icon {
+	opacity: 0.65;
+}
+
+.glup-tool-title {
+	font-size: 0.88em;
+	font-weight: 600;
+}
+
+.glup-tool-subtitle {
+	font-size: 0.85em;
+	opacity: 0.7;
+}
+
+.glup-tool-badges {
+	margin-left: 4px;
+}
+
+.glup-tool-badge {
+	font-size: 0.78em;
+	padding: 1px 6px;
+	border-radius: 4px;
+	font-weight: 600;
+	font-family: monospace;
+	background-color: alpha(@theme_fg_color, 0.08);
+}
+
+.glup-diff-badge-add {
+	color: @success_color;
+	background-color: alpha(@success_color, 0.15);
+}
+
+.glup-diff-badge-del {
+	color: @error_color;
+	background-color: alpha(@error_color, 0.15);
+}
+
+.glup-tool-action-btn {
+	font-size: 0.8em;
+	padding: 1px 6px;
+	color: @accent_color;
+}
+
+.glup-tool-status {
+	font-size: 0.8em;
+	opacity: 0.7;
+}
+
+.glup-tool-status-running {
+	color: @accent_color;
+	opacity: 1;
+}
+
+.glup-tool-status-completed {
+	color: @success_color;
+}
+
+.glup-tool-status-error {
+	color: @error_color;
+	opacity: 1;
+}
+
+.glup-tool-expander {
+	font-size: 0.86em;
+	opacity: 0.9;
+	padding: 1px 0;
+}
+
+.glup-tool-images {
+	padding: 4px 0 4px 8px;
+}
+
+.glup-tool-body,
+.glup-tool-body text {
+	font-family: monospace;
+	font-size: 0.84em;
+	background-color: alpha(@theme_fg_color, 0.03);
+	padding: 4px 6px;
+	border-radius: 4px;
+}
+
+.glup-diff-box {
+	font-family: monospace;
+	font-size: 0.84em;
+	background-color: alpha(@theme_fg_color, 0.03);
+	border: 1px solid alpha(@borders, 0.45);
+	border-radius: 4px;
+	padding: 4px 8px;
+	margin: 2px 0;
+}
+
+.glup-diff-line-add {
+	color: @success_color;
+}
+
+.glup-diff-line-del {
+	color: @error_color;
+}
+
+.glup-diff-line-hdr {
+	opacity: 0.6;
+	font-weight: 600;
+}
+
+.glup-image-thumb {
+	border-radius: 8px;
+	border: 1px solid alpha(@borders, 0.5);
+	padding: 2px;
+	background-color: alpha(@card_bg_color, 0.5);
+}
+
+.glup-image-thumb picture {
+	border-radius: 6px;
+}
+
+.glup-image-viewer-body {
+	background-color: alpha(@window_bg_color, 0.95);
+	padding: 12px;
+}
+
+.glup-compaction-entry {
+	margin: 8px 0;
+	padding: 2px 0;
+}
+
+.glup-compaction-header {
+	opacity: 0.7;
+	margin: 4px 0;
+}
+
+.glup-compaction-title {
+	font-size: 0.85em;
+	font-weight: 600;
+	opacity: 0.75;
+}
+
+.glup-compaction-body {
+	padding: 4px 16px;
+	opacity: 0.88;
+}
+
+.glup-timeline-notice {
+	font-size: 0.82em;
+	opacity: 0.65;
+	font-style: italic;
+	padding: 2px 0 2px 12px;
+	margin: 2px 0;
+}
+
+.glup-composer-bar {
+	padding: 8px 16px 4px 16px;
+	background: transparent;
+}
+
+.glup-composer-frame {
+	background-color: @card_bg_color;
+	border: 1px solid alpha(@borders, 0.65);
+	padding: 10px 12px 6px 12px;
+	border-radius: 14px;
+}
+
+.glup-composer-frame scrolledwindow,
+.glup-composer-frame scrolledwindow > scrollbar.vertical,
+.glup-composer-frame scrolledwindow > scrollbar.vertical slider,
+.glup-composer-frame textview {
+	min-height: 0;
+}
+
+.glup-composer-placeholder {
+	padding: 6px 4px;
+	font-size: 0.95em;
+	opacity: 0.55;
+}
+
+.glup-composer-flat-btn {
+	min-width: 28px;
+	min-height: 28px;
+	padding: 0;
+	opacity: 0.75;
+}
+
+.glup-composer-flat-btn:hover {
+	opacity: 1;
+}
+
+menubutton.glup-composer-selector-btn {
+	padding: 0;
+	margin: 0;
+	background: none;
+	box-shadow: none;
+	border: none;
+}
+
+menubutton.glup-composer-selector-btn > button {
+	padding: 2px 8px;
+	border-radius: 6px;
+	font-size: 0.9em;
+	opacity: 0.85;
+	min-height: 24px;
+}
+
+menubutton.glup-composer-selector-btn > button:hover,
+menubutton.glup-composer-selector-btn > button:checked {
+	opacity: 1;
+	background-color: alpha(@theme_fg_color, 0.08);
+}
+
+.glup-popover-content {
+	padding: 6px;
+}
+
+.glup-selector-chevron {
+	opacity: 0.6;
+}
+
+.glup-agent-pill-label {
+	font-weight: 600;
+	font-size: 0.92em;
+}
+
+.glup-agent-text-build {
+	color: #3b82f6;
+}
+
+.glup-agent-text-plan {
+	color: #a855f7;
+}
+
+.glup-agent-text-bare {
+	color: #10b981;
+}
+
+.glup-agent-text-orchestrator {
+	color: #06b6d4;
+}
+
+.glup-model-status-label {
+	font-weight: 500;
+	font-size: 0.9em;
+	opacity: 0.9;
+}
+
+.glup-composer-frame button.circular,
+#sendBtn,
+#stopBtn {
+	min-width: 32px;
+	min-height: 32px;
+	padding: 0;
+	border-radius: 999px;
+}
+
+.glup-attachment-tray {
+	padding: 2px 0 6px 0;
+}
+
+.glup-attachment-item {
+	border-radius: 8px;
+	border: 1px solid alpha(@borders, 0.65);
+	background-color: alpha(@window_bg_color, 0.6);
+}
+
+.glup-attachment-thumb {
+	border-radius: 6px;
+}
+
+.glup-attachment-remove-btn {
+	min-width: 20px;
+	min-height: 20px;
+	padding: 0;
+	margin: 2px;
+	border-radius: 9999px;
+	background-color: alpha(@window_bg_color, 0.85);
+	color: @error_color;
+}
+
+.glup-composer-text,
+.glup-composer-text text {
+	background: transparent;
+}
+
+.glup-composer-text {
+	padding: 7px 4px;
+}
+
+.glup-status-bar {
+	padding: 8px 18px;
+	border-top: 1px solid alpha(@borders, 0.5);
+	background-color: @headerbar_bg_color;
+}
+
+.glup-status-chip {
+	font-size: 0.82em;
+	padding: 4px 10px;
+	border-radius: 6px;
+}
+
+.glup-status-project {
+	font-weight: 600;
+	background-color: alpha(@theme_fg_color, 0.05);
+	border: 1px solid alpha(@borders, 0.35);
+	opacity: 0.85;
+}
+
+.glup-status-shells {
+	background-color: alpha(#10b981, 0.16);
+	color: #10b981;
+	border: 1px solid alpha(#10b981, 0.35);
+	font-weight: 600;
+}
+
+.glup-status-model {
+	background-color: alpha(@theme_fg_color, 0.07);
+	border: 1px solid alpha(@borders, 0.45);
+	opacity: 0.85;
+}
+
+.glup-status-subagents {
+	background-color: alpha(@accent_bg_color, 0.16);
+	color: @accent_color;
+	border: 1px solid alpha(@accent_color, 0.35);
+	font-weight: 600;
+}
+
+.glup-status-tokrate {
+	background-color: alpha(@theme_fg_color, 0.07);
+	border: 1px solid alpha(@borders, 0.45);
+	opacity: 0.85;
+}
+
+.glup-status-context {
+	background-color: alpha(@theme_fg_color, 0.07);
+	border: 1px solid alpha(@borders, 0.45);
+	opacity: 0.85;
+}
+
+.glup-agent-pill {
+	font-weight: 700;
+	color: #ffffff;
+	background-color: #3b82f6;
+}
+
+.glup-agent-build {
+	background-color: #3b82f6;
+	color: #ffffff;
+}
+
+.glup-agent-plan {
+	background-color: #a855f7;
+	color: #ffffff;
+}
+
+.glup-agent-bare {
+	background-color: #10b981;
+	color: #ffffff;
+}
+
+.glup-agent-orchestrator {
+	background-color: #06b6d4;
+	color: #ffffff;
+}
+
+.glup-breadcrumb-parent {
+	padding: 2px 6px;
+	font-weight: 500;
+	opacity: 0.78;
+}
+
+.glup-sheet-content {
+	padding: 28px 16px 24px 16px;
+	min-height: 110px;
+}
+
+.glup-switcher-suffix {
+	margin-left: 6px;
+}
+
+.glup-switcher-suffix adwspinner {
+	min-width: 14px;
+	min-height: 14px;
+}
+
+.glup-md-table {
+	border: 1px solid alpha(@borders, 0.6);
+	border-radius: 8px;
+	margin: 8px 0;
+	background-color: alpha(@theme_fg_color, 0.02);
+}
+
+.glup-md-table-header {
+	font-weight: 700;
+	padding: 6px 12px;
+	border-bottom: 1px solid alpha(@borders, 0.6);
+	background-color: alpha(@theme_fg_color, 0.05);
+}
+
+.glup-md-table-cell {
+	padding: 6px 12px;
+	border-bottom: 1px solid alpha(@borders, 0.25);
+}
+
+/* Revert Banner & Undo Button */
+.glup-revert-banner {
+	background-color: alpha(@accent_bg_color, 0.12);
+	border: 1px solid alpha(@accent_color, 0.3);
+	border-radius: 8px;
+	padding: 8px 12px;
+	margin: 10px 12px;
+}
+
+.glup-revert-banner-icon {
+	color: @accent_color;
+}
+
+.glup-revert-banner-title {
+	font-weight: bold;
+	font-size: 13px;
+}
+
+.glup-revert-banner-diff {
+	font-family: monospace;
+	font-size: 11px;
+	background-color: alpha(@card_bg_color, 0.85);
+	border: 1px solid alpha(@borders, 0.5);
+	border-radius: 4px;
+	padding: 1px 6px;
+	font-weight: bold;
+}
+
+.glup-revert-diff-expander {
+	font-size: 12px;
+	margin-top: 4px;
+}
+
+.glup-revert-diff-text {
+	font-family: monospace;
+	font-size: 11px;
+	background-color: alpha(@window_bg_color, 0.6);
+	padding: 6px;
+	border-radius: 4px;
+}
+
+.glup-user-undo-btn {
+	opacity: 0.5;
+	transition: opacity 120ms ease;
+}
+
+.glup-user-card:hover .glup-user-undo-btn,
+.glup-user-undo-btn:hover {
+	opacity: 1.0;
+}
+
+viewswitcher button image {
+	min-width: 0px;
+	min-height: 0px;
+	margin: 0px -6px 0px 0px;
+	padding: 0px;
+	opacity: 0;
+}
+
+viewswitcher button {
+	min-width: 110px;
+}

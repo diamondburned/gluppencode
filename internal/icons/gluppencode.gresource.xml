@@ -1,0 +1,52 @@
+<?xml version='1.0' encoding='utf-8'?>
+<gresources>
+  <gresource prefix="/so/libdb/gluppencode/icons/scalable/actions/">
+    <file preprocess="xml-stripblanks" alias="arrow-downward-symbolic.svg">scalable/actions/arrow-downward-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="arrow-forward-symbolic.svg">scalable/actions/arrow-forward-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="avatar-default-symbolic.svg">scalable/actions/avatar-default-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="channel-broadcast-symbolic.svg">scalable/actions/channel-broadcast-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="channel-symbolic.svg">scalable/actions/channel-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="chat-bubble-simple-symbolic.svg">scalable/actions/chat-bubble-simple-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="chat-bubbles-empty-symbolic.svg">scalable/actions/chat-bubbles-empty-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="chevron-right-symbolic.svg">scalable/actions/chevron-right-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="compress-symbolic.svg">scalable/actions/summarize-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="document-edit-symbolic.svg">scalable/actions/document-edit-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="document-new-symbolic.svg">scalable/actions/document-new-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="document-open-symbolic.svg">scalable/actions/document-open-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="earth-symbolic.svg">scalable/actions/earth-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="edit-clear-all-symbolic.svg">scalable/actions/edit-clear-all-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="edit-copy-symbolic.svg">scalable/actions/edit-copy-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="edit-redo-symbolic.svg">scalable/actions/edit-redo-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="edit-undo-symbolic.svg">scalable/actions/edit-undo-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="expand-less-symbolic.svg">scalable/actions/expand-less-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="folder-symbolic.svg">scalable/actions/folder-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="folder-visiting-symbolic.svg">scalable/actions/folder-visiting-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="forum-symbolic.svg">scalable/actions/forum-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="git-branch-symbolic.svg">scalable/actions/git-branch-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="group-symbolic.svg">scalable/actions/group-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="list-add-symbolic.svg">scalable/actions/list-add-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="mail-reply-sender-symbolic.svg">scalable/actions/mail-reply-sender-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="menu-large-symbolic.svg">scalable/actions/menu-large-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="open-in-new-symbolic.svg">scalable/actions/open-in-new-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="pan-up-symbolic.svg">scalable/actions/expand-less-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="paper-plane-symbolic.svg">scalable/actions/paper-plane-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="person-symbolic.svg">scalable/actions/person-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="refresh-symbolic.svg">scalable/actions/refresh-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="sidebar-show-symbolic.svg">scalable/actions/sidebar-show-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="stop-circle-symbolic.svg">scalable/actions/stop-circle-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="subdirectory-arrow-right-symbolic.svg">scalable/actions/subdirectory-arrow-right-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="summarize-symbolic.svg">scalable/actions/summarize-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="system-run-symbolic.svg">scalable/actions/system-run-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="system-search-symbolic.svg">scalable/actions/system-search-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="system-users-symbolic.svg">scalable/actions/group-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="tab-horizontal-symbolic.svg">scalable/actions/tab-horizontal-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="terminal-symbolic.svg">scalable/actions/terminal-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="text-x-generic-symbolic.svg">scalable/actions/document-open-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="thread-branch-symbolic.svg">scalable/actions/thread-branch-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="utilities-terminal-symbolic.svg">scalable/actions/terminal-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="visibility-off-symbolic.svg">scalable/actions/visibility-off-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="visibility-symbolic.svg">scalable/actions/visibility-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="window-close-symbolic.svg">scalable/actions/window-close-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="window-new-symbolic.svg">scalable/actions/window-new-symbolic.svg</file>
+  </gresource>
+</gresources>

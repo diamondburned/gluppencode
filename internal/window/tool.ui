@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.9"/>
+
+  <object class="GtkBox" id="rootContent">
+    <property name="orientation">vertical</property>
+    <property name="spacing">2</property>
+    <style>
+      <class name="glup-tool-inline"/>
+    </style>
+    <child>
+      <object class="GtkBox" id="headerRow">
+        <property name="orientation">horizontal</property>
+        <property name="spacing">6</property>
+        <property name="hexpand">true</property>
+        <child>
+          <object class="GtkExpander" id="detailsExpander">
+            <property name="hexpand">true</property>
+            <property name="valign">center</property>
+            <style>
+              <class name="glup-tool-expander"/>
+            </style>
+            <property name="label-widget">
+              <object class="GtkBox" id="summaryRow">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">6</property>
+                <property name="hexpand">true</property>
+                <child>
+                  <object class="GtkImage" id="toolIcon">
+                    <property name="icon-name">terminal-symbolic</property>
+                    <style>
+                      <class name="glup-tool-icon"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="titleLabel">
+                    <property name="xalign">0</property>
+                    <style>
+                      <class name="glup-tool-title"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="subtitleLabel">
+                    <property name="xalign">0</property>
+                    <property name="hexpand">true</property>
+                    <property name="ellipsize">end</property>
+                    <style>
+                      <class name="glup-tool-subtitle"/>
+                    </style>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkBox" id="badgesBox">
+                    <property name="orientation">horizontal</property>
+                    <property name="spacing">4</property>
+                    <style>
+                      <class name="glup-tool-badges"/>
+                    </style>
+                  </object>
+                </child>
+              </object>
+            </property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkButton" id="actionBtn">
+            <property name="visible">false</property>
+            <property name="valign">center</property>
+            <style>
+              <class name="flat"/>
+              <class name="glup-tool-action-btn"/>
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="AdwSpinner" id="spinner">
+            <property name="visible">false</property>
+            <property name="valign">center</property>
+          </object>
+        </child>
+        <child>
+          <object class="GtkLabel" id="statusLabel">
+            <property name="visible">false</property>
+            <property name="valign">center</property>
+            <style>
+              <class name="glup-tool-status"/>
+            </style>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <object class="GtkBox" id="detailsBox">
+        <property name="orientation">vertical</property>
+        <property name="spacing">4</property>
+        <property name="margin-top">4</property>
+        <property name="visible">false</property>
+        <child>
+          <object class="GtkTextView" id="inputView">
+            <property name="editable">false</property>
+            <property name="monospace">true</property>
+            <property name="wrap-mode">word-char</property>
+            <style>
+              <class name="glup-tool-body"/>
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="GtkScrolledWindow" id="outputScroll">
+            <property name="hscrollbar-policy">never</property>
+            <property name="vscrollbar-policy">automatic</property>
+            <property name="max-content-height">180</property>
+            <property name="propagate-natural-height">true</property>
+            <property name="visible">false</property>
+            <property name="child">
+              <object class="GtkTextView" id="outputView">
+                <property name="editable">false</property>
+                <property name="monospace">true</property>
+                <property name="wrap-mode">word-char</property>
+                <style>
+                  <class name="glup-tool-body"/>
+                </style>
+              </object>
+            </property>
+          </object>
+        </child>
+      </object>
+    </child>
+    <child>
+      <!-- Inline image preview box: visible by default for tool output images -->
+      <object class="GtkBox" id="imageBox">
+        <property name="orientation">horizontal</property>
+        <property name="spacing">8</property>
+        <property name="visible">false</property>
+        <style>
+          <class name="glup-tool-images"/>
+        </style>
+      </object>
+    </child>
+    <child>
+      <!-- Inline diff/modification block: visible by default for file edits/writes -->
+      <object class="GtkBox" id="diffBox">
+        <property name="orientation">vertical</property>
+        <property name="visible">false</property>
+        <style>
+          <class name="glup-diff-box"/>
+        </style>
+      </object>
+    </child>
+  </object>
+</interface>

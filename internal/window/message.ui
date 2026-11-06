@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<interface>
+  <requires lib="gtk" version="4.0"/>
+  <requires lib="libadwaita" version="1.9"/>
+
+  <object class="GtkBox" id="rootContent">
+    <property name="orientation">vertical</property>
+    <property name="spacing">0</property>
+    <style>
+      <class name="glup-post-entry"/>
+    </style>
+    <child>
+      <object class="GtkBox" id="partsBox">
+        <property name="orientation">vertical</property>
+        <property name="spacing">0</property>
+        <style>
+          <class name="glup-post-parts"/>
+        </style>
+      </object>
+    </child>
+  </object>
+</interface>
