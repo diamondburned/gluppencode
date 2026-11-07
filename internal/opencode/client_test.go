@@ -1680,7 +1680,9 @@ func TestShellEndpoints(t *testing.T) {
 	ctx := context.Background()
 
 	var killedID string
+	var killedDir string
 	var capturedDir string
+	var outputDir string
 
 	client := &Client{
 		BaseURL: "http://opencode.local",
@@ -1688,7 +1690,16 @@ func TestShellEndpoints(t *testing.T) {
 			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
 				if req.Method == http.MethodGet && req.URL.Path == "/api/shell" {
 					capturedDir = req.URL.Query().Get("location[directory]")
-					respBody := `{"data":[{"id":"sh_1","pid":1234,"sessionID":"ses_1","command":"npm run dev","description":"Dev server","status":"running","time":{"created":1000}}]}`
+					respBody := `{"location":{"directory":"/path/to/project"},"data":[{"id":"sh_1","pid":1234,"command":"npm run dev","description":"Dev server","status":"running","output":{"file":"/tmp/sh_1.out"},"source":{"type":"session","sessionID":"ses_1"},"time":{"created":1000}}]}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(respBody)),
+					}, nil
+				}
+				if req.Method == http.MethodGet && req.URL.Path == "/api/shell/sh_1/output" {
+					outputDir = req.URL.Query().Get("location[directory]")
+					respBody := `{"data":{"id":"sh_1","output":"line 1\nline 2\n","size":14,"truncated":false}}`
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -1697,6 +1708,7 @@ func TestShellEndpoints(t *testing.T) {
 				}
 				if req.Method == http.MethodDelete && strings.HasPrefix(req.URL.Path, "/api/shell/") {
 					killedID = strings.TrimPrefix(req.URL.Path, "/api/shell/")
+					killedDir = req.URL.Query().Get("location[directory]")
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Body:       io.NopCloser(strings.NewReader(`{"success":true}`)),
@@ -1720,12 +1732,23 @@ func TestShellEndpoints(t *testing.T) {
 	if len(shells) != 1 || shells[0].ID != "sh_1" || shells[0].PID != 1234 || shells[0].Status != "running" {
 		t.Errorf("unexpected shells: %+v", shells)
 	}
+	if shells[0].EffectiveSessionID() != "ses_1" || shells[0].EffectiveFile() != "/tmp/sh_1.out" || shells[0].EffectiveLocationDir() != "/path/to/project" {
+		t.Errorf("unexpected shell effective fields: sess=%q file=%q dir=%q", shells[0].EffectiveSessionID(), shells[0].EffectiveFile(), shells[0].EffectiveLocationDir())
+	}
 
-	if err := client.KillShell(ctx, "sh_1"); err != nil {
+	out, err := client.GetShellOutput(ctx, "sh_1", "/path/to/project", 0, 16384)
+	if err != nil {
+		t.Fatalf("GetShellOutput failed: %v", err)
+	}
+	if outputDir != "/path/to/project" || out.Output != "line 1\nline 2\n" || out.Size != 14 {
+		t.Errorf("unexpected GetShellOutput: dir=%q out=%+v", outputDir, out)
+	}
+
+	if err := client.KillShell(ctx, "sh_1", "/path/to/project"); err != nil {
 		t.Fatalf("KillShell failed: %v", err)
 	}
-	if killedID != "sh_1" {
-		t.Errorf("killedID = %q, want sh_1", killedID)
+	if killedID != "sh_1" || killedDir != "/path/to/project" {
+		t.Errorf("killedID=%q killedDir=%q, want sh_1 and /path/to/project", killedID, killedDir)
 	}
 }
 
@@ -2063,5 +2086,50 @@ func TestFormEndpointsAndEvents(t *testing.T) {
 	}
 	if cancelledEv.ID != "frm_123" || cancelledEv.SessionID != "ses_123" {
 		t.Errorf("unexpected FormCancelledEvent: %+v", cancelledEv)
+	}
+}
+
+func TestSessionCreatedEventAndIsRunning(t *testing.T) {
+	t.Parallel()
+
+	// OpenCode V2 flat session.created payload uses "sessionID" rather than "id".
+	flatPayload := `{
+		"sessionID": "ses_child_1",
+		"parentID": "ses_root_1",
+		"projectID": "proj_1",
+		"title": "Find dissent package in repo",
+		"agent": "explore",
+		"model": {"providerID": "google", "id": "antigravity-gemini-3.8-flash-medium"},
+		"location": {"directory": "/home/diamond/.nix"}
+	}`
+	var ev SessionCreatedEvent
+	if err := json.Unmarshal([]byte(flatPayload), &ev); err != nil {
+		t.Fatalf("unmarshal flat SessionCreatedEvent: %v", err)
+	}
+	if ev.SessionID != "ses_child_1" || ev.Session.ID != "ses_child_1" {
+		t.Fatalf("expected SessionID=ses_child_1, got %q / %q", ev.SessionID, ev.Session.ID)
+	}
+	if ev.Session.ParentID != "ses_root_1" || ev.Session.Title != "Find dissent package in repo" || ev.Session.Agent != "explore" {
+		t.Errorf("unexpected Session fields from flat payload: %+v", ev.Session)
+	}
+	if ev.Session.Location.Directory != "/home/diamond/.nix" || ev.Session.Model.ID != "antigravity-gemini-3.8-flash-medium" {
+		t.Errorf("unexpected Location/Model from flat payload: %+v", ev.Session)
+	}
+	if !ev.Session.IsRunning() {
+		t.Errorf("expected newly created child session without outcome/idle time to be running")
+	}
+
+	completed := ev.Session
+	completed.Outcome = "succeeded"
+	completed.Time.Busy = 1000
+	completed.Time.Idle = 2000
+	if completed.IsRunning() {
+		t.Errorf("expected completed session (Outcome=succeeded, Idle >= Busy) not to be running")
+	}
+
+	resumed := completed
+	resumed.Time.Busy = 3000
+	if !resumed.IsRunning() {
+		t.Errorf("expected resumed session (Busy > Idle) to be running")
 	}
 }

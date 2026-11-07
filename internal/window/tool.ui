@@ -70,16 +70,6 @@
           </object>
         </child>
         <child>
-          <object class="GtkButton" id="actionBtn">
-            <property name="visible">false</property>
-            <property name="valign">center</property>
-            <style>
-              <class name="flat"/>
-              <class name="glup-tool-action-btn"/>
-            </style>
-          </object>
-        </child>
-        <child>
           <object class="AdwSpinner" id="spinner">
             <property name="visible">false</property>
             <property name="valign">center</property>
@@ -91,6 +81,16 @@
             <property name="valign">center</property>
             <style>
               <class name="glup-tool-status"/>
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="GtkButton" id="actionBtn">
+            <property name="visible">false</property>
+            <property name="valign">center</property>
+            <style>
+              <class name="flat"/>
+              <class name="glup-tool-action-btn"/>
             </style>
           </object>
         </child>

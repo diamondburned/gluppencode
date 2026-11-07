@@ -44,32 +44,44 @@ type pendingPrompt struct {
 }
 
 type convTimeline struct {
-	session        opencode.Session
-	scroll         *autoscroll.Window
-	timelineBox    *gtk.Box
-	assistantMap   map[string]*AssistantMessageWidget
-	compactionMap  map[string]*CompactionWidget
-	messageWidgets map[string]gtk.Widgetter
-	revertBanner   *RevertBannerWidget
-	thinkingLabel  *gtk.Label
-	pendingPrompts []*pendingPrompt
-	pendingForms   []opencode.FormInfo
-	formWidgets    map[string]*QuestionFormWidget
-	seenMsgIDs     map[string]bool
-	messages       []opencode.Message
-	nextCursor     string
-	hasOlder       bool
-	loadingOlder   bool
-	loadingInitial bool
-	loaded         bool
-	active         bool
-	runningTools   int
-	blockingTools  map[string]bool
-	toolNames      map[string]string
-	streamStart    time.Time
-	streamEnd      time.Time
-	streamedChars  int
-	lastTokRate    string
+	session            opencode.Session
+	scroll             *autoscroll.Window
+	timelineBox        *gtk.Box
+	assistantMap       map[string]*AssistantMessageWidget
+	compactionMap      map[string]*CompactionWidget
+	messageWidgets     map[string]gtk.Widgetter
+	revertBanner       *RevertBannerWidget
+	thinkingLabel      *gtk.Label
+	pendingPrompts     []*pendingPrompt
+	pendingForms       []opencode.FormInfo
+	formWidgets        map[string]*QuestionFormWidget
+	seenMsgIDs         map[string]bool
+	messages           []opencode.Message
+	nextCursor         string
+	hasOlder           bool
+	loadingOlder       bool
+	loadingInitial     bool
+	loaded             bool
+	active             bool
+	runningTools       int
+	blockingTools      map[string]bool
+	blockingShellTools map[string]bool
+	blockingShellIDs   map[string]string
+	backgroundShellIDs map[string]bool
+	toolNames          map[string]string
+	streamStart        time.Time
+	streamEnd          time.Time
+	streamedChars      int
+	lastTokRate        string
+}
+
+func isShellToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "shell", "bash":
+		return true
+	default:
+		return false
+	}
 }
 
 func isBackgroundableToolName(name string) bool {
@@ -95,6 +107,86 @@ func isBlockingBackgroundableTool(name, status string, input any) bool {
 
 func (c *convTimeline) isBlockingOnBackgroundable() bool {
 	return c != nil && c.active && len(c.blockingTools) > 0
+}
+
+func (c *convTimeline) syncToolPart(part opencode.ContentPart) {
+	if c == nil || part.ID == "" {
+		return
+	}
+	if part.Name != "" {
+		c.toolNames[part.ID] = part.Name
+	}
+	name := part.Name
+	if name == "" {
+		name = c.toolNames[part.ID]
+	}
+	shID, _ := part.State.Metadata["shellID"].(string)
+	metaStatus, _ := part.State.Metadata["status"].(string)
+
+	if isBlockingBackgroundableTool(name, part.State.Status, part.State.Input) {
+		c.blockingTools[part.ID] = true
+		if isShellToolName(name) {
+			c.blockingShellTools[part.ID] = true
+			if shID != "" && !c.backgroundShellIDs[shID] {
+				c.blockingShellIDs[shID] = part.ID
+			}
+		}
+	} else {
+		delete(c.blockingTools, part.ID)
+		delete(c.blockingShellTools, part.ID)
+		for k, tid := range c.blockingShellIDs {
+			if tid == part.ID {
+				delete(c.blockingShellIDs, k)
+			}
+		}
+		if isShellToolName(name) && shID != "" && (metaStatus == "running" || part.State.Status == "completed") {
+			if metaStatus == "running" {
+				c.backgroundShellIDs[shID] = true
+			}
+		}
+	}
+}
+
+func (c *convTimeline) markSyntheticTargetCompleted(msg opencode.Message) {
+	if c == nil {
+		return
+	}
+	trimmed := strings.TrimSpace(msg.Text)
+	if strings.HasPrefix(trimmed, "<shell") {
+		shID := extractShellID(trimmed)
+		if shID == "" {
+			if id, ok := msg.Metadata["shellID"].(string); ok {
+				shID = id
+			}
+		}
+		if shID != "" {
+			for _, aw := range c.assistantMap {
+				for _, tw := range aw.tools {
+					if tw.ShellID() == shID {
+						tw.SetBackgroundStatus("completed")
+					}
+				}
+			}
+		}
+		return
+	}
+	subID := ""
+	if s, ok := msg.Metadata["childID"].(string); ok && s != "" {
+		subID = s
+	} else if s, ok := msg.Metadata["sessionID"].(string); ok && s != "" {
+		subID = s
+	} else if matches := subagentSessionRe.FindStringSubmatch(trimmed); len(matches) > 1 {
+		subID = matches[1]
+	}
+	if subID != "" {
+		for _, aw := range c.assistantMap {
+			for _, tw := range aw.tools {
+				if tw.ChildSessionID() == subID {
+					tw.SetBackgroundStatus("completed")
+				}
+			}
+		}
+	}
 }
 
 func (c *convTimeline) closeStreams() {
@@ -275,7 +367,10 @@ type Window struct {
 	modelSearchEntry     *gtk.SearchEntry
 	modelListBox         *gtk.ListBox
 
-	activeShells map[string]opencode.ShellItem
+	activeShells      map[string]opencode.ShellItem
+	shellOutputs      map[string]string
+	shellOutputLabels map[string]*gtk.Label
+	shellPollRunning  bool
 
 	tabs         map[string]*sessionTab // keyed by root session ID
 	tabOrder     []string               // root session IDs in display order
@@ -402,6 +497,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		archivedSessions:           make(map[string]bool),
 		projectSessions:            make(map[string][]opencode.Session),
 		activeShells:               make(map[string]opencode.ShellItem),
+		shellOutputs:               make(map[string]string),
+		shellOutputLabels:          make(map[string]*gtk.Label),
 		closeBtnSessID:             make(map[uintptr]string),
 		hoveredRow:                 make(map[uintptr]bool),
 		rowControllers:             make(map[uintptr]bool),
@@ -1254,17 +1351,20 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	timelineBox.Append(thinkingLabel)
 
 	conv := &convTimeline{
-		session:        sess,
-		scroll:         scroll,
-		timelineBox:    timelineBox,
-		thinkingLabel:  thinkingLabel,
-		assistantMap:   make(map[string]*AssistantMessageWidget),
-		compactionMap:  make(map[string]*CompactionWidget),
-		messageWidgets: make(map[string]gtk.Widgetter),
-		formWidgets:    make(map[string]*QuestionFormWidget),
-		seenMsgIDs:     make(map[string]bool),
-		blockingTools:  make(map[string]bool),
-		toolNames:      make(map[string]string),
+		session:            sess,
+		scroll:             scroll,
+		timelineBox:        timelineBox,
+		thinkingLabel:      thinkingLabel,
+		assistantMap:       make(map[string]*AssistantMessageWidget),
+		compactionMap:      make(map[string]*CompactionWidget),
+		messageWidgets:     make(map[string]gtk.Widgetter),
+		formWidgets:        make(map[string]*QuestionFormWidget),
+		seenMsgIDs:         make(map[string]bool),
+		blockingTools:      make(map[string]bool),
+		blockingShellTools: make(map[string]bool),
+		blockingShellIDs:   make(map[string]string),
+		backgroundShellIDs: make(map[string]bool),
+		toolNames:          make(map[string]string),
 	}
 
 	vadj := scroll.VAdjustment()
@@ -2582,6 +2682,7 @@ func (w *Window) onVisibleTabChanged() {
 	tab.page.SetNeedsAttention(false)
 
 	w.refreshHeaderAndBottomBar(tab)
+	w.rebuildShellList()
 	w.syncProjectSessionVisibility()
 	w.syncSwitcherIndicators()
 	w.refreshShells()
@@ -2657,7 +2758,103 @@ func (w *Window) closeSubagent(tab *sessionTab) {
 	w.refreshHeaderAndBottomBar(tab)
 }
 
+func (w *Window) upsertSubagent(tab *sessionTab, sess opencode.Session) {
+	if tab == nil || sess.ID == "" {
+		return
+	}
+	if sess.ParentID == "" {
+		sess.ParentID = tab.main.session.ID
+	}
+	w.childToRoot[sess.ID] = tab.main.session.ID
+	for i, s := range tab.subagents {
+		if s.ID == sess.ID {
+			if sess.Title != "" {
+				s.Title = sess.Title
+			}
+			if sess.Agent != "" {
+				s.Agent = sess.Agent
+			}
+			if sess.Model.ID != "" {
+				s.Model = sess.Model
+			}
+			if sess.Location.Directory != "" {
+				s.Location = sess.Location
+			}
+			if sess.Outcome != "" {
+				s.Outcome = sess.Outcome
+			}
+			if sess.Time.Created != 0 {
+				s.Time.Created = sess.Time.Created
+			}
+			if sess.Time.Updated != 0 {
+				s.Time.Updated = sess.Time.Updated
+			}
+			if sess.Time.Busy != 0 {
+				s.Time.Busy = sess.Time.Busy
+			}
+			if sess.Time.Idle != 0 {
+				s.Time.Idle = sess.Time.Idle
+			}
+			tab.subagents[i] = s
+			return
+		}
+	}
+	tab.subagents = append([]opencode.Session{sess}, tab.subagents...)
+}
+
+func (w *Window) setSubagentActive(childID string, active bool, outcome string) {
+	if childID == "" {
+		return
+	}
+	rootID, ok := w.childToRoot[childID]
+	if !ok || rootID == "" {
+		return
+	}
+	tab, ok := w.tabs[rootID]
+	if !ok || tab == nil {
+		return
+	}
+	now := time.Now().UnixMilli()
+	for i, s := range tab.subagents {
+		if s.ID == childID {
+			if active {
+				s.Outcome = ""
+				s.Time.Busy = now
+				s.Time.Idle = 0
+			} else {
+				if outcome == "" {
+					outcome = "succeeded"
+				}
+				s.Outcome = outcome
+				if s.Time.Busy > now {
+					s.Time.Idle = s.Time.Busy
+				} else {
+					s.Time.Idle = now
+				}
+			}
+			tab.subagents[i] = s
+			break
+		}
+	}
+	if !active && tab.main != nil {
+		for _, aw := range tab.main.assistantMap {
+			for _, tw := range aw.tools {
+				if tw.ChildSessionID() == childID {
+					tw.SetBackgroundStatus("completed")
+				}
+			}
+		}
+	}
+	if w.currentTab() == tab {
+		w.updateBottomBar(tab)
+		w.rebuildSubagentList(tab)
+	}
+}
+
 func (w *Window) loadChildSubagents(rootSessionID string) {
+	if w.client == nil || rootSessionID == "" {
+		return
+	}
 	gtkutil.Async(w.ctx, func() func() {
 		children, err := w.client.ListChildSessions(w.ctx, rootSessionID)
 		return func() {
@@ -2669,10 +2866,26 @@ func (w *Window) loadChildSubagents(rootSessionID string) {
 			if !ok {
 				return
 			}
-			tab.subagents = children
+			seen := make(map[string]bool, len(children))
 			for _, child := range children {
+				seen[child.ID] = true
 				w.childToRoot[child.ID] = rootSessionID
+				if !child.IsRunning() && tab.main != nil {
+					for _, aw := range tab.main.assistantMap {
+						for _, tw := range aw.tools {
+							if tw.ChildSessionID() == child.ID {
+								tw.SetBackgroundStatus("completed")
+							}
+						}
+					}
+				}
 			}
+			for _, existing := range tab.subagents {
+				if !seen[existing.ID] && existing.IsRunning() {
+					children = append([]opencode.Session{existing}, children...)
+				}
+			}
+			tab.subagents = children
 			if w.currentRootSessionID() == rootSessionID {
 				w.updateBottomBar(tab)
 				w.rebuildSubagentList(tab)
@@ -2725,6 +2938,9 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			conv.revertBanner = nil
 			conv.seenMsgIDs = make(map[string]bool)
 			conv.blockingTools = make(map[string]bool)
+			conv.blockingShellTools = make(map[string]bool)
+			conv.blockingShellIDs = make(map[string]string)
+			conv.backgroundShellIDs = make(map[string]bool)
 			conv.toolNames = make(map[string]string)
 
 			if page == nil {
@@ -2749,17 +2965,14 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				if msg.Type == "assistant" {
 					for _, part := range msg.Content {
 						if part.Type == "tool" {
-							if part.ID != "" && part.Name != "" {
-								conv.toolNames[part.ID] = part.Name
-							}
 							if part.State.Status == "running" || part.State.Status == "streaming" {
 								runningTools++
 							}
-							if part.ID != "" && isBlockingBackgroundableTool(part.Name, part.State.Status, part.State.Input) {
-								conv.blockingTools[part.ID] = true
-							}
+							conv.syncToolPart(part)
 						}
 					}
+				} else if msg.Type == "synthetic" && isSubagentOrShellSynthetic(msg) {
+					conv.markSyntheticTargetCompleted(msg)
 				}
 			}
 			conv.runningTools = runningTools
@@ -2910,6 +3123,16 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 			w.openSubagentByID(tab, subID)
 		})
 		aw.LoadContent(msg.Content)
+		for _, tw := range aw.tools {
+			if shID := tw.ShellID(); shID != "" {
+				if out, ok := w.shellOutputs[shID]; ok && out != "" {
+					tw.SetShellLiveOutput(out)
+				}
+				if _, active := w.activeShells[shID]; !active && tw.IsBackgroundRunning() {
+					tw.SetBackgroundStatus("completed")
+				}
+			}
+		}
 		conv.assistantMap[msg.ID] = aw
 		return aw
 
@@ -2920,6 +3143,7 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 
 	case "synthetic":
 		if isSubagentOrShellSynthetic(msg) {
+			conv.markSyntheticTargetCompleted(msg)
 			return NewSyntheticSubagentWidget(w.ctx, msg, func(subID string) {
 				w.openSubagentByID(tab, subID)
 			})
@@ -2945,7 +3169,7 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 
 func (w *Window) reconcileTail(sessionID string) {
 	tab, conv := w.resolveConv(sessionID)
-	if conv == nil || !conv.loaded {
+	if w.client == nil || conv == nil || !conv.loaded {
 		return
 	}
 	gtkutil.Async(w.ctx, func() func() {
@@ -2996,20 +3220,11 @@ func (w *Window) reconcileTail(sessionID string) {
 				if msg.Type == "assistant" {
 					for _, part := range msg.Content {
 						if part.Type == "tool" && part.ID != "" {
-							if part.Name != "" {
-								conv.toolNames[part.ID] = part.Name
-							}
-							name := part.Name
-							if name == "" {
-								name = conv.toolNames[part.ID]
-							}
-							if isBlockingBackgroundableTool(name, part.State.Status, part.State.Input) {
-								conv.blockingTools[part.ID] = true
-							} else {
-								delete(conv.blockingTools, part.ID)
-							}
+							conv.syncToolPart(part)
 						}
 					}
+				} else if msg.Type == "synthetic" && isSubagentOrShellSynthetic(msg) {
+					conv.markSyntheticTargetCompleted(msg)
 				}
 			}
 
@@ -3092,7 +3307,9 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 		if w.backgroundStatusBtn != nil {
 			w.backgroundStatusBtn.SetVisible(false)
 		}
-		w.tokRateStatusLabel.SetVisible(false)
+		if w.tokRateStatusLabel != nil {
+			w.tokRateStatusLabel.SetVisible(false)
+		}
 		w.rebuildContextInfo(nil)
 		return
 	}
@@ -3107,16 +3324,18 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 	agentLower := strings.ToLower(agent)
 
 	// Agent button label in composer row 2
-	w.agentPillLabel.SetLabel(formatAgentDisplayName(agent))
-	for _, cls := range []string{
-		"glup-agent-build", "glup-agent-plan", "glup-agent-bare", "glup-agent-orchestrator",
-		"glup-agent-text-build", "glup-agent-text-plan", "glup-agent-text-bare", "glup-agent-text-orchestrator",
-	} {
-		w.agentPillLabel.RemoveCSSClass(cls)
-	}
-	switch agentLower {
-	case "build", "plan", "bare", "orchestrator":
-		w.agentPillLabel.AddCSSClass("glup-agent-text-" + agentLower)
+	if w.agentPillLabel != nil {
+		w.agentPillLabel.SetLabel(formatAgentDisplayName(agent))
+		for _, cls := range []string{
+			"glup-agent-build", "glup-agent-plan", "glup-agent-bare", "glup-agent-orchestrator",
+			"glup-agent-text-build", "glup-agent-text-plan", "glup-agent-text-bare", "glup-agent-text-orchestrator",
+		} {
+			w.agentPillLabel.RemoveCSSClass(cls)
+		}
+		switch agentLower {
+		case "build", "plan", "bare", "orchestrator":
+			w.agentPillLabel.AddCSSClass("glup-agent-text-" + agentLower)
+		}
 	}
 
 	// Model button label in composer row 2
@@ -3131,7 +3350,9 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 	if modelDisplay == "" {
 		modelDisplay = "Default Model"
 	}
-	w.modelStatusLabel.SetLabel(modelDisplay)
+	if w.modelStatusLabel != nil {
+		w.modelStatusLabel.SetLabel(modelDisplay)
+	}
 
 	// Left: Project badge and separate Git branch badge
 	dir := tab.main.session.Location.Directory
@@ -3139,15 +3360,19 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 	if projName == "" || projName == "." || projName == "/" {
 		projName = "workspace"
 	}
-	w.projectStatusLabel.SetLabel(projName)
+	if w.projectStatusLabel != nil {
+		w.projectStatusLabel.SetLabel(projName)
+	}
 	if tab.gitBranch == "" {
 		tab.gitBranch = w.getGitBranch(dir)
 	}
-	if tab.gitBranch != "" {
-		w.branchStatusLabel.SetLabel(tab.gitBranch)
-		w.branchStatusBox.SetVisible(true)
-	} else {
-		w.branchStatusBox.SetVisible(false)
+	if w.branchStatusBox != nil && w.branchStatusLabel != nil {
+		if tab.gitBranch != "" {
+			w.branchStatusLabel.SetLabel(tab.gitBranch)
+			w.branchStatusBox.SetVisible(true)
+		} else {
+			w.branchStatusBox.SetVisible(false)
+		}
 	}
 
 	// Right: Active shells
@@ -3156,19 +3381,21 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 	// Right: Active subagents count (only active > 0)
 	var activeCount int
 	for _, sub := range tab.subagents {
-		if sub.Outcome == "" {
+		if sub.IsRunning() {
 			activeCount++
 		}
 	}
-	if activeCount > 0 {
-		noun := "subagents"
-		if activeCount == 1 {
-			noun = "subagent"
+	if w.subagentStatusBox != nil && w.subagentStatusLabel != nil {
+		if activeCount > 0 {
+			noun := "subagents"
+			if activeCount == 1 {
+				noun = "subagent"
+			}
+			w.subagentStatusLabel.SetLabel(fmt.Sprintf("%d %s", activeCount, noun))
+			w.subagentStatusBox.SetVisible(true)
+		} else {
+			w.subagentStatusBox.SetVisible(false)
 		}
-		w.subagentStatusLabel.SetLabel(fmt.Sprintf("%d %s", activeCount, noun))
-		w.subagentStatusBox.SetVisible(true)
-	} else {
-		w.subagentStatusBox.SetVisible(false)
 	}
 
 	// Right: tok/s rate
@@ -3184,11 +3411,13 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 			tokRate = opencode.FormatMessageTokPerSec(conv.messages)
 		}
 	}
-	if tokRate != "" {
-		w.tokRateStatusLabel.SetLabel(tokRate)
-		w.tokRateStatusLabel.SetVisible(true)
-	} else {
-		w.tokRateStatusLabel.SetVisible(false)
+	if w.tokRateStatusLabel != nil {
+		if tokRate != "" {
+			w.tokRateStatusLabel.SetLabel(tokRate)
+			w.tokRateStatusLabel.SetVisible(true)
+		} else {
+			w.tokRateStatusLabel.SetVisible(false)
+		}
 	}
 
 	// Right:Context usage
@@ -3197,7 +3426,9 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 		limit = w.modelLimits[conv.session.Model.ID]
 	}
 	ctxText := opencode.FormatContextUsage(conv.messages, conv.session.Tokens, limit)
-	w.contextStatusLabel.SetLabel(ctxText)
+	if w.contextStatusLabel != nil {
+		w.contextStatusLabel.SetLabel(ctxText)
+	}
 
 	w.rebuildAgentPills()
 	w.rebuildContextInfo(tab)
@@ -3233,30 +3464,296 @@ func (w *Window) getGitBranch(dir string) string {
 			branch = line[:7]
 		}
 	}
+	if w.branchCache == nil {
+		w.branchCache = make(map[string]string)
+	}
 	w.branchCache[dir] = branch
 	return branch
 }
 
-func (w *Window) refreshShells() {
-	gtkutil.Async(w.ctx, func() func() {
-		shells, err := w.client.ListShells(w.ctx, "")
-		return func() {
-			if err == nil {
-				w.activeShells = make(map[string]opencode.ShellItem)
-				for _, sh := range shells {
-					if sh.Status == "" || sh.Status == "running" {
-						w.activeShells[sh.ID] = sh
+func (w *Window) isShellInTab(tab *sessionTab, sh opencode.ShellItem) bool {
+	if tab == nil {
+		return false
+	}
+	rootID := tab.main.session.ID
+	sessID := sh.EffectiveSessionID()
+	if sessID != "" {
+		if sessID == rootID || w.childToRoot[sessID] == rootID {
+			return true
+		}
+		if tab.subTimelines != nil {
+			if _, ok := tab.subTimelines[sessID]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	shDir := normalizeProjectDir(sh.EffectiveLocationDir())
+	tabDir := normalizeProjectDir(tab.main.session.Location.Directory)
+	return shDir != "" && shDir == tabDir
+}
+
+func (w *Window) isForegroundShell(tab *sessionTab, sh opencode.ShellItem) bool {
+	if tab == nil {
+		return false
+	}
+	checkConv := func(conv *convTimeline) bool {
+		if conv == nil {
+			return false
+		}
+		if conv.backgroundShellIDs[sh.ID] {
+			return false
+		}
+		if _, ok := conv.blockingShellIDs[sh.ID]; ok {
+			return true
+		}
+		if len(conv.blockingShellTools) > 0 {
+			sessID := sh.EffectiveSessionID()
+			if sessID == "" || sessID == conv.session.ID {
+				return true
+			}
+		}
+		return false
+	}
+	if checkConv(tab.main) {
+		return true
+	}
+	for _, sub := range tab.subTimelines {
+		if checkConv(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) visibleBackgroundShellsForTab(tab *sessionTab) []opencode.ShellItem {
+	if tab == nil || len(w.activeShells) == 0 {
+		return nil
+	}
+	var out []opencode.ShellItem
+	for _, sh := range w.activeShells {
+		if sh.Status != "" && sh.Status != "running" {
+			continue
+		}
+		if !w.isShellInTab(tab, sh) {
+			continue
+		}
+		if w.isForegroundShell(tab, sh) {
+			continue
+		}
+		out = append(out, sh)
+	}
+	slices.SortFunc(out, func(a, b opencode.ShellItem) int {
+		if a.Time.Created != b.Time.Created {
+			return cmp.Compare(a.Time.Created, b.Time.Created)
+		}
+		return cmp.Compare(a.ID, b.ID)
+	})
+	return out
+}
+
+func readTailBytes(path string, maxBytes int64) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	size := st.Size()
+	if size <= 0 {
+		return nil, nil
+	}
+	offset := int64(0)
+	if size > maxBytes {
+		offset = size - maxBytes
+	}
+	buf := make([]byte, size-offset)
+	n, _ := f.ReadAt(buf, offset)
+	return buf[:n], nil
+}
+
+func (w *Window) fetchSingleShellOutput(sh opencode.ShellItem) (string, bool) {
+	if w.client == nil {
+		if f := sh.EffectiveFile(); f != "" {
+			if data, readErr := readTailBytes(f, 16384); readErr == nil {
+				return FormatShellTailLines(string(data), 7), true
+			}
+		}
+		return "", false
+	}
+	out, err := w.client.GetShellOutput(w.ctx, sh.ID, sh.EffectiveLocationDir(), 0, 16384)
+	if err == nil && out != nil && out.Output != "" {
+		return FormatShellTailLines(out.Output, 7), true
+	}
+	if f := sh.EffectiveFile(); f != "" {
+		if data, readErr := readTailBytes(f, 16384); readErr == nil {
+			return FormatShellTailLines(string(data), 7), true
+		}
+	}
+	if err == nil && out != nil {
+		return FormatShellTailLines(out.Output, 7), true
+	}
+	return "", false
+}
+
+func (w *Window) updateToolWidgetsForShell(shellID, formattedOutput, bgStatus string) {
+	if shellID == "" {
+		return
+	}
+	applyConv := func(conv *convTimeline) {
+		if conv == nil {
+			return
+		}
+		for _, aw := range conv.assistantMap {
+			for _, tw := range aw.tools {
+				if tw.ShellID() == shellID {
+					if formattedOutput != "" {
+						tw.SetShellLiveOutput(formattedOutput)
+					}
+					if bgStatus != "" {
+						tw.SetBackgroundStatus(bgStatus)
 					}
 				}
+			}
+		}
+	}
+	for _, tab := range w.tabs {
+		applyConv(tab.main)
+		for _, sub := range tab.subTimelines {
+			applyConv(sub)
+		}
+	}
+}
+
+func (w *Window) pollActiveShellOutputs() {
+	shells := w.visibleBackgroundShellsForTab(w.currentTab())
+	if len(shells) == 0 {
+		return
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		type res struct {
+			id   string
+			text string
+		}
+		var (
+			mu      sync.Mutex
+			results []res
+			wg      sync.WaitGroup
+		)
+		for _, sh := range shells {
+			shCopy := sh
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if text, ok := w.fetchSingleShellOutput(shCopy); ok {
+					mu.Lock()
+					results = append(results, res{id: shCopy.ID, text: text})
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		return func() {
+			for _, r := range results {
+				if w.shellOutputs[r.id] != r.text {
+					w.shellOutputs[r.id] = r.text
+					if lbl, ok := w.shellOutputLabels[r.id]; ok && lbl != nil {
+						lbl.SetText(r.text)
+					}
+					w.updateToolWidgetsForShell(r.id, r.text, "")
+				}
+			}
+		}
+	})
+}
+
+func (w *Window) ensureShellOutputPoller() {
+	if w.client == nil || w.shellPollRunning {
+		return
+	}
+	if len(w.visibleBackgroundShellsForTab(w.currentTab())) == 0 {
+		return
+	}
+	w.shellPollRunning = true
+	w.pollActiveShellOutputs()
+	glib.TimeoutAdd(1000, func() bool {
+		if w.ctx.Err() != nil || len(w.visibleBackgroundShellsForTab(w.currentTab())) == 0 {
+			w.shellPollRunning = false
+			return false
+		}
+		w.pollActiveShellOutputs()
+		return true
+	})
+}
+
+func (w *Window) refreshShells() {
+	if w.client == nil {
+		return
+	}
+	seenDirs := map[string]bool{"": true}
+	dirs := []string{""}
+	if tab := w.currentTab(); tab != nil && tab.main.session.Location.Directory != "" {
+		d := tab.main.session.Location.Directory
+		seenDirs[d] = true
+		dirs = append(dirs, d)
+	}
+	for _, tab := range w.tabs {
+		if d := tab.main.session.Location.Directory; d != "" && !seenDirs[d] {
+			seenDirs[d] = true
+			dirs = append(dirs, d)
+		}
+	}
+
+	gtkutil.Async(w.ctx, func() func() {
+		var (
+			mu     sync.Mutex
+			merged = make(map[string]opencode.ShellItem)
+			anyOK  bool
+			wg     sync.WaitGroup
+		)
+		for _, dir := range dirs {
+			d := dir
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				shells, err := w.client.ListShells(w.ctx, d)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				anyOK = true
+				for _, sh := range shells {
+					if sh.Status == "" || sh.Status == "running" {
+						if sh.LocationDir == "" && d != "" {
+							sh.LocationDir = d
+						}
+						merged[sh.ID] = sh
+					}
+				}
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		return func() {
+			if anyOK {
+				w.activeShells = merged
 				w.updateShellStatus()
 				w.rebuildShellList()
+				w.ensureShellOutputPoller()
 			}
 		}
 	})
 }
 
 func (w *Window) updateShellStatus() {
-	count := len(w.activeShells)
+	if w.shellStatusBox == nil || w.shellStatusLabel == nil || w.shellsSectionBox == nil {
+		return
+	}
+	shells := w.visibleBackgroundShellsForTab(w.currentTab())
+	count := len(shells)
 	if count > 0 {
 		noun := "shells"
 		if count == 1 {
@@ -3276,7 +3773,8 @@ func (w *Window) updateSheetEmptyState() {
 	if w.sheetEmptyLabel == nil {
 		return
 	}
-	hasContent := w.shellsSectionBox.Visible() || w.subagentsSectionBox.Visible() ||
+	hasContent := (w.shellsSectionBox != nil && w.shellsSectionBox.Visible()) ||
+		(w.subagentsSectionBox != nil && w.subagentsSectionBox.Visible()) ||
 		(w.contextSectionBox != nil && w.contextSectionBox.Visible())
 	w.sheetEmptyLabel.SetVisible(!hasContent)
 }
@@ -3457,24 +3955,28 @@ func (w *Window) rebuildShellList() {
 	if w.shellListBox == nil {
 		return
 	}
-	for c := w.shellListBox.FirstChild(); c != nil; c = w.shellListBox.FirstChild() {
-		w.shellListBox.Remove(c)
-	}
-	if len(w.activeShells) == 0 {
+	w.shellListBox.RemoveAll()
+	w.shellOutputLabels = make(map[string]*gtk.Label)
+
+	shells := w.visibleBackgroundShellsForTab(w.currentTab())
+	if len(shells) == 0 {
 		return
 	}
 
-	for _, sh := range w.activeShells {
+	for _, sh := range shells {
 		shellItem := sh
 		row := gtk.NewListBoxRow()
 		row.SetSelectable(false)
 		row.SetActivatable(false)
 
+		outerVBox := gtk.NewBox(gtk.OrientationVertical, 6)
+		outerVBox.SetMarginTop(8)
+		outerVBox.SetMarginBottom(8)
+		outerVBox.SetMarginStart(12)
+		outerVBox.SetMarginEnd(12)
+		outerVBox.SetHExpand(true)
+
 		hBox := gtk.NewBox(gtk.OrientationHorizontal, 10)
-		hBox.SetMarginTop(8)
-		hBox.SetMarginBottom(8)
-		hBox.SetMarginStart(12)
-		hBox.SetMarginEnd(12)
 		hBox.SetHExpand(true)
 		hBox.SetVAlign(gtk.AlignCenter)
 
@@ -3516,8 +4018,14 @@ func (w *Window) rebuildShellList() {
 		stopBtn.SetVAlign(gtk.AlignCenter)
 		stopBtn.SetTooltipText("Stop Shell")
 		stopBtn.ConnectClicked(func() {
+			locDir := shellItem.EffectiveLocationDir()
+			if locDir == "" {
+				if tab := w.currentTab(); tab != nil {
+					locDir = tab.main.session.Location.Directory
+				}
+			}
 			gtkutil.Async(w.ctx, func() func() {
-				err := w.client.KillShell(w.ctx, shellItem.ID)
+				err := w.client.KillShell(w.ctx, shellItem.ID, locDir)
 				return func() {
 					if err != nil {
 						slog.Error("failed to kill shell", "shellID", shellItem.ID, "err", err)
@@ -3525,29 +4033,48 @@ func (w *Window) rebuildShellList() {
 						return
 					}
 					delete(w.activeShells, shellItem.ID)
+					delete(w.shellOutputs, shellItem.ID)
+					delete(w.shellOutputLabels, shellItem.ID)
+					w.updateToolWidgetsForShell(shellItem.ID, "", "completed")
 					w.updateShellStatus()
 					w.rebuildShellList()
 				}
 			})
 		})
 		hBox.Append(stopBtn)
+		outerVBox.Append(hBox)
 
-		row.SetChild(hBox)
+		outText, ok := w.shellOutputs[shellItem.ID]
+		if !ok || outText == "" {
+			outText = FormatShellTailLines("", 7)
+		}
+		outLbl := gtk.NewLabel(outText)
+		outLbl.AddCSSClass("glup-shell-output")
+		outLbl.SetXAlign(0)
+		outLbl.SetYAlign(0)
+		outLbl.SetHExpand(true)
+		outLbl.SetSelectable(true)
+		outLbl.SetOverflow(gtk.OverflowHidden)
+		outerVBox.Append(outLbl)
+		w.shellOutputLabels[shellItem.ID] = outLbl
+
+		row.SetChild(outerVBox)
 		w.shellListBox.Append(row)
 	}
 }
 
 func (w *Window) rebuildSubagentList(tab *sessionTab) {
-	for child := w.subagentListBox.FirstChild(); child != nil; child = w.subagentListBox.FirstChild() {
-		w.subagentListBox.Remove(child)
+	if w.subagentListBox == nil || w.subagentsSectionBox == nil {
+		return
 	}
+	w.subagentListBox.RemoveAll()
 	w.subagentRows = nil
 
 	viewingSubagent := tab != nil && tab.activeSubID != ""
 	var activeSubs []opencode.Session
 	if tab != nil {
 		for _, sub := range tab.subagents {
-			if sub.Outcome == "" {
+			if sub.IsRunning() {
 				activeSubs = append(activeSubs, sub)
 			}
 		}
@@ -3618,9 +4145,10 @@ func (w *Window) rebuildAgentButtons() {
 }
 
 func (w *Window) rebuildAgentPills() {
-	for child := w.agentListBox.FirstChild(); child != nil; child = w.agentListBox.FirstChild() {
-		w.agentListBox.Remove(child)
+	if w.agentListBox == nil {
+		return
 	}
+	w.agentListBox.RemoveAll()
 	w.agentRows = nil
 	primary := opencode.PrimaryAgents(w.agents)
 	if len(primary) == 0 {
@@ -3703,9 +4231,7 @@ func (w *Window) updateModelLastUsed(ref opencode.ModelRef, ts int64) {
 }
 
 func (w *Window) rebuildModelList() {
-	for child := w.modelListBox.FirstChild(); child != nil; child = w.modelListBox.FirstChild() {
-		w.modelListBox.Remove(child)
-	}
+	w.modelListBox.RemoveAll()
 	w.modelRows = nil
 
 	sortedModels := make([]opencode.ModelInfo, len(w.models))
@@ -4022,6 +4548,50 @@ func (w *Window) createNewSession() {
 	w.createNewSessionInDir(cwd)
 }
 
+func (w *Window) inheritedAgentAndModel() (string, opencode.ModelRef) {
+	var agent string
+	var model opencode.ModelRef
+
+	extractFromConv := func(conv *convTimeline) {
+		if conv == nil {
+			return
+		}
+		if agent == "" && conv.session.Agent != "" {
+			agent = conv.session.Agent
+		}
+		if model.ID == "" && conv.session.Model.ID != "" {
+			model = conv.session.Model
+		}
+		for i := len(conv.messages) - 1; i >= 0 && (agent == "" || model.ID == ""); i-- {
+			msg := conv.messages[i]
+			if agent == "" && msg.Agent != "" {
+				agent = msg.Agent
+			}
+			if model.ID == "" && msg.Model.ID != "" {
+				model = msg.Model
+			}
+		}
+	}
+
+	if tab := w.currentTab(); tab != nil {
+		extractFromConv(tab.activeConv())
+		if tab.main != tab.activeConv() {
+			extractFromConv(tab.main)
+		}
+	}
+
+	if model.ID != "" && model.ProviderID == "" {
+		for _, m := range w.models {
+			if m.ID == model.ID || m.ModelID == model.ID {
+				model.ProviderID = m.ProviderID
+				break
+			}
+		}
+	}
+
+	return agent, model
+}
+
 func (w *Window) createNewSessionInDir(dir string) {
 	cwd := strings.TrimSpace(dir)
 	if cwd == "" {
@@ -4032,8 +4602,17 @@ func (w *Window) createNewSessionInDir(dir string) {
 	}
 	cwd = filepath.Clean(cwd)
 
+	inheritedAgent, inheritedModel := w.inheritedAgentAndModel()
+	req := opencode.CreateSessionRequest{
+		Directory: cwd,
+		Agent:     inheritedAgent,
+	}
+	if inheritedModel.ID != "" && inheritedModel.ProviderID != "" {
+		req.Model = &inheritedModel
+	}
+
 	gtkutil.Async(w.ctx, func() func() {
-		sess, err := w.client.CreateSession(w.ctx, cwd)
+		sess, err := w.client.CreateSessionWithOptions(w.ctx, req)
 		return func() {
 			if err != nil {
 				app.Error(w.ctx, err)
@@ -5017,8 +5596,15 @@ func (w *Window) backgroundCurrentSession() bool {
 	}
 	if _, conv := w.resolveConv(sessionID); conv != nil {
 		clear(conv.blockingTools)
+		clear(conv.blockingShellTools)
+		for shID := range conv.blockingShellIDs {
+			conv.backgroundShellIDs[shID] = true
+		}
+		clear(conv.blockingShellIDs)
 	}
 	w.updateBottomBar(tab)
+	w.rebuildShellList()
+	w.ensureShellOutputPoller()
 	rootID := tab.main.session.ID
 	gtkutil.Async(w.ctx, func() func() {
 		err := w.client.BackgroundSession(w.ctx, sessionID)
@@ -5058,6 +5644,8 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		if !active {
 			conv.runningTools = 0
 			clear(conv.blockingTools)
+			clear(conv.blockingShellTools)
+			clear(conv.blockingShellIDs)
 		}
 		conv.keepPendingAtBottom()
 		if active && conv.scroll != nil {
@@ -5146,18 +5734,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			applyCreated := func(sess opencode.Session) {
 				if sess.ParentID != "" {
 					if tab, ok := w.tabs[sess.ParentID]; ok {
-						w.childToRoot[sess.ID] = sess.ParentID
-						found := false
-						for i, s := range tab.subagents {
-							if s.ID == sess.ID {
-								tab.subagents[i] = sess
-								found = true
-								break
-							}
-						}
-						if !found {
-							tab.subagents = append([]opencode.Session{sess}, tab.subagents...)
-						}
+						w.upsertSubagent(tab, sess)
 						if w.currentTab() == tab {
 							w.updateBottomBar(tab)
 							w.rebuildSubagentList(tab)
@@ -5169,7 +5746,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					w.syncSwitcherIndicators()
 				}
 			}
-			if d.Session.ID != "" && d.Session.Location.Directory == "" && d.Session.ParentID == "" && d.Session.Title == "" {
+			if w.client != nil && d.Session.ID != "" && d.Session.Location.Directory == "" && d.Session.ParentID == "" && d.Session.Title == "" {
 				sessID := d.Session.ID
 				gtkutil.Async(w.ctx, func() func() {
 					sess, err := w.client.GetSession(w.ctx, sessID)
@@ -5211,13 +5788,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				}
 			} else if parentID, ok := w.childToRoot[sess.ID]; ok {
 				if parentTab, ok := w.tabs[parentID]; ok {
-					for i, s := range parentTab.subagents {
-						if s.ID == sess.ID {
-							parentTab.subagents[i] = sess
-							break
-						}
-					}
+					w.upsertSubagent(parentTab, sess)
 					if w.currentTab() == parentTab {
+						w.updateBottomBar(parentTab)
 						w.rebuildSubagentList(parentTab)
 					}
 				}
@@ -5242,6 +5815,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						w.closeSubagent(parentTab)
 					}
 					if w.currentTab() == parentTab {
+						w.updateBottomBar(parentTab)
 						w.rebuildSubagentList(parentTab)
 					}
 				}
@@ -5268,6 +5842,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			w.setConvActive(d.SessionID, true)
+			w.setSubagentActive(d.SessionID, true, "")
 			w.reconcileTail(d.SessionID)
 		}
 
@@ -5283,9 +5858,37 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				conv.session.Time.Updated = now
 			}
 			w.setConvActive(d.SessionID, false)
+			outcome := "succeeded"
+			if ev.Type == "session.execution.failed" {
+				outcome = "failed"
+			} else if ev.Type == "session.execution.interrupted" {
+				outcome = "interrupted"
+			}
+			w.setSubagentActive(d.SessionID, false, outcome)
 			w.reconcileTail(d.SessionID)
 			if rootID, ok := w.childToRoot[d.SessionID]; ok {
 				w.loadChildSubagents(rootID)
+			}
+		}
+
+	case "session.status":
+		var d struct {
+			SessionID string `json:"sessionID"`
+			Status    struct {
+				Type string `json:"type"`
+			} `json:"status"`
+		}
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			switch d.Status.Type {
+			case "busy", "retry":
+				w.setConvActive(d.SessionID, true)
+				w.setSubagentActive(d.SessionID, true, "")
+			case "idle":
+				w.setConvActive(d.SessionID, false)
+				w.setSubagentActive(d.SessionID, false, "succeeded")
+				if rootID, ok := w.childToRoot[d.SessionID]; ok {
+					w.loadChildSubagents(rootID)
+				}
 			}
 		}
 
@@ -5339,7 +5942,10 @@ func (w *Window) handleEvent(ev opencode.Event) {
 
 	case "session.inbox.delivered", "session.synthetic", "session.instructions.updated", "session.skill.activated",
 		"session.compaction.started", "session.compaction.ended", "session.compaction.failed":
-		var d opencode.SessionIDEvent
+		var d struct {
+			SessionID string         `json:"sessionID"`
+			Metadata  map[string]any `json:"metadata,omitempty"`
+		}
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			tab, conv := w.resolveConv(d.SessionID)
 			if tab != nil {
@@ -5352,7 +5958,19 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				}
 			}
 			if ev.Type == "session.synthetic" {
-				if rootID, ok := w.childToRoot[d.SessionID]; ok {
+				if d.Metadata != nil {
+					if childID, _ := d.Metadata["childID"].(string); childID != "" {
+						state, _ := d.Metadata["state"].(string)
+						w.setSubagentActive(childID, false, cmp.Or(state, "succeeded"))
+					}
+					if shID, _ := d.Metadata["shellID"].(string); shID != "" {
+						w.updateToolWidgetsForShell(shID, "", "completed")
+						w.refreshShells()
+					}
+				}
+				if tab != nil {
+					w.loadChildSubagents(tab.main.session.ID)
+				} else if rootID, ok := w.childToRoot[d.SessionID]; ok {
 					w.loadChildSubagents(rootID)
 				}
 			}
@@ -5387,6 +6005,14 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				conv.session.Title = d.Title
+			}
+			if rootID, ok := w.childToRoot[d.SessionID]; ok {
+				if parentTab, ok := w.tabs[rootID]; ok {
+					w.upsertSubagent(parentTab, opencode.Session{ID: d.SessionID, ParentID: rootID, Title: d.Title})
+					if w.currentTab() == parentTab {
+						w.rebuildSubagentList(parentTab)
+					}
+				}
 			}
 			if tab != nil {
 				if conv == tab.main {
@@ -5606,15 +6232,60 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
+				name := d.Name
+				if name == "" && d.ID != "" {
+					name = conv.toolNames[d.ID]
+				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-					tw := aw.EnsureTool(d.ID, d.Name)
+					tw := aw.EnsureTool(d.ID, name)
 					tw.AppendInputDelta(d.Delta)
 				}
 			}
 		}
 
 	case "session.tool.called":
+		var d opencode.ToolEvent
+		if json.Unmarshal(ev.Data, &d) == nil {
+			tab, conv := w.resolveConv(d.SessionID)
+			var name string
+			if conv != nil {
+				if d.ID != "" && d.Name != "" {
+					conv.toolNames[d.ID] = d.Name
+				}
+				name = d.Name
+				if name == "" && d.ID != "" {
+					name = conv.toolNames[d.ID]
+				}
+				if d.ID != "" {
+					if isBlockingBackgroundableTool(name, "running", d.Input) {
+						conv.blockingTools[d.ID] = true
+						if isShellToolName(name) {
+							conv.blockingShellTools[d.ID] = true
+						}
+					} else {
+						delete(conv.blockingTools, d.ID)
+						delete(conv.blockingShellTools, d.ID)
+					}
+				}
+				if conv.loaded {
+					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
+					tw := aw.EnsureTool(d.ID, name)
+					tw.SetStatus("running")
+					tw.SetInput(d.Input)
+					tw.SetMetadata(d.Metadata)
+				}
+				if w.currentTab() == tab {
+					w.updateBottomBar(tab)
+					w.rebuildShellList()
+				}
+			}
+			if name == "subagent" || name == "task" {
+				w.loadChildSubagents(d.SessionID)
+			}
+		}
+
+	case "session.tool.progress", "session.tool.updated":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
@@ -5626,44 +6297,53 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if name == "" && d.ID != "" {
 					name = conv.toolNames[d.ID]
 				}
-				if d.ID != "" {
-					if isBlockingBackgroundableTool(name, "running", d.Input) {
-						conv.blockingTools[d.ID] = true
-					} else {
-						delete(conv.blockingTools, d.ID)
-					}
-				}
-				if conv.loaded {
-					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-					tw := aw.EnsureTool(d.ID, d.Name)
-					tw.SetStatus("running")
-					tw.SetInput(d.Input)
-					tw.SetMetadata(d.Metadata)
-				}
-				if w.currentTab() == tab {
-					w.updateBottomBar(tab)
-				}
-			}
-			if d.Name == "subagent" || d.Name == "task" {
-				w.loadChildSubagents(d.SessionID)
-			}
-		}
-
-	case "session.tool.updated":
-		var d opencode.ToolEvent
-		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
-			if conv != nil {
+				var inputDesc, inputAgent string
 				if d.ID != "" && d.Input != nil {
 					if m := opencode.ParseToolInputMap(d.Input); m != nil {
 						if bg, ok := m["background"].(bool); ok && bg {
 							delete(conv.blockingTools, d.ID)
+							delete(conv.blockingShellTools, d.ID)
 						}
+						inputDesc, _ = m["description"].(string)
+						inputAgent, _ = m["agent"].(string)
+					}
+				}
+				var shID, childID string
+				if d.Metadata != nil {
+					shID, _ = d.Metadata["shellID"].(string)
+					if shID != "" {
+						if conv.blockingShellTools[d.ID] && !conv.backgroundShellIDs[shID] {
+							conv.blockingShellIDs[shID] = d.ID
+						} else if st, _ := d.Metadata["status"].(string); st == "running" {
+							conv.backgroundShellIDs[shID] = true
+							delete(conv.blockingShellIDs, shID)
+						}
+					}
+					childID, _ = d.Metadata["sessionID"].(string)
+					if childID != "" && tab != nil {
+						agent, _ := d.Metadata["agent"].(string)
+						if agent == "" {
+							agent = inputAgent
+						}
+						st, _ := d.Metadata["status"].(string)
+						w.upsertSubagent(tab, opencode.Session{
+							ID:       childID,
+							ParentID: tab.main.session.ID,
+							Title:    inputDesc,
+							Agent:    agent,
+							Location: tab.main.session.Location,
+						})
+						if st == "" || st == "running" {
+							w.setSubagentActive(childID, true, "")
+						} else {
+							w.setSubagentActive(childID, false, st)
+						}
+						w.loadChildSubagents(tab.main.session.ID)
 					}
 				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-					tw := aw.EnsureTool(d.ID, d.Name)
+					tw := aw.EnsureTool(d.ID, name)
 					if d.Text != "" {
 						tw.SetStatus(d.Text)
 					}
@@ -5677,6 +6357,13 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
+					if childID != "" {
+						w.rebuildSubagentList(tab)
+					}
+					if shID != "" {
+						w.rebuildShellList()
+						w.ensureShellOutputPoller()
+					}
 				}
 			}
 		}
@@ -5689,18 +6376,74 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if conv.runningTools > 0 {
 					conv.runningTools--
 				}
+				if d.ID != "" && d.Name != "" {
+					conv.toolNames[d.ID] = d.Name
+				}
+				name := d.Name
+				if name == "" && d.ID != "" {
+					name = conv.toolNames[d.ID]
+				}
 				if d.ID != "" {
 					delete(conv.blockingTools, d.ID)
+					delete(conv.blockingShellTools, d.ID)
+					for k, tid := range conv.blockingShellIDs {
+						if tid == d.ID {
+							delete(conv.blockingShellIDs, k)
+						}
+					}
+				}
+				var shID, childID string
+				if d.Metadata != nil {
+					shID, _ = d.Metadata["shellID"].(string)
+					st, _ := d.Metadata["status"].(string)
+					if st == "running" && shID != "" {
+						conv.backgroundShellIDs[shID] = true
+						delete(conv.blockingShellIDs, shID)
+					}
+					childID, _ = d.Metadata["sessionID"].(string)
+					if childID != "" && tab != nil {
+						agent, _ := d.Metadata["agent"].(string)
+						w.upsertSubagent(tab, opencode.Session{
+							ID:       childID,
+							ParentID: tab.main.session.ID,
+							Agent:    agent,
+							Location: tab.main.session.Location,
+						})
+						if st == "running" {
+							w.setSubagentActive(childID, true, "")
+							w.loadChildSubagents(tab.main.session.ID)
+						} else {
+							w.setSubagentActive(childID, false, cmp.Or(st, "succeeded"))
+						}
+					}
 				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-					tw := aw.EnsureTool(d.ID, d.Name)
+					tw := aw.EnsureTool(d.ID, name)
 					tw.SetStatus("completed")
 					tw.SetOutput(d.Content, nil)
 					tw.SetMetadata(d.Metadata)
+					if shID == "" {
+						shID = tw.ShellID()
+					}
+					if shID != "" && tw.IsBackgroundRunning() {
+						conv.backgroundShellIDs[shID] = true
+						delete(conv.blockingShellIDs, shID)
+						if out, ok := w.shellOutputs[shID]; ok && out != "" {
+							tw.SetShellLiveOutput(out)
+						}
+					}
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
+					w.rebuildSubagentList(tab)
+					w.rebuildShellList()
+					w.ensureShellOutputPoller()
+				}
+				if shID != "" && conv.backgroundShellIDs[shID] {
+					if _, exists := w.activeShells[shID]; !exists {
+						w.refreshShells()
+					}
 				}
 			}
 		}
@@ -5713,18 +6456,38 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if conv.runningTools > 0 {
 					conv.runningTools--
 				}
+				if d.ID != "" && d.Name != "" {
+					conv.toolNames[d.ID] = d.Name
+				}
+				name := d.Name
+				if name == "" && d.ID != "" {
+					name = conv.toolNames[d.ID]
+				}
 				if d.ID != "" {
 					delete(conv.blockingTools, d.ID)
+					delete(conv.blockingShellTools, d.ID)
+					for k, tid := range conv.blockingShellIDs {
+						if tid == d.ID {
+							delete(conv.blockingShellIDs, k)
+						}
+					}
+				}
+				if d.Metadata != nil {
+					if childID, _ := d.Metadata["sessionID"].(string); childID != "" {
+						w.setSubagentActive(childID, false, "failed")
+					}
 				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-					tw := aw.EnsureTool(d.ID, d.Name)
+					tw := aw.EnsureTool(d.ID, name)
 					tw.SetStatus("failed")
 					tw.SetOutput(d.Content, d.Error)
 					tw.SetMetadata(d.Metadata)
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
+					w.rebuildSubagentList(tab)
+					w.rebuildShellList()
 				}
 			}
 		}
@@ -5765,10 +6528,14 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			if sh.ID == "" {
 				sh = d.Shell
 			}
+			if sh.LocationDir == "" && ev.Location.Directory != "" {
+				sh.LocationDir = ev.Location.Directory
+			}
 			if sh.ID != "" && (sh.Status == "" || sh.Status == "running") {
 				w.activeShells[sh.ID] = sh
 				w.updateShellStatus()
 				w.rebuildShellList()
+				w.ensureShellOutputPoller()
 			}
 		}
 
@@ -5786,7 +6553,21 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				id = d.Shell.ID
 			}
 			if id != "" {
+				prevSh, hadSh := w.activeShells[id]
 				delete(w.activeShells, id)
+				delete(w.shellOutputLabels, id)
+				w.updateToolWidgetsForShell(id, w.shellOutputs[id], "completed")
+				if hadSh {
+					gtkutil.Async(w.ctx, func() func() {
+						text, ok := w.fetchSingleShellOutput(prevSh)
+						return func() {
+							if ok && text != "" {
+								w.shellOutputs[id] = text
+								w.updateToolWidgetsForShell(id, text, "completed")
+							}
+						}
+					})
+				}
 				w.updateShellStatus()
 				w.rebuildShellList()
 			}

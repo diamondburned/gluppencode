@@ -110,7 +110,7 @@ func (e *SessionCreatedEvent) UnmarshalJSON(data []byte) error {
 		e.Session = *r.Info
 	} else {
 		var flat Session
-		if err := json.Unmarshal(data, &flat); err == nil && flat.ID != "" {
+		if err := json.Unmarshal(data, &flat); err == nil {
 			e.Session = flat
 		}
 	}

@@ -205,6 +205,17 @@ type Session struct {
 	Location  Location       `json:"location"`
 }
 
+// IsRunning reports whether a session (such as a child subagent) is currently running.
+func (s Session) IsRunning() bool {
+	if s.Outcome != "" {
+		return s.Time.Idle > 0 && s.Time.Busy > s.Time.Idle
+	}
+	if s.Time.Idle > 0 && s.Time.Idle >= s.Time.Busy {
+		return false
+	}
+	return true
+}
+
 // ListSessions lists top-level sessions.
 func (c *Client) ListSessions(ctx context.Context, limit int) ([]Session, error) {
 	return c.SearchSessions(ctx, "", limit)
@@ -266,15 +277,21 @@ func (c *Client) GetSession(ctx context.Context, sessionID string) (*Session, er
 // CreateSessionRequest is the payload for creating a session.
 type CreateSessionRequest struct {
 	Title     string    `json:"title,omitempty"`
+	Agent     string    `json:"agent,omitempty"`
+	Model     *ModelRef `json:"model,omitempty"`
 	Directory string    `json:"-"`
 	Location  *Location `json:"location,omitempty"`
 }
 
 // CreateSession creates a new session.
 func (c *Client) CreateSession(ctx context.Context, directory string) (*Session, error) {
-	req := CreateSessionRequest{}
-	if directory != "" {
-		req.Location = &Location{Directory: directory}
+	return c.CreateSessionWithOptions(ctx, CreateSessionRequest{Directory: directory})
+}
+
+// CreateSessionWithOptions creates a new session with optional agent, model, and location settings.
+func (c *Client) CreateSessionWithOptions(ctx context.Context, req CreateSessionRequest) (*Session, error) {
+	if req.Location == nil && req.Directory != "" {
+		req.Location = &Location{Directory: req.Directory}
 	}
 	var raw json.RawMessage
 	if err := c.doJSON(ctx, http.MethodPost, "/api/session", req, &raw); err != nil {
@@ -283,6 +300,12 @@ func (c *Client) CreateSession(ctx context.Context, directory string) (*Session,
 	var sess Session
 	if err := decodeDataOrDirect(raw, &sess); err != nil {
 		return nil, err
+	}
+	if sess.Agent == "" && req.Agent != "" {
+		sess.Agent = req.Agent
+	}
+	if sess.Model.ID == "" && req.Model != nil && req.Model.ID != "" {
+		sess.Model = *req.Model
 	}
 	return &sess, nil
 }
@@ -593,6 +616,7 @@ type ShellItem struct {
 	Command     string         `json:"command"`
 	Description string         `json:"description,omitempty"`
 	Cwd         string         `json:"cwd,omitempty"`
+	LocationDir string         `json:"-"`
 	File        string         `json:"file,omitempty"`
 	OutputPath  string         `json:"outputPath,omitempty"`
 	Status      string         `json:"status"` // "running", "exited", "timeout", "killed"
@@ -600,10 +624,62 @@ type ShellItem struct {
 	ExitCode    *int           `json:"exitCode,omitempty"`
 	Signal      string         `json:"signal,omitempty"`
 	Metadata    map[string]any `json:"metadata,omitempty"`
-	Time        struct {
+	Output      *struct {
+		File string `json:"file,omitempty"`
+	} `json:"output,omitempty"`
+	Source *struct {
+		Type      string `json:"type,omitempty"`
+		SessionID string `json:"sessionID,omitempty"`
+		CallID    string `json:"callID,omitempty"`
+	} `json:"source,omitempty"`
+	Time struct {
+		Started   int64 `json:"started,omitempty"`
 		Created   int64 `json:"created,omitempty"`
 		Completed int64 `json:"completed,omitempty"`
 	} `json:"time,omitempty"`
+}
+
+// EffectiveSessionID returns the session ID associated with the shell (checking top-level, source, and metadata).
+func (s ShellItem) EffectiveSessionID() string {
+	if s.SessionID != "" {
+		return s.SessionID
+	}
+	if s.Source != nil && s.Source.SessionID != "" {
+		return s.Source.SessionID
+	}
+	if s.Metadata != nil {
+		if id, ok := s.Metadata["sessionID"].(string); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+// EffectiveFile returns the on-disk output capture file path for the shell.
+func (s ShellItem) EffectiveFile() string {
+	if s.File != "" {
+		return s.File
+	}
+	if s.Output != nil && s.Output.File != "" {
+		return s.Output.File
+	}
+	return s.OutputPath
+}
+
+// EffectiveLocationDir returns the location directory for the shell, falling back to Cwd.
+func (s ShellItem) EffectiveLocationDir() string {
+	if s.LocationDir != "" {
+		return s.LocationDir
+	}
+	return s.Cwd
+}
+
+// ShellOutput represents a page of stdout/stderr from GET /api/shell/{id}/output.
+type ShellOutput struct {
+	Output    string `json:"output"`
+	Cursor    int    `json:"cursor"`
+	Size      int    `json:"size"`
+	Truncated bool   `json:"truncated"`
 }
 
 // ListShells lists background shells from GET /api/shell.
@@ -618,16 +694,61 @@ func (c *Client) ListShells(ctx context.Context, directory string) ([]ShellItem,
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
 		return nil, err
 	}
+	var env struct {
+		Location Location `json:"location"`
+	}
+	_ = json.Unmarshal(raw, &env)
+	locDir := env.Location.Directory
+	if locDir == "" {
+		locDir = directory
+	}
 	var shells []ShellItem
 	if err := decodeDataOrDirect(raw, &shells); err != nil {
 		return nil, err
 	}
+	for i := range shells {
+		if shells[i].LocationDir == "" {
+			shells[i].LocationDir = locDir
+		}
+	}
 	return shells, nil
 }
 
+// GetShellOutput fetches output from a shell (GET /api/shell/{id}/output).
+func (c *Client) GetShellOutput(ctx context.Context, shellID, directory string, cursor, limit int) (*ShellOutput, error) {
+	v := url.Values{}
+	if directory != "" {
+		v.Set("location[directory]", directory)
+	}
+	if cursor > 0 {
+		v.Set("cursor", strconv.Itoa(cursor))
+	}
+	if limit > 0 {
+		v.Set("limit", strconv.Itoa(limit))
+	}
+	path := fmt.Sprintf("/api/shell/%s/output", url.PathEscape(shellID))
+	if len(v) > 0 {
+		path += "?" + v.Encode()
+	}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var out ShellOutput
+	if err := decodeDataOrDirect(raw, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // KillShell terminates a running background shell (DELETE /api/shell/{id}).
-func (c *Client) KillShell(ctx context.Context, shellID string) error {
+func (c *Client) KillShell(ctx context.Context, shellID string, directory ...string) error {
 	path := fmt.Sprintf("/api/shell/%s", url.PathEscape(shellID))
+	if len(directory) > 0 && directory[0] != "" {
+		v := url.Values{}
+		v.Set("location[directory]", directory[0])
+		path += "?" + v.Encode()
+	}
 	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
@@ -1153,9 +1274,10 @@ func (c *Client) CancelForm(ctx context.Context, sessionID, formID, message stri
 
 // Event is an SSE event emitted by /api/event.
 type Event struct {
-	ID   string          `json:"id"`
-	Type string          `json:"type"`
-	Data json.RawMessage `json:"data"`
+	ID       string          `json:"id"`
+	Type     string          `json:"type"`
+	Location Location        `json:"location,omitempty"`
+	Data     json.RawMessage `json:"data"`
 }
 
 // SubscribeEvents connects to /api/event and invokes fn for each decoded event.

@@ -1016,14 +1016,28 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 	if _, ok := qw.CollectAnswers(); ok {
 		t.Fatal("expected CollectAnswers to be invalid before selecting a multiselect option")
 	}
+	if qw.StepCount() != 2 || qw.CurrentStep() != 0 {
+		t.Fatalf("expected StepCount=2 CurrentStep=0, got %d %d", qw.StepCount(), qw.CurrentStep())
+	}
+	// On step 0, q0 is valid so Next button is sensitive and Submit is hidden.
+	if !qw.nextBtn.Sensitive() || qw.submitBtn.Visible() {
+		t.Fatalf("expected nextBtn sensitive and submitBtn hidden on step 0")
+	}
+	if !qw.NextStep() || qw.CurrentStep() != 1 {
+		t.Fatalf("expected NextStep() to advance to step 1")
+	}
 	if qw.submitBtn.Sensitive() {
-		t.Fatal("expected submitBtn to be insensitive when required multiselect is empty")
+		t.Fatal("expected submitBtn to be insensitive on step 1 when required multiselect is empty")
+	}
+	if !qw.PrevStep() || qw.CurrentStep() != 0 {
+		t.Fatalf("expected PrevStep() to return to step 0")
 	}
 
 	// Select an option in q1 and type a custom answer in q0.
+	qw.fields[0].customEntry.SetText("CockroachDB")
+	qw.SetStep(1)
 	qw.fields[1].options[0].btn.SetActive(true)
 	qw.fields[1].customEntry.SetText("Tracing")
-	qw.fields[0].customEntry.SetText("CockroachDB")
 
 	ans, ok := qw.CollectAnswers()
 	if !ok {
@@ -1065,19 +1079,25 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 	win.tabs["ses_fg"] = &sessionTab{
 		page: fgPage,
 		main: &convTimeline{
-			session:       opencode.Session{ID: "ses_fg", Title: "Foreground"},
-			formWidgets:   make(map[string]*QuestionFormWidget),
-			blockingTools: make(map[string]bool),
-			toolNames:     make(map[string]string),
+			session:            opencode.Session{ID: "ses_fg", Title: "Foreground"},
+			formWidgets:        make(map[string]*QuestionFormWidget),
+			blockingTools:      make(map[string]bool),
+			blockingShellTools: make(map[string]bool),
+			blockingShellIDs:   make(map[string]string),
+			backgroundShellIDs: make(map[string]bool),
+			toolNames:          make(map[string]string),
 		},
 	}
 	bgTab := &sessionTab{
 		page: bgPage,
 		main: &convTimeline{
-			session:       opencode.Session{ID: "ses_bg", Title: "Background"},
-			formWidgets:   make(map[string]*QuestionFormWidget),
-			blockingTools: make(map[string]bool),
-			toolNames:     make(map[string]string),
+			session:            opencode.Session{ID: "ses_bg", Title: "Background"},
+			formWidgets:        make(map[string]*QuestionFormWidget),
+			blockingTools:      make(map[string]bool),
+			blockingShellTools: make(map[string]bool),
+			blockingShellIDs:   make(map[string]string),
+			backgroundShellIDs: make(map[string]bool),
+			toolNames:          make(map[string]string),
 		},
 	}
 	win.tabs["ses_bg"] = bgTab
@@ -1211,5 +1231,296 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 		t.Fatal("expected SyntheticSubagentWidget for subagentMsg")
 	} else if _, ok := w.(*SyntheticSubagentWidget); !ok {
 		t.Fatalf("expected *SyntheticSubagentWidget for subagentMsg, got %T", w)
+	}
+}
+
+func TestBackgroundShellFilteringAndOutput(t *testing.T) {
+	// 1. Test FormatShellTailLines fixed 7-line buffer
+	emptyBuf := FormatShellTailLines("", 7)
+	if lines := strings.Split(emptyBuf, "\n"); len(lines) != 7 || !strings.Contains(lines[0], "Waiting for output") {
+		t.Fatalf("unexpected empty FormatShellTailLines: %q (lines=%d)", emptyBuf, len(lines))
+	}
+
+	rawAns := "\x1b[32mline1\x1b[0m\nline2\rline2_updated\nline3\nline4\nline5\nline6\nline7\nline8\n"
+	tailBuf := FormatShellTailLines(rawAns, 7)
+	tailLines := strings.Split(tailBuf, "\n")
+	if len(tailLines) != 7 {
+		t.Fatalf("expected 7 lines from FormatShellTailLines, got %d: %q", len(tailLines), tailBuf)
+	}
+	if tailLines[0] != "line2_updated" || tailLines[6] != "line8" {
+		t.Errorf("unexpected tailLines: first=%q last=%q all=%v", tailLines[0], tailLines[6], tailLines)
+	}
+
+	if !gtk.InitCheck() {
+		return
+	}
+
+	// 2. Test foreground shell suppression vs background shell visibility & session.tool.progress
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:               t.Context(),
+		viewStack:         vs,
+		stopBtn:           gtk.NewButton(),
+		shellStatusBox:    gtk.NewBox(gtk.OrientationHorizontal, 0),
+		shellStatusLabel:  gtk.NewLabel(""),
+		shellsSectionBox:  gtk.NewBox(gtk.OrientationVertical, 0),
+		shellListBox:      gtk.NewListBox(),
+		sheetEmptyLabel:   gtk.NewLabel(""),
+		activeShells:      make(map[string]opencode.ShellItem),
+		shellOutputs:      make(map[string]string),
+		shellOutputLabels: make(map[string]*gtk.Label),
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+	}
+	tab1 := win.addSessionTab(opencode.Session{ID: "ses_1", Title: "Tab 1"})
+	tab1.main.loaded = true
+	_ = win.addSessionTab(opencode.Session{ID: "ses_2", Title: "Tab 2"})
+	vs.SetVisibleChildName("ses_1")
+
+	newTestToolWidget := func(id, name string) *ToolWidget {
+		inView := gtk.NewTextView()
+		outView := gtk.NewTextView()
+		return &ToolWidget{
+			Box:             gtk.NewBox(gtk.OrientationVertical, 0),
+			ctx:             t.Context(),
+			toolIcon:        gtk.NewImage(),
+			titleLabel:      gtk.NewLabel(""),
+			subtitleLabel:   gtk.NewLabel(""),
+			badgesBox:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+			actionBtn:       gtk.NewButton(),
+			spinner:         adw.NewSpinner(),
+			statusLabel:     gtk.NewLabel(""),
+			imageBox:        gtk.NewBox(gtk.OrientationHorizontal, 0),
+			diffBox:         gtk.NewBox(gtk.OrientationVertical, 0),
+			detailsExpander: gtk.NewExpander(""),
+			inputView:       inView,
+			outputScroll:    gtk.NewScrolledWindow(),
+			outputView:      outView,
+			inputBuf:        inView.Buffer(),
+			outputBuf:       outView.Buffer(),
+			toolID:          id,
+			toolName:        name,
+		}
+	}
+	tab1.main.assistantMap["m1"] = &AssistantMessageWidget{
+		Box:      gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:      t.Context(),
+		partsBox: gtk.NewBox(gtk.OrientationVertical, 0),
+		tools: map[string]*ToolWidget{
+			"tool_fg": newTestToolWidget("tool_fg", "shell"),
+			"tool_bg": newTestToolWidget("tool_bg", "shell"),
+		},
+	}
+
+	// Start a foreground shell tool in ses_1: input.started -> called -> progress (with shellID) -> shell.created
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.input.started",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_fg","name":"shell"}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.called",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_fg","input":{"command":"ls -la"}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.progress",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_fg","metadata":{"shellID":"sh_fg"}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "shell.created",
+		Data: json.RawMessage(`{"info":{"id":"sh_fg","pid":101,"command":"ls -la","status":"running","source":{"type":"session","sessionID":"ses_1"}}}`),
+	})
+
+	// Foreground blocking shell must NOT appear in visibleBackgroundShellsForTab!
+	if got := win.visibleBackgroundShellsForTab(tab1); len(got) != 0 {
+		t.Fatalf("expected 0 visible background shells while foreground shell is blocking, got %+v", got)
+	}
+
+	// Shell belonging to another session (ses_2) must NOT appear in tab1!
+	win.handleEvent(opencode.Event{
+		Type: "shell.created",
+		Data: json.RawMessage(`{"info":{"id":"sh_other","pid":202,"command":"sleep 30","status":"running","source":{"type":"session","sessionID":"ses_2"}}}`),
+	})
+	if got := win.visibleBackgroundShellsForTab(tab1); len(got) != 0 {
+		t.Fatalf("expected 0 visible background shells for tab1 when shell belongs to ses_2, got %+v", got)
+	}
+
+	// Now start a background shell in ses_1 (background: true):
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.input.started",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_bg","name":"shell"}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.called",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_bg","input":{"command":"sleep 10","background":true}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "shell.created",
+		Data: json.RawMessage(`{"info":{"id":"sh_bg","pid":303,"command":"sleep 10","status":"running","source":{"type":"session","sessionID":"ses_1"}}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.success",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_bg","content":[{"type":"text","text":"Started background shell"}],"metadata":{"shellID":"sh_bg","status":"running"}}`),
+	})
+
+	got := win.visibleBackgroundShellsForTab(tab1)
+	if len(got) != 1 || got[0].ID != "sh_bg" {
+		t.Fatalf("expected [sh_bg] visible in tab1, got %+v", got)
+	}
+
+	// ToolWidget for tool_bg should remain in background-running state even after session.tool.success
+	aw := tab1.main.assistantMap["m1"]
+	if aw == nil || aw.tools["tool_bg"] == nil {
+		t.Fatalf("expected AssistantMessageWidget m1 and tool_bg widget")
+	}
+	twBg := aw.tools["tool_bg"]
+	if !twBg.IsBackgroundRunning() || twBg.ShellID() != "sh_bg" {
+		t.Errorf("expected twBg.IsBackgroundRunning()=true and ShellID=sh_bg, got bgRunning=%v shellID=%q", twBg.IsBackgroundRunning(), twBg.ShellID())
+	}
+
+	// 3. Test inheritedAgentAndModel inherits agent and model from current conversation
+	tab1.main.session.Agent = "plan"
+	tab1.main.session.Model = opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-argon-high"}
+	inhAgent, inhModel := win.inheritedAgentAndModel()
+	if inhAgent != "plan" || inhModel.ProviderID != "google" || inhModel.ID != "antigravity-gemini-4-argon-high" {
+		t.Errorf("inheritedAgentAndModel() = (%q, %+v), want (plan, google/antigravity-gemini-4-argon-high)", inhAgent, inhModel)
+	}
+}
+
+func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
+	if !gtk.InitCheck() {
+		return
+	}
+
+	vs := adw.NewViewStack()
+	bgBtn := gtk.NewButton()
+	bgBtn.SetVisible(false)
+	subBox := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	subBox.SetVisible(false)
+	subLbl := gtk.NewLabel("")
+	subSection := gtk.NewBox(gtk.OrientationVertical, 0)
+	subSection.SetVisible(false)
+	subList := gtk.NewListBox()
+
+	win := &Window{
+		ctx:                 t.Context(),
+		viewStack:           vs,
+		stopBtn:             gtk.NewButton(),
+		backgroundStatusBtn: bgBtn,
+		subagentStatusBox:   subBox,
+		subagentStatusLabel: subLbl,
+		subagentsSectionBox: subSection,
+		subagentListBox:     subList,
+		sheetEmptyLabel:     gtk.NewLabel(""),
+		tabs:                make(map[string]*sessionTab),
+		childToRoot:         make(map[string]string),
+	}
+
+	tab := win.addSessionTab(opencode.Session{
+		ID:       "ses_root",
+		Title:    "Dissent v0.0.41 update",
+		Agent:    "build",
+		Location: opencode.Location{Directory: "/home/diamond/.nix"},
+	})
+	tab.main.loaded = true
+	tab.main.active = true
+	vs.SetVisibleChildName("ses_root")
+
+	inView := gtk.NewTextView()
+	outView := gtk.NewTextView()
+	twSub := &ToolWidget{
+		Box:             gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:             t.Context(),
+		toolIcon:        gtk.NewImage(),
+		titleLabel:      gtk.NewLabel(""),
+		subtitleLabel:   gtk.NewLabel(""),
+		badgesBox:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+		actionBtn:       gtk.NewButton(),
+		spinner:         adw.NewSpinner(),
+		statusLabel:     gtk.NewLabel(""),
+		imageBox:        gtk.NewBox(gtk.OrientationHorizontal, 0),
+		diffBox:         gtk.NewBox(gtk.OrientationVertical, 0),
+		detailsExpander: gtk.NewExpander(""),
+		inputView:       inView,
+		outputScroll:    gtk.NewScrolledWindow(),
+		outputView:      outView,
+		inputBuf:        inView.Buffer(),
+		outputBuf:       outView.Buffer(),
+		toolID:          "call_sub_1",
+		toolName:        "subagent",
+	}
+	tab.main.assistantMap["msg_ast_1"] = &AssistantMessageWidget{
+		Box:      gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:      t.Context(),
+		partsBox: gtk.NewBox(gtk.OrientationVertical, 0),
+		tools: map[string]*ToolWidget{
+			"call_sub_1": twSub,
+		},
+	}
+
+	// 1. Subagent tool input started and called (blocking foreground subagent):
+	// "Background (Ctrl+B)" button should immediately become visible!
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.input.started",
+		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","name":"subagent"}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.called",
+		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","input":{"agent":"explore","description":"Find dissent package in repo","prompt":"search for dissent"}}`),
+	})
+	if !bgBtn.Visible() {
+		t.Fatalf("expected backgroundStatusBtn ('Background (Ctrl+B)') to be visible while foreground subagent tool is blocking")
+	}
+
+	// 2. OpenCode V2 emits flat session.created for the child session (with "sessionID" and "parentID"):
+	// Bottom bar should immediately show "1 subagent" and subagent sheet should list the running subagent.
+	win.handleEvent(opencode.Event{
+		Type: "session.created",
+		Data: json.RawMessage(`{"sessionID":"ses_child","parentID":"ses_root","title":"Find dissent package in repo","agent":"explore","location":{"directory":"/home/diamond/.nix"}}`),
+	})
+	if !subBox.Visible() || subLbl.Label() != "1 subagent" {
+		t.Fatalf("expected subagentStatusBox visible with label '1 subagent' after flat session.created, got visible=%v label=%q", subBox.Visible(), subLbl.Label())
+	}
+	if !subSection.Visible() || len(win.subagentRows) != 1 || win.subagentRows[0].session.ID != "ses_child" {
+		t.Fatalf("expected subagentsSectionBox visible with 1 row for ses_child, got visible=%v rows=%+v", subSection.Visible(), win.subagentRows)
+	}
+
+	// 3. Even if session.created was missed, session.tool.progress with metadata.sessionID registers the child subagent
+	// and wires the ToolWidget's "View Session ->" button!
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.progress",
+		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","text":"Find dissent package in repo","metadata":{"agent":"explore","sessionID":"ses_child"}}`),
+	})
+	if twSub.ChildSessionID() != "ses_child" || !twSub.actionBtn.Visible() {
+		t.Fatalf("expected ToolWidget ChildSessionID=ses_child and actionBtn visible after session.tool.progress, got childID=%q visible=%v", twSub.ChildSessionID(), twSub.actionBtn.Visible())
+	}
+
+	// 4. Suppose the user backgrounds the subagent: session.tool.success arrives with metadata.status="running".
+	// The blocking "Background (Ctrl+B)" button hides, while "1 subagent" stays visible in the bottom bar
+	// and the ToolWidget stays in background-running state!
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.success",
+		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","content":[{"type":"text","text":"Subagent moved to background"}],"metadata":{"agent":"explore","sessionID":"ses_child","status":"running"}}`),
+	})
+	if bgBtn.Visible() {
+		t.Fatalf("expected backgroundStatusBtn hidden once subagent tool moves to background")
+	}
+	if !subBox.Visible() || subLbl.Label() != "1 subagent" {
+		t.Fatalf("expected '1 subagent' to remain visible while background subagent is still running, got visible=%v label=%q", subBox.Visible(), subLbl.Label())
+	}
+	if !twSub.IsBackgroundRunning() {
+		t.Fatalf("expected ToolWidget IsBackgroundRunning()=true while subagent is running in background")
+	}
+
+	// 5. When the background subagent finishes and delivers a synthetic completion message to ses_root,
+	// "1 subagent" hides from the bottom bar and the ToolWidget transitions out of background-running state.
+	win.handleEvent(opencode.Event{
+		Type: "session.synthetic",
+		Data: json.RawMessage(`{"sessionID":"ses_root","metadata":{"source":"subagent","childID":"ses_child","state":"completed"}}`),
+	})
+	if subBox.Visible() {
+		t.Fatalf("expected subagentStatusBox hidden after subagent completes, got visible=true label=%q", subLbl.Label())
+	}
+	if twSub.IsBackgroundRunning() {
+		t.Fatalf("expected ToolWidget IsBackgroundRunning()=false after subagent completes")
 	}
 }

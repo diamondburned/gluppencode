@@ -276,6 +276,15 @@ sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
 	background-color: alpha(@error_color, 0.15);
 }
 
+.glup-tool-badge-bg {
+	font-family: inherit;
+	font-size: 0.76em;
+	font-weight: 600;
+	color: @accent_color;
+	background-color: alpha(@accent_bg_color, 0.15);
+	border: 1px solid alpha(@accent_color, 0.28);
+}
+
 .glup-tool-action-btn {
 	font-size: 0.8em;
 	padding: 1px 6px;
@@ -898,4 +907,73 @@ button.glup-status-background:hover {
 
 .glup-question-opt-desc {
 	font-size: 0.86em;
+}
+
+.glup-question-steps {
+	padding: 2px 0;
+}
+
+.glup-question-step-tab {
+	padding: 4px 10px;
+	min-height: 26px;
+	border-radius: 6px;
+	font-size: 0.84em;
+	font-weight: 600;
+	opacity: 0.68;
+	background-color: alpha(@theme_fg_color, 0.04);
+	border: 1px solid transparent;
+}
+
+.glup-question-step-tab:hover {
+	opacity: 0.92;
+	background-color: alpha(@theme_fg_color, 0.08);
+}
+
+.glup-question-step-tab-done {
+	opacity: 0.85;
+	border-color: alpha(@borders, 0.6);
+}
+
+.glup-question-step-tab-active {
+	opacity: 1.0;
+	color: @accent_color;
+	background-color: alpha(@accent_bg_color, 0.16);
+	border-color: alpha(@accent_color, 0.35);
+}
+
+.glup-question-custom-row {
+	padding: 4px 6px;
+}
+
+.glup-question-custom-check {
+	margin: 0;
+	padding: 0;
+	min-height: 0;
+	min-width: 0;
+}
+
+.glup-question-custom-check > check,
+.glup-question-custom-check > radio {
+	margin: 0;
+}
+
+.glup-question-custom-entry {
+	min-height: 28px;
+	padding: 2px 8px 2px 5px;
+	margin: 0;
+}
+
+.glup-question-custom-entry-standalone {
+	padding-left: 6px;
+}
+
+.glup-shell-output {
+	font-family: monospace;
+	font-size: 0.82em;
+	line-height: 1.32;
+	background-color: alpha(@theme_fg_color, 0.045);
+	border: 1px solid alpha(@borders, 0.45);
+	border-radius: 6px;
+	padding: 6px 8px;
+	margin-top: 4px;
 }

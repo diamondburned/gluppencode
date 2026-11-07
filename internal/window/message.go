@@ -234,10 +234,20 @@ type ToolWidget struct {
 	inputBuf  *gtk.TextBuffer
 	outputBuf *gtk.TextBuffer
 
-	toolID         string
-	toolName       string
-	childSessionID string
-	onOpenSubagent func(string)
+	badgeWidgets []*gtk.Label
+	imageWidgets []gtk.Widgetter
+	diffWidgets  []*gtk.Label
+
+	toolID          string
+	toolName        string
+	partStatus      string
+	metaStatus      string
+	isBackground    bool
+	hasBgBadge      bool
+	shellID         string
+	liveShellOutput string
+	childSessionID  string
+	onOpenSubagent  func(string)
 }
 
 // NewToolWidget creates a new ToolWidget for an inline tool invocation.
@@ -352,9 +362,11 @@ func setInitialToolIcon(icon *gtk.Image, name string) {
 }
 
 func (t *ToolWidget) clearBadges() {
-	for child := t.badgesBox.FirstChild(); child != nil; child = t.badgesBox.FirstChild() {
-		t.badgesBox.Remove(child)
+	for _, lbl := range t.badgeWidgets {
+		t.badgesBox.Remove(lbl)
 	}
+	t.badgeWidgets = nil
+	t.hasBgBadge = false
 }
 
 func (t *ToolWidget) addBadge(text, cssClass string) {
@@ -364,6 +376,15 @@ func (t *ToolWidget) addBadge(text, cssClass string) {
 		lbl.AddCSSClass(cssClass)
 	}
 	t.badgesBox.Append(lbl)
+	t.badgeWidgets = append(t.badgeWidgets, lbl)
+}
+
+func (t *ToolWidget) ensureBackgroundBadge() {
+	if t.hasBgBadge {
+		return
+	}
+	t.hasBgBadge = true
+	t.addBadge("Background", "glup-tool-badge-bg")
 }
 
 func setViewSessionButtonContent(btn *gtk.Button) {
@@ -386,7 +407,35 @@ func (t *ToolWidget) setChildSessionID(id string) {
 	t.actionBtn.SetVisible(true)
 }
 
-// SetMetadata updates tool metadata such as child subagent session IDs.
+// ShellID returns the background shell ID associated with this tool widget, if any.
+func (t *ToolWidget) ShellID() string {
+	return t.shellID
+}
+
+// ChildSessionID returns the child subagent session ID associated with this tool widget, if any.
+func (t *ToolWidget) ChildSessionID() string {
+	return t.childSessionID
+}
+
+// IsBackgroundRunning reports whether the tool call was moved to the background and its job is still running.
+func (t *ToolWidget) IsBackgroundRunning() bool {
+	return t.isBackground && t.metaStatus == "running"
+}
+
+// SetBackgroundStatus updates the background execution status (e.g. "completed" when a background job finishes).
+func (t *ToolWidget) SetBackgroundStatus(status string) {
+	t.metaStatus = status
+	t.syncStatus()
+}
+
+// SetShellLiveOutput sets the live 7-line monospace tail output buffer for a background shell tool.
+func (t *ToolWidget) SetShellLiveOutput(text string) {
+	t.liveShellOutput = text
+	t.outputBuf.SetText(text)
+	t.outputScroll.SetVisible(true)
+}
+
+// SetMetadata updates tool metadata such as child subagent session IDs or shell IDs.
 func (t *ToolWidget) SetMetadata(meta map[string]any) {
 	if meta == nil {
 		return
@@ -396,16 +445,40 @@ func (t *ToolWidget) SetMetadata(meta map[string]any) {
 	} else if id, ok := meta["childID"].(string); ok && id != "" {
 		t.setChildSessionID(id)
 	}
+	if shID, ok := meta["shellID"].(string); ok && shID != "" {
+		t.shellID = shID
+	}
+	if status, ok := meta["status"].(string); ok && status != "" {
+		t.metaStatus = status
+		if status == "running" && t.partStatus == "completed" {
+			t.isBackground = true
+			t.ensureBackgroundBadge()
+		}
+		t.syncStatus()
+	}
 }
 
 // SetStatus updates the visual execution status of the tool.
 func (t *ToolWidget) SetStatus(status string) {
-	t.statusLabel.SetLabel(status)
+	t.partStatus = status
+	if status == "completed" && t.metaStatus == "running" {
+		t.isBackground = true
+		t.ensureBackgroundBadge()
+	}
+	t.syncStatus()
+}
+
+func (t *ToolWidget) syncStatus() {
+	effective := t.partStatus
+	if effective == "completed" && t.metaStatus == "running" {
+		effective = "running"
+	}
+	t.statusLabel.SetLabel(effective)
 	t.statusLabel.RemoveCSSClass("glup-tool-status-running")
 	t.statusLabel.RemoveCSSClass("glup-tool-status-completed")
 	t.statusLabel.RemoveCSSClass("glup-tool-status-error")
 
-	switch status {
+	switch effective {
 	case "streaming", "running":
 		t.spinner.SetVisible(true)
 		t.statusLabel.SetVisible(true)
@@ -449,7 +522,13 @@ func (t *ToolWidget) SetInput(raw any) {
 	}
 
 	m := opencode.ParseToolInputMap(raw)
+	if bg, ok := m["background"].(bool); ok && bg {
+		t.isBackground = true
+	}
 	t.clearBadges()
+	if t.isBackground {
+		t.ensureBackgroundBadge()
+	}
 
 	switch strings.ToLower(t.toolName) {
 	case "subagent", "task":
@@ -607,21 +686,80 @@ func toInt(v any) int {
 }
 
 func extractSessionID(text string) string {
-	idx := strings.Index(text, "ses_")
+	return extractPrefixedID(text, "ses_")
+}
+
+func extractShellID(text string) string {
+	return extractPrefixedID(text, "sh_")
+}
+
+func extractPrefixedID(text, prefix string) string {
+	idx := strings.Index(text, prefix)
 	if idx == -1 {
 		return ""
 	}
-	end := idx + 4
+	end := idx + len(prefix)
 	for end < len(text) && ((text[end] >= 'a' && text[end] <= 'z') || (text[end] >= 'A' && text[end] <= 'Z') || (text[end] >= '0' && text[end] <= '9')) {
 		end++
+	}
+	if end == idx+len(prefix) {
+		return ""
 	}
 	return text[idx:end]
 }
 
-func (t *ToolWidget) renderInlineDiff(diffText string) {
-	for child := t.diffBox.FirstChild(); child != nil; child = t.diffBox.FirstChild() {
-		t.diffBox.Remove(child)
+var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
+
+// FormatShellTailLines strips ANSI escapes, normalizes carriage returns, and returns a fixed
+// maxLines-line string containing the last maxLines lines of output (padded with empty lines).
+func FormatShellTailLines(raw string, maxLines int) string {
+	if maxLines <= 0 {
+		maxLines = 7
 	}
+	cleaned := ansiEscapeRe.ReplaceAllString(raw, "")
+	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\n")
+
+	rawLines := strings.Split(cleaned, "\n")
+	var lines []string
+	for _, line := range rawLines {
+		if strings.Contains(line, "\r") {
+			parts := strings.Split(line, "\r")
+			last := ""
+			for i := len(parts) - 1; i >= 0; i-- {
+				if parts[i] != "" {
+					last = parts[i]
+					break
+				}
+			}
+			line = last
+		}
+		line = strings.ReplaceAll(line, "\t", "    ")
+		if r := []rune(line); len(r) > 140 {
+			line = string(r[:139]) + "…"
+		}
+		lines = append(lines, line)
+	}
+
+	for len(lines) > 0 && strings.TrimSpace(lines[len(lines)-1]) == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) == 0 {
+		lines = []string{"Waiting for output…"}
+	}
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	for len(lines) < maxLines {
+		lines = append(lines, "")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (t *ToolWidget) renderInlineDiff(diffText string) {
+	for _, lbl := range t.diffWidgets {
+		t.diffBox.Remove(lbl)
+	}
+	t.diffWidgets = nil
 	diffText = strings.TrimSpace(diffText)
 	if diffText == "" {
 		t.diffBox.SetVisible(false)
@@ -651,12 +789,14 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 			lbl.AddCSSClass("glup-diff-line-del")
 		}
 		t.diffBox.Append(lbl)
+		t.diffWidgets = append(t.diffWidgets, lbl)
 	}
 	if truncated > 0 {
 		more := gtk.NewLabel(fmt.Sprintf("… (%d more lines)", truncated))
 		more.SetXAlign(0)
 		more.AddCSSClass("glup-diff-line-hdr")
 		t.diffBox.Append(more)
+		t.diffWidgets = append(t.diffWidgets, more)
 	}
 	t.diffBox.SetVisible(true)
 }
@@ -762,9 +902,10 @@ func (t *ToolWidget) AppendInputDelta(delta string) {
 
 // SetOutput renders the tool's output content items, images, and errors.
 func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
-	for child := t.imageBox.FirstChild(); child != nil; child = t.imageBox.FirstChild() {
-		t.imageBox.Remove(child)
+	for _, img := range t.imageWidgets {
+		t.imageBox.Remove(img)
 	}
+	t.imageWidgets = nil
 
 	var hasImage bool
 	for _, item := range items {
@@ -777,6 +918,7 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 				}
 				thumb := newImageThumbnail(t.ctx, name, tex)
 				t.imageBox.Append(thumb)
+				t.imageWidgets = append(t.imageWidgets, thumb)
 				hasImage = true
 			}
 		}
@@ -785,12 +927,18 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 
 	var sb strings.Builder
 	for _, item := range items {
-		if item.Text != "" {
-			if sb.Len() > 0 {
-				sb.WriteByte('\n')
-			}
-			sb.WriteString(item.Text)
+		txt := strings.TrimSpace(item.Text)
+		if txt == "" {
+			continue
 		}
+		// Skip internal LLM instructions appended to backgrounded shell/subagent tool results.
+		if strings.HasPrefix(txt, "You will be notified automatically when the command finishes.") {
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(item.Text)
 	}
 	if errVal != nil {
 		if sb.Len() > 0 {
@@ -799,7 +947,10 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 		sb.WriteString(fmt.Sprintf("Error: %v", errVal))
 	}
 	out := strings.TrimSpace(sb.String())
-	if out != "" {
+	if t.liveShellOutput != "" && errVal == nil {
+		t.outputBuf.SetText(t.liveShellOutput)
+		t.outputScroll.SetVisible(true)
+	} else if out != "" {
 		t.outputBuf.SetText(out)
 		t.outputScroll.SetVisible(true)
 		if errVal != nil {
@@ -808,6 +959,11 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 		}
 	}
 
+	if t.shellID == "" && (t.toolName == "shell" || t.toolName == "bash") {
+		if shID := extractShellID(out); shID != "" {
+			t.shellID = shID
+		}
+	}
 	if t.childSessionID == "" && (t.toolName == "subagent" || t.toolName == "task") {
 		if id := extractSessionID(out); id != "" {
 			t.setChildSessionID(id)
@@ -956,7 +1112,7 @@ func (w *AssistantMessageWidget) FinalizeText(ordinal int, fullText string) {
 // EnsureTool returns an existing or newly created ToolWidget for the given tool ID.
 func (w *AssistantMessageWidget) EnsureTool(id, name string) *ToolWidget {
 	if tw, ok := w.tools[id]; ok {
-		if name != "" && tw.toolName == "" {
+		if name != "" && (tw.toolName == "" || tw.toolName == "tool") {
 			tw.toolName = name
 			tw.titleLabel.SetLabel(formatToolTitle(name))
 			setInitialToolIcon(tw.toolIcon, name)
@@ -1052,7 +1208,10 @@ func (cw *CompactionWidget) Update(msg opencode.Message) {
 	}
 }
 
-var shellCmdRe = regexp.MustCompile(`command=["']([^"']+)["']`)
+var (
+	shellCmdRe        = regexp.MustCompile(`command=["']([^"']+)["']`)
+	subagentSessionRe = regexp.MustCompile(`sessionID=["']([^"']+)["']`)
+)
 
 func stripSubagentTags(text string) string {
 	text = strings.TrimSpace(text)
@@ -1154,18 +1313,6 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 	headerRow.SetHExpand(true)
 	headerRow.Append(expander)
 
-	if !isShell && childID != "" && onOpenSubagent != nil {
-		btn := gtk.NewButton()
-		setViewSessionButtonContent(btn)
-		btn.SetVAlign(gtk.AlignCenter)
-		btn.AddCSSClass("flat")
-		btn.AddCSSClass("glup-tool-action-btn")
-		btn.ConnectClicked(func() {
-			onOpenSubagent(childID)
-		})
-		headerRow.Append(btn)
-	}
-
 	state := strings.ToLower(strings.TrimSpace(msg.Status))
 	if state == "" {
 		state = "completed"
@@ -1185,6 +1332,18 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 	}
 	headerRow.Append(statusLabel)
 
+	if !isShell && childID != "" && onOpenSubagent != nil {
+		btn := gtk.NewButton()
+		setViewSessionButtonContent(btn)
+		btn.SetVAlign(gtk.AlignCenter)
+		btn.AddCSSClass("flat")
+		btn.AddCSSClass("glup-tool-action-btn")
+		btn.ConnectClicked(func() {
+			onOpenSubagent(childID)
+		})
+		headerRow.Append(btn)
+	}
+
 	root.Append(headerRow)
 
 	body := stripSubagentTags(msg.Text)
@@ -1193,9 +1352,24 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 		bodyBox.AddCSSClass("glup-tool-body")
 		bodyBox.SetMarginTop(4)
 		bodyBox.SetVisible(false)
-		mv := mdstream.NewView(ctx)
-		mv.SetStatic(body)
-		bodyBox.Append(mv)
+		if isShell {
+			tv := gtk.NewTextView()
+			tv.SetEditable(false)
+			tv.SetCursorVisible(false)
+			tv.SetMonospace(true)
+			tv.SetWrapMode(gtk.WrapWordChar)
+			tv.Buffer().SetText(body)
+			scroll := gtk.NewScrolledWindow()
+			scroll.SetHExpand(true)
+			scroll.SetMaxContentHeight(200)
+			scroll.SetPropagateNaturalHeight(true)
+			scroll.SetChild(tv)
+			bodyBox.Append(scroll)
+		} else {
+			mv := mdstream.NewView(ctx)
+			mv.SetStatic(body)
+			bodyBox.Append(mv)
+		}
 		expander.NotifyProperty("expanded", func() {
 			bodyBox.SetVisible(expander.Expanded())
 		})
@@ -1543,18 +1717,24 @@ type questionFieldState struct {
 	customEntry *gtk.Entry
 }
 
-// QuestionFormWidget renders an interactive OpenCode V2 question / form card.
+// QuestionFormWidget renders an interactive OpenCode V2 question / form wizard card.
 type QuestionFormWidget struct {
 	*gtk.Box
-	FormID     string
-	fields     []questionFieldState
-	submitBtn  *gtk.Button
-	dismissBtn *gtk.Button
-	onSubmit   func(map[string]any)
-	onDismiss  func()
+	FormID      string
+	fields      []questionFieldState
+	stepBtns    []*gtk.Button
+	stack       *gtk.Stack
+	currentStep int
+	busy        bool
+	backBtn     *gtk.Button
+	nextBtn     *gtk.Button
+	submitBtn   *gtk.Button
+	dismissBtn  *gtk.Button
+	onSubmit    func(map[string]any)
+	onDismiss   func()
 }
 
-// NewQuestionFormWidget creates an interactive card for answering or dismissing a FormInfo.
+// NewQuestionFormWidget creates an interactive step-by-step wizard card for answering or dismissing a FormInfo.
 func NewQuestionFormWidget(
 	form opencode.FormInfo,
 	onSubmit func(map[string]any),
@@ -1591,36 +1771,56 @@ func NewQuestionFormWidget(
 		root.Append(descLbl)
 	}
 
+	stack := gtk.NewStack()
+	stack.SetTransitionType(gtk.StackTransitionTypeSlideLeftRight)
+	stack.SetTransitionDuration(140)
+	stack.SetHhomogeneous(true)
+	stack.SetVhomogeneous(false)
+
 	qw := &QuestionFormWidget{
 		Box:       root,
 		FormID:    form.ID,
+		stack:     stack,
 		onSubmit:  onSubmit,
 		onDismiss: onDismiss,
 	}
 
-	for _, f := range form.Fields {
+	if len(form.Fields) > 0 {
+		stepsBar := gtk.NewBox(gtk.OrientationHorizontal, 6)
+		stepsBar.AddCSSClass("glup-question-steps")
+		for i, f := range form.Fields {
+			stepIdx := i
+			tabTitle := strings.TrimSpace(f.Title)
+			if tabTitle == "" {
+				tabTitle = fmt.Sprintf("Step %d", i+1)
+			} else if len(form.Fields) > 1 {
+				tabTitle = fmt.Sprintf("%d. %s", i+1, tabTitle)
+			}
+			stepBtn := gtk.NewButtonWithLabel(tabTitle)
+			stepBtn.AddCSSClass("flat")
+			stepBtn.AddCSSClass("glup-question-step-tab")
+			stepBtn.ConnectClicked(func() {
+				qw.SetStep(stepIdx)
+			})
+			stepsBar.Append(stepBtn)
+			qw.stepBtns = append(qw.stepBtns, stepBtn)
+		}
+		root.Append(stepsBar)
+	}
+
+	for fieldIdx, f := range form.Fields {
+		stepIdx := fieldIdx
 		fieldBox := gtk.NewBox(gtk.OrientationVertical, 6)
 		fieldBox.AddCSSClass("glup-question-field")
 
-		fHdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
-		fHdr.SetVAlign(gtk.AlignCenter)
-		hasHeader := false
-
-		if hdrText := strings.TrimSpace(f.Title); hdrText != "" {
-			chip := gtk.NewLabel(hdrText)
-			chip.AddCSSClass("glup-question-header-chip")
-			chip.SetXAlign(0)
-			fHdr.Append(chip)
-			hasHeader = true
-		}
 		if f.Type == "multiselect" {
+			fHdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
+			fHdr.SetVAlign(gtk.AlignCenter)
 			multiLbl := gtk.NewLabel("Select all that apply")
 			multiLbl.AddCSSClass("dim-label")
 			multiLbl.AddCSSClass("caption")
+			multiLbl.SetXAlign(0)
 			fHdr.Append(multiLbl)
-			hasHeader = true
-		}
-		if hasHeader {
 			fieldBox.Append(fHdr)
 		}
 
@@ -1694,13 +1894,15 @@ func NewQuestionFormWidget(
 		}
 
 		if f.Custom || len(f.Options) == 0 {
-			customRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
+			customRow := gtk.NewBox(gtk.OrientationHorizontal, 0)
 			customRow.SetVAlign(gtk.AlignCenter)
 			customRow.AddCSSClass("glup-question-option-row")
+			customRow.AddCSSClass("glup-question-custom-row")
 
 			var customChk *gtk.CheckButton
 			if len(f.Options) > 0 {
 				customChk = gtk.NewCheckButton()
+				customChk.AddCSSClass("glup-question-custom-check")
 				if !isMulti && groupLeader != nil {
 					customChk.SetGroup(groupLeader)
 				}
@@ -1709,6 +1911,10 @@ func NewQuestionFormWidget(
 
 			entry := gtk.NewEntry()
 			entry.SetHExpand(true)
+			entry.AddCSSClass("glup-question-custom-entry")
+			if customChk == nil {
+				entry.AddCSSClass("glup-question-custom-entry-standalone")
+			}
 			entry.SetPlaceholderText("Type a custom answer…")
 			entry.ConnectChanged(func() {
 				if customChk != nil && strings.TrimSpace(entry.Text()) != "" && !customChk.Active() {
@@ -1717,7 +1923,11 @@ func NewQuestionFormWidget(
 				qw.syncValidState()
 			})
 			entry.ConnectActivate(func() {
-				qw.Submit()
+				if stepIdx < len(qw.fields)-1 {
+					qw.NextStep()
+				} else {
+					qw.Submit()
+				}
 			})
 			if customChk != nil {
 				customChk.ConnectToggled(func() {
@@ -1736,18 +1946,37 @@ func NewQuestionFormWidget(
 		}
 
 		fieldBox.Append(optsBox)
-		root.Append(fieldBox)
+		stack.AddNamed(fieldBox, fmt.Sprintf("step_%d", stepIdx))
 		qw.fields = append(qw.fields, fs)
 	}
 
+	root.Append(stack)
+
 	actionsRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
-	actionsRow.SetHAlign(gtk.AlignEnd)
+	actionsRow.SetHExpand(true)
 
 	dismissBtn := gtk.NewButtonWithLabel("Dismiss")
 	dismissBtn.ConnectClicked(func() {
 		qw.Dismiss()
 	})
 	actionsRow.Append(dismissBtn)
+
+	spacer := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	spacer.SetHExpand(true)
+	actionsRow.Append(spacer)
+
+	backBtn := gtk.NewButtonWithLabel("Back")
+	backBtn.ConnectClicked(func() {
+		qw.PrevStep()
+	})
+	actionsRow.Append(backBtn)
+
+	nextBtn := gtk.NewButtonWithLabel("Next")
+	nextBtn.AddCSSClass("suggested-action")
+	nextBtn.ConnectClicked(func() {
+		qw.NextStep()
+	})
+	actionsRow.Append(nextBtn)
 
 	submitBtn := gtk.NewButtonWithLabel("Submit")
 	submitBtn.AddCSSClass("suggested-action")
@@ -1758,15 +1987,67 @@ func NewQuestionFormWidget(
 
 	root.Append(actionsRow)
 
+	qw.backBtn = backBtn
+	qw.nextBtn = nextBtn
 	qw.submitBtn = submitBtn
 	qw.dismissBtn = dismissBtn
-	qw.syncValidState()
+	qw.SetStep(0)
 	return qw
+}
+
+// CurrentStep returns the 0-based index of the currently visible question step.
+func (qw *QuestionFormWidget) CurrentStep() int {
+	return qw.currentStep
+}
+
+// StepCount returns the number of question steps in the form.
+func (qw *QuestionFormWidget) StepCount() int {
+	return len(qw.fields)
+}
+
+// SetStep switches the wizard view to the given 0-based step index.
+func (qw *QuestionFormWidget) SetStep(idx int) {
+	if len(qw.fields) == 0 {
+		qw.syncValidState()
+		return
+	}
+	if idx < 0 {
+		idx = 0
+	}
+	if idx >= len(qw.fields) {
+		idx = len(qw.fields) - 1
+	}
+	qw.currentStep = idx
+	if qw.stack != nil {
+		qw.stack.SetVisibleChildName(fmt.Sprintf("step_%d", idx))
+	}
+	qw.syncValidState()
+}
+
+// NextStep advances to the next question step if available.
+func (qw *QuestionFormWidget) NextStep() bool {
+	if qw.currentStep >= len(qw.fields)-1 {
+		return false
+	}
+	if _, ok := qw.collectFieldAnswer(qw.fields[qw.currentStep]); !ok {
+		return false
+	}
+	qw.SetStep(qw.currentStep + 1)
+	return true
+}
+
+// PrevStep moves back to the previous question step if available.
+func (qw *QuestionFormWidget) PrevStep() bool {
+	if qw.currentStep <= 0 {
+		return false
+	}
+	qw.SetStep(qw.currentStep - 1)
+	return true
 }
 
 // Submit validates and submits the current answers if valid.
 func (qw *QuestionFormWidget) Submit() bool {
-	if qw.submitBtn != nil && !qw.submitBtn.Sensitive() {
+	if qw.busy || (qw.submitBtn != nil && !qw.submitBtn.Sensitive()) {
 		return false
 	}
 	ans, ok := qw.CollectAnswers()
@@ -1782,7 +2063,7 @@ func (qw *QuestionFormWidget) Submit() bool {
 
 // Dismiss cancels/dismisses the form.
 func (qw *QuestionFormWidget) Dismiss() {
-	if qw.dismissBtn != nil && !qw.dismissBtn.Sensitive() {
+	if qw.busy || (qw.dismissBtn != nil && !qw.dismissBtn.Sensitive()) {
 		return
 	}
 	qw.SetBusy(true)
@@ -1793,10 +2074,20 @@ func (qw *QuestionFormWidget) Dismiss() {
 
 // SetBusy enables or disables the form buttons while a request is in flight.
 func (qw *QuestionFormWidget) SetBusy(busy bool) {
+	qw.busy = busy
 	if qw.dismissBtn != nil {
 		qw.dismissBtn.SetSensitive(!busy)
 	}
+	for _, b := range qw.stepBtns {
+		b.SetSensitive(!busy)
+	}
 	if busy {
+		if qw.backBtn != nil {
+			qw.backBtn.SetSensitive(false)
+		}
+		if qw.nextBtn != nil {
+			qw.nextBtn.SetSensitive(false)
+		}
 		if qw.submitBtn != nil {
 			qw.submitBtn.SetSensitive(false)
 		}
@@ -1806,56 +2097,92 @@ func (qw *QuestionFormWidget) SetBusy(busy bool) {
 }
 
 func (qw *QuestionFormWidget) syncValidState() {
-	if qw.submitBtn == nil {
-		return
+	multiStep := len(qw.fields) > 1
+	isLast := len(qw.fields) <= 1 || qw.currentStep >= len(qw.fields)-1
+
+	for i, btn := range qw.stepBtns {
+		if i == qw.currentStep {
+			btn.AddCSSClass("glup-question-step-tab-active")
+		} else {
+			btn.RemoveCSSClass("glup-question-step-tab-active")
+		}
+		if _, ok := qw.collectFieldAnswer(qw.fields[i]); ok {
+			btn.AddCSSClass("glup-question-step-tab-done")
+		} else {
+			btn.RemoveCSSClass("glup-question-step-tab-done")
+		}
 	}
-	_, ok := qw.CollectAnswers()
-	qw.submitBtn.SetSensitive(ok)
+
+	if qw.backBtn != nil {
+		qw.backBtn.SetVisible(multiStep)
+		qw.backBtn.SetSensitive(!qw.busy && qw.currentStep > 0)
+	}
+	if qw.nextBtn != nil {
+		qw.nextBtn.SetVisible(multiStep && !isLast)
+		curValid := true
+		if qw.currentStep >= 0 && qw.currentStep < len(qw.fields) {
+			_, curValid = qw.collectFieldAnswer(qw.fields[qw.currentStep])
+		}
+		qw.nextBtn.SetSensitive(!qw.busy && curValid)
+	}
+	if qw.submitBtn != nil {
+		qw.submitBtn.SetVisible(isLast)
+		_, allValid := qw.CollectAnswers()
+		qw.submitBtn.SetSensitive(!qw.busy && allValid)
+	}
+}
+
+func (qw *QuestionFormWidget) collectFieldAnswer(fs questionFieldState) (any, bool) {
+	isMulti := fs.field.Type == "multiselect"
+	if isMulti {
+		var vals []string
+		for _, opt := range fs.options {
+			if opt.btn != nil && opt.btn.Active() {
+				vals = append(vals, opt.value)
+			}
+		}
+		if fs.customEntry != nil {
+			customText := strings.TrimSpace(fs.customEntry.Text())
+			if customText != "" && (fs.customCheck == nil || fs.customCheck.Active()) {
+				vals = append(vals, customText)
+			}
+		}
+		if len(vals) == 0 && !fs.field.Optional {
+			return nil, false
+		}
+		return vals, true
+	}
+
+	var val string
+	if fs.customCheck != nil && fs.customCheck.Active() {
+		if fs.customEntry != nil {
+			val = strings.TrimSpace(fs.customEntry.Text())
+		}
+	} else if fs.customCheck == nil && fs.customEntry != nil && len(fs.options) == 0 {
+		val = strings.TrimSpace(fs.customEntry.Text())
+	} else {
+		for _, opt := range fs.options {
+			if opt.btn != nil && opt.btn.Active() {
+				val = opt.value
+				break
+			}
+		}
+	}
+	if val == "" && !fs.field.Optional {
+		return nil, false
+	}
+	return val, true
 }
 
 // CollectAnswers extracts the current field values and reports whether all required fields have answers.
 func (qw *QuestionFormWidget) CollectAnswers() (map[string]any, bool) {
 	out := make(map[string]any, len(qw.fields))
 	for _, fs := range qw.fields {
-		isMulti := fs.field.Type == "multiselect"
-		if isMulti {
-			var vals []string
-			for _, opt := range fs.options {
-				if opt.btn != nil && opt.btn.Active() {
-					vals = append(vals, opt.value)
-				}
-			}
-			if fs.customEntry != nil {
-				customText := strings.TrimSpace(fs.customEntry.Text())
-				if customText != "" && (fs.customCheck == nil || fs.customCheck.Active()) {
-					vals = append(vals, customText)
-				}
-			}
-			if len(vals) == 0 && !fs.field.Optional {
-				return nil, false
-			}
-			out[fs.field.Key] = vals
-		} else {
-			var val string
-			if fs.customCheck != nil && fs.customCheck.Active() {
-				if fs.customEntry != nil {
-					val = strings.TrimSpace(fs.customEntry.Text())
-				}
-			} else if fs.customCheck == nil && fs.customEntry != nil && len(fs.options) == 0 {
-				val = strings.TrimSpace(fs.customEntry.Text())
-			} else {
-				for _, opt := range fs.options {
-					if opt.btn != nil && opt.btn.Active() {
-						val = opt.value
-						break
-					}
-				}
-			}
-			if val == "" && !fs.field.Optional {
-				return nil, false
-			}
-			out[fs.field.Key] = val
+		ans, ok := qw.collectFieldAnswer(fs)
+		if !ok {
+			return nil, false
 		}
+		out[fs.field.Key] = ans
 	}
 	return out, true
 }
