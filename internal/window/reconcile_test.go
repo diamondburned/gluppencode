@@ -3,17 +3,22 @@ package window
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 	"unicode/utf16"
 	"unsafe"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"libdb.so/gluppencode/internal/opencode"
 )
@@ -895,15 +900,16 @@ func TestIsBlockingBackgroundableTool(t *testing.T) {
 }
 
 func TestBlockingSessionID(t *testing.T) {
+	now := time.Now()
 	mainConv := &convTimeline{
 		session:       opencode.Session{ID: "ses_main"},
 		active:        true,
-		blockingTools: map[string]bool{"tool_1": true},
+		blockingTools: map[string]time.Time{"tool_1": now.Add(-2 * time.Second)},
 	}
 	subConv := &convTimeline{
 		session:       opencode.Session{ID: "ses_sub"},
 		active:        true,
-		blockingTools: map[string]bool{},
+		blockingTools: map[string]time.Time{},
 	}
 	tab := &sessionTab{
 		main:         mainConv,
@@ -913,6 +919,12 @@ func TestBlockingSessionID(t *testing.T) {
 	if got := tab.blockingSessionID(); got != "ses_main" {
 		t.Fatalf("blockingSessionID() = %q, want ses_main", got)
 	}
+	if tab.shouldShowBackgroundHint(now) {
+		t.Fatalf("shouldShowBackgroundHint() = true after 2s, want false (< 5s)")
+	}
+	if !tab.shouldShowBackgroundHint(now.Add(4 * time.Second)) {
+		t.Fatalf("shouldShowBackgroundHint() = false after 6s, want true (>= 5s)")
+	}
 
 	// Viewing subagent while main is blocking still resolves ses_main.
 	tab.activeSubID = "ses_sub"
@@ -921,7 +933,7 @@ func TestBlockingSessionID(t *testing.T) {
 	}
 
 	// If subagent itself is blocking on a backgroundable tool, activeConv takes precedence.
-	subConv.blockingTools["tool_sub"] = true
+	subConv.blockingTools["tool_sub"] = now
 	if got := tab.blockingSessionID(); got != "ses_sub" {
 		t.Fatalf("blockingSessionID() with blocking subagent = %q, want ses_sub", got)
 	}
@@ -1081,7 +1093,7 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		main: &convTimeline{
 			session:            opencode.Session{ID: "ses_fg", Title: "Foreground"},
 			formWidgets:        make(map[string]*QuestionFormWidget),
-			blockingTools:      make(map[string]bool),
+			blockingTools:      make(map[string]time.Time),
 			blockingShellTools: make(map[string]bool),
 			blockingShellIDs:   make(map[string]string),
 			backgroundShellIDs: make(map[string]bool),
@@ -1093,7 +1105,7 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		main: &convTimeline{
 			session:            opencode.Session{ID: "ses_bg", Title: "Background"},
 			formWidgets:        make(map[string]*QuestionFormWidget),
-			blockingTools:      make(map[string]bool),
+			blockingTools:      make(map[string]time.Time),
 			blockingShellTools: make(map[string]bool),
 			blockingShellIDs:   make(map[string]string),
 			backgroundShellIDs: make(map[string]bool),
@@ -1229,8 +1241,46 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	}
 	if w := win.buildMessageWidget(tab, tab.main, subagentMsg); w == nil {
 		t.Fatal("expected SyntheticSubagentWidget for subagentMsg")
-	} else if _, ok := w.(*SyntheticSubagentWidget); !ok {
+	} else if sw, ok := w.(*SyntheticSubagentWidget); !ok {
 		t.Fatalf("expected *SyntheticSubagentWidget for subagentMsg, got %T", w)
+	} else if sw.expander != nil {
+		t.Fatalf("expected SyntheticSubagentWidget for non-shell subagent finish to omit GtkExpander")
+	}
+
+	readTw := &ToolWidget{
+		Box:             gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:             t.Context(),
+		headerRow:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+		summaryRow:      gtk.NewBox(gtk.OrientationHorizontal, 0),
+		detailsBox:      gtk.NewBox(gtk.OrientationVertical, 0),
+		toolIcon:        gtk.NewImage(),
+		titleLabel:      gtk.NewLabel(""),
+		subtitleLabel:   gtk.NewLabel(""),
+		badgesBox:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+		actionBtn:       gtk.NewButton(),
+		spinner:         adw.NewSpinner(),
+		statusLabel:     gtk.NewLabel(""),
+		imageBox:        gtk.NewBox(gtk.OrientationHorizontal, 0),
+		diffBox:         gtk.NewBox(gtk.OrientationVertical, 0),
+		detailsExpander: gtk.NewExpander(""),
+		inputView:       gtk.NewTextView(),
+		outputScroll:    gtk.NewScrolledWindow(),
+		outputView:      gtk.NewTextView(),
+		toolID:          "call_read_1",
+		toolName:        "read",
+	}
+	readTw.inputBuf = readTw.inputView.Buffer()
+	readTw.outputBuf = readTw.outputView.Buffer()
+	readTw.headerRow.Append(readTw.detailsExpander)
+	readTw.Append(readTw.headerRow)
+	readTw.Append(readTw.detailsBox)
+	readTw.applyToolKind()
+	if readTw.detailsExpander != nil {
+		t.Fatalf("expected read ToolWidget to strip detailsExpander")
+	}
+	readTw.SetOutput([]opencode.ToolContentItem{{Type: "text", Text: "1: secret file contents"}}, nil)
+	if txt := readTw.outputBuf.Text(readTw.outputBuf.StartIter(), readTw.outputBuf.EndIter(), false); txt != "" {
+		t.Fatalf("expected read ToolWidget not to store file output, got %q", txt)
 	}
 }
 
@@ -1458,7 +1508,7 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 	}
 
 	// 1. Subagent tool input started and called (blocking foreground subagent):
-	// "Background (Ctrl+B)" button should immediately become visible!
+	// "Background (Ctrl+B)" button should stay hidden for the first 5 seconds, then become visible once > 5s has elapsed.
 	win.handleEvent(opencode.Event{
 		Type: "session.tool.input.started",
 		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","name":"subagent"}`),
@@ -1467,8 +1517,13 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 		Type: "session.tool.called",
 		Data: json.RawMessage(`{"sessionID":"ses_root","assistantMessageID":"msg_ast_1","id":"call_sub_1","input":{"agent":"explore","description":"Find dissent package in repo","prompt":"search for dissent"}}`),
 	})
+	if bgBtn.Visible() {
+		t.Fatalf("expected backgroundStatusBtn ('Background (Ctrl+B)') to stay hidden before 5 seconds have elapsed")
+	}
+	tab.main.blockingTools["call_sub_1"] = time.Now().Add(-6 * time.Second)
+	win.updateBottomBar(tab)
 	if !bgBtn.Visible() {
-		t.Fatalf("expected backgroundStatusBtn ('Background (Ctrl+B)') to be visible while foreground subagent tool is blocking")
+		t.Fatalf("expected backgroundStatusBtn ('Background (Ctrl+B)') to be visible once foreground subagent tool has been blocking for > 5s")
 	}
 
 	// 2. OpenCode V2 emits flat session.created for the child session (with "sessionID" and "parentID"):
@@ -1522,5 +1577,223 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 	}
 	if twSub.IsBackgroundRunning() {
 		t.Fatalf("expected ToolWidget IsBackgroundRunning()=false after subagent completes")
+	}
+
+	// 6. Clicking the window title opens the rename popover and submitting updates the session title,
+	// tab page title, and windowTitle widget.
+	win.windowTitleBtn = gtk.NewMenuButton()
+	win.windowTitle = adw.NewWindowTitle("Dissent v0.0.41 update", "~/.nix")
+	win.renameSessionPopover = gtk.NewPopover()
+	win.renameSessionEntry = gtk.NewEntry()
+	win.renameSessionEntry.SetText("  Updated Dissent Session Title  ")
+	win.submitRenameSession()
+
+	if tab.main.session.Title != "Updated Dissent Session Title" {
+		t.Errorf("tab.main.session.Title = %q, want Updated Dissent Session Title", tab.main.session.Title)
+	}
+	if tab.page.Title() != "Updated Dissent Session Title" {
+		t.Errorf("tab.page.Title() = %q, want Updated Dissent Session Title", tab.page.Title())
+	}
+	if win.windowTitle.Title() != "Updated Dissent Session Title" {
+		t.Errorf("win.windowTitle.Title() = %q, want Updated Dissent Session Title", win.windowTitle.Title())
+	}
+
+	// 7. Conversations dynamically sort by most recent activity within each project.
+	win.collapsedProjects = make(map[string]bool)
+	win.expandedProjects = make(map[string]bool)
+	win.projectSessions = make(map[string][]opencode.Session)
+	nowMs := time.Now().UnixMilli()
+	tab.main.session.Time.Updated = nowMs - 9*60*1000
+	win.tabOrder = []string{"ses_root"}
+	win.ensureSessionTab(opencode.Session{
+		ID:       "ses_older_13m",
+		Title:    "Testing opencode question tool",
+		Location: opencode.Location{Directory: "/home/diamond/.nix"},
+		Time:     opencode.SessionTime{Updated: nowMs - 13*60*1000},
+	})
+	win.ensureSessionTab(opencode.Session{
+		ID:       "ses_older_20m",
+		Title:    "GNOME Wayland technical discussion",
+		Location: opencode.Location{Directory: "/home/diamond/.nix"},
+		Time:     opencode.SessionTime{Updated: nowMs - 20*60*1000},
+	})
+	if !slices.Equal(win.tabOrder, []string{"ses_root", "ses_older_13m", "ses_older_20m"}) {
+		t.Fatalf("initial tabOrder = %v, want [ses_root ses_older_13m ses_older_20m]", win.tabOrder)
+	}
+	// New activity arrives on ses_older_20m -> it should immediately move to the top of tabOrder.
+	win.handleEvent(opencode.Event{
+		Type: "session.inbox.enqueued",
+		Data: json.RawMessage(`{"sessionID":"ses_older_20m","inboxID":"in_1","delivery":"queue"}`),
+	})
+	if !slices.Equal(win.tabOrder, []string{"ses_older_20m", "ses_root", "ses_older_13m"}) {
+		t.Fatalf("tabOrder after activity on ses_older_20m = %v, want [ses_older_20m ses_root ses_older_13m]", win.tabOrder)
+	}
+
+	// 8. Hiding (clearing) a project removes all of its conversations from the sidebar without deleting them,
+	// and creating a new session in that project brings the project back with just that new session alone.
+	win.statePath = t.TempDir() + "/gluppencode.json"
+	win.archivedSessions = make(map[string]bool)
+	win.headerTitleStack = gtk.NewStack()
+	win.clearProjectSessions("/home/diamond/.nix")
+	if len(win.tabOrder) != 0 || len(win.tabs) != 0 {
+		t.Fatalf("expected all project tabs cleared from sidebar, got tabOrder=%v len(tabs)=%d", win.tabOrder, len(win.tabs))
+	}
+	if !win.archivedSessions["ses_root"] || !win.archivedSessions["ses_older_13m"] || !win.archivedSessions["ses_older_20m"] {
+		t.Fatalf("expected all project sessions marked archived, got %+v", win.archivedSessions)
+	}
+	newSess := opencode.Session{
+		ID:       "ses_new_after_clear",
+		Title:    "Fresh session after clear",
+		Location: opencode.Location{Directory: "/home/diamond/.nix"},
+		Time:     opencode.SessionTime{Updated: nowMs},
+	}
+	win.ensureSessionTab(newSess)
+	if !slices.Equal(win.tabOrder, []string{"ses_new_after_clear"}) {
+		t.Fatalf("expected only new session in sidebar after clear, got tabOrder=%v", win.tabOrder)
+	}
+	if !win.archivedSessions["ses_root"] {
+		t.Fatalf("expected old sessions to remain hidden until explicitly selected from search")
+	}
+}
+
+func TestTakeChargeAutoReply(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK cannot be initialized")
+	}
+
+	var (
+		mu      sync.Mutex
+		replied = make(map[string]map[string]any)
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/form") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":[]}`))
+			return
+		}
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/reply") {
+			var body struct {
+				Answer map[string]any `json:"answer"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			formID := parts[len(parts)-2]
+			mu.Lock()
+			replied[formID] = body.Answer
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:                t.Context(),
+		client:             &opencode.Client{BaseURL: srv.URL},
+		viewStack:          vs,
+		takeChargeBtn:      gtk.NewToggleButton(),
+		tabs:               make(map[string]*sessionTab),
+		childToRoot:        make(map[string]string),
+		takeChargeInFlight: make(map[string]bool),
+	}
+
+	fgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_fg", "Foreground")
+	bgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_bg", "Background")
+	win.tabs["ses_fg"] = &sessionTab{
+		page: fgPage,
+		main: &convTimeline{
+			session:     opencode.Session{ID: "ses_fg", Title: "Foreground"},
+			formWidgets: make(map[string]*QuestionFormWidget),
+		},
+		subTimelines: make(map[string]*convTimeline),
+	}
+	bgTab := &sessionTab{
+		page: bgPage,
+		main: &convTimeline{
+			session:     opencode.Session{ID: "ses_bg", Title: "Background"},
+			loaded:      true,
+			formWidgets: make(map[string]*QuestionFormWidget),
+		},
+		subTimelines: make(map[string]*convTimeline),
+	}
+	win.tabs["ses_bg"] = bgTab
+	vs.SetVisibleChildName("ses_fg")
+
+	// 1. A pending form arrives while Take Charge is OFF -> waits for user.
+	win.handleEvent(opencode.Event{
+		Type: "form.created",
+		Data: json.RawMessage(`{"form":{"id":"frm_existing","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"DB","description":"Which database?","type":"string","custom":true,"options":[{"value":"Postgres (Recommended)","label":"Postgres (Recommended)"}]},{"key":"q1","title":"Features","description":"Which features?","type":"multiselect","custom":true,"options":[{"value":"FTS","label":"FTS"}]}]}}`),
+	})
+	if len(bgTab.main.pendingForms) != 1 || bgTab.main.formWidgets["frm_existing"] == nil {
+		t.Fatalf("expected frm_existing to be pending before Take Charge is enabled, got %+v", bgTab.main.pendingForms)
+	}
+
+	// 2. User toggles Take Charge ON -> existing pending form is automatically answered and removed.
+	win.takeChargeBtn.SetActive(true)
+	win.setTakeCharge(true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		_, ok := replied["frm_existing"]
+		mu.Unlock()
+		if ok && len(bgTab.main.pendingForms) == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	ans1, ok1 := replied["frm_existing"]
+	mu.Unlock()
+	if !ok1 {
+		t.Fatalf("expected frm_existing to be auto-replied when Take Charge was enabled")
+	}
+	if got, _ := ans1["q0"].(string); got != TakeChargeDirective {
+		t.Errorf("frm_existing q0 answer = %q, want %q", got, TakeChargeDirective)
+	}
+	if gotSlice, ok := ans1["q1"].([]any); !ok || len(gotSlice) != 1 || gotSlice[0] != TakeChargeDirective {
+		t.Errorf("frm_existing q1 answer = %#v, want [%q]", ans1["q1"], TakeChargeDirective)
+	}
+	if len(bgTab.main.pendingForms) != 0 || bgTab.main.formWidgets["frm_existing"] != nil {
+		t.Errorf("expected frm_existing removed from pendingForms and formWidgets, got %+v", bgTab.main.pendingForms)
+	}
+
+	// 3. While Take Charge is ON, a new form.created arrives -> immediately auto-answered without setting NeedsAttention.
+	bgTab.page.SetNeedsAttention(false)
+	win.handleEvent(opencode.Event{
+		Type: "form.created",
+		Data: json.RawMessage(`{"form":{"id":"frm_incoming","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"Deploy","description":"Deploy now?","type":"string","custom":true}]}}`),
+	})
+	if bgTab.page.NeedsAttention() {
+		t.Errorf("expected form.created while Take Charge is active NOT to set NeedsAttention")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		_, ok := replied["frm_incoming"]
+		mu.Unlock()
+		if ok {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	ans2, ok2 := replied["frm_incoming"]
+	mu.Unlock()
+	if !ok2 {
+		t.Fatalf("expected frm_incoming to be auto-replied while Take Charge is active")
+	}
+	if got, _ := ans2["q0"].(string); got != TakeChargeDirective {
+		t.Errorf("frm_incoming q0 answer = %q, want %q", got, TakeChargeDirective)
 	}
 }

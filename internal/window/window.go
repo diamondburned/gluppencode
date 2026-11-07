@@ -26,8 +26,8 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotkit/app"
-	"github.com/diamondburned/gotkit/components/autoscroll"
 	"github.com/diamondburned/gotkit/gtkutil"
+	"libdb.so/gluppencode/internal/autoscroll"
 	"libdb.so/gluppencode/internal/opencode"
 )
 
@@ -64,7 +64,7 @@ type convTimeline struct {
 	loaded             bool
 	active             bool
 	runningTools       int
-	blockingTools      map[string]bool
+	blockingTools      map[string]time.Time
 	blockingShellTools map[string]bool
 	blockingShellIDs   map[string]string
 	backgroundShellIDs map[string]bool
@@ -105,8 +105,44 @@ func isBlockingBackgroundableTool(name, status string, input any) bool {
 	return true
 }
 
+const backgroundHintDelay = 5 * time.Second
+
 func (c *convTimeline) isBlockingOnBackgroundable() bool {
 	return c != nil && c.active && len(c.blockingTools) > 0
+}
+
+func (c *convTimeline) isBlockingForAtLeast(now time.Time, minAge time.Duration) bool {
+	if !c.isBlockingOnBackgroundable() {
+		return false
+	}
+	for _, startedAt := range c.blockingTools {
+		if !startedAt.IsZero() && now.Sub(startedAt) >= minAge {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *convTimeline) nextBackgroundHintDelay(now time.Time, minAge time.Duration) (time.Duration, bool) {
+	if !c.isBlockingOnBackgroundable() {
+		return 0, false
+	}
+	var shortest time.Duration
+	var found bool
+	for _, startedAt := range c.blockingTools {
+		if startedAt.IsZero() {
+			continue
+		}
+		rem := minAge - now.Sub(startedAt)
+		if rem <= 0 {
+			return 0, false
+		}
+		if !found || rem < shortest {
+			shortest = rem
+			found = true
+		}
+	}
+	return shortest, found
 }
 
 func (c *convTimeline) syncToolPart(part opencode.ContentPart) {
@@ -124,7 +160,9 @@ func (c *convTimeline) syncToolPart(part opencode.ContentPart) {
 	metaStatus, _ := part.State.Metadata["status"].(string)
 
 	if isBlockingBackgroundableTool(name, part.State.Status, part.State.Input) {
-		c.blockingTools[part.ID] = true
+		if c.blockingTools[part.ID].IsZero() {
+			c.blockingTools[part.ID] = time.Now()
+		}
 		if isShellToolName(name) {
 			c.blockingShellTools[part.ID] = true
 			if shID != "" && !c.backgroundShellIDs[shID] {
@@ -275,6 +313,33 @@ func (t *sessionTab) blockingSessionID() string {
 	return ""
 }
 
+func (t *sessionTab) shouldShowBackgroundHint(now time.Time) bool {
+	if t == nil {
+		return false
+	}
+	if conv := t.activeConv(); conv.isBlockingForAtLeast(now, backgroundHintDelay) {
+		return true
+	}
+	return t.main.isBlockingForAtLeast(now, backgroundHintDelay)
+}
+
+func (t *sessionTab) nextBackgroundHintDelay(now time.Time) (time.Duration, bool) {
+	if t == nil {
+		return 0, false
+	}
+	var shortest time.Duration
+	var found bool
+	for _, conv := range []*convTimeline{t.activeConv(), t.main} {
+		if d, ok := conv.nextBackgroundHintDelay(now, backgroundHintDelay); ok {
+			if !found || d < shortest {
+				shortest = d
+				found = true
+			}
+		}
+	}
+	return shortest, found
+}
+
 type agentRowData struct {
 	row     *gtk.ListBoxRow
 	agentID string
@@ -299,29 +364,36 @@ type Window struct {
 	cancel context.CancelFunc
 	client *opencode.Client
 
-	rootContent                *adw.OverlaySplitView
-	hideSidebarBtn             *gtk.Button
-	newSessionSidebarBtn       *gtk.MenuButton
-	newSessionSidebarPopover   *gtk.Popover
-	newSessionSidebarListBox   *gtk.ListBox
-	newSessionSidebarFolderBtn *gtk.Button
-	searchSessionsBtn          *gtk.Button
-	viewSwitcherSidebar        *adw.ViewSwitcherSidebar
+	rootContent                  *adw.OverlaySplitView
+	hideSidebarBtn               *gtk.Button
+	newSessionSidebarBtn         *gtk.MenuButton
+	newSessionSidebarPopover     *gtk.Popover
+	newSessionSidebarSearchEntry *gtk.SearchEntry
+	newSessionSidebarListBox     *gtk.ListBox
+	newSessionSidebarFolderBtn   *gtk.Button
+	searchSessionsBtn            *gtk.Button
+	viewSwitcherSidebar          *adw.ViewSwitcherSidebar
 
-	bottomSheet            *adw.BottomSheet
-	showSidebarBtn         *gtk.Button
-	newSessionTopBtn       *gtk.MenuButton
-	newSessionTopPopover   *gtk.Popover
-	newSessionTopListBox   *gtk.ListBox
-	newSessionTopFolderBtn *gtk.Button
-	headerTitleStack       *gtk.Stack
-	windowTitle            *adw.WindowTitle
-	breadcrumbParentBtn    *gtk.Button
-	breadcrumbParentLabel  *gtk.Label
-	breadcrumbChildLabel   *gtk.Label
-	newWindowBtn           *gtk.Button
-	refreshBtn             *gtk.Button
-	viewStack              *adw.ViewStack
+	bottomSheet              *adw.BottomSheet
+	showSidebarBtn           *gtk.Button
+	newSessionTopBtn         *gtk.MenuButton
+	newSessionTopPopover     *gtk.Popover
+	newSessionTopSearchEntry *gtk.SearchEntry
+	newSessionTopListBox     *gtk.ListBox
+	newSessionTopFolderBtn   *gtk.Button
+	headerTitleStack         *gtk.Stack
+	windowTitleBtn           *gtk.MenuButton
+	windowTitle              *adw.WindowTitle
+	renameSessionPopover     *gtk.Popover
+	renameSessionEntry       *gtk.Entry
+	renameSessionSaveBtn     *gtk.Button
+	breadcrumbParentBtn      *gtk.Button
+	breadcrumbParentLabel    *gtk.Label
+	breadcrumbChildLabel     *gtk.Label
+	newWindowBtn             *gtk.Button
+	refreshBtn               *gtk.Button
+	takeChargeBtn            *gtk.ToggleButton
+	viewStack                *adw.ViewStack
 
 	inputView      *gtksource.View
 	inputBuffer    *gtksource.Buffer
@@ -403,6 +475,9 @@ type Window struct {
 	rowProjectDir    map[uintptr]string
 	headerProjectDir map[uintptr]string
 
+	takeCharge         bool
+	takeChargeInFlight map[string]bool
+
 	populating bool
 }
 
@@ -425,85 +500,93 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	builder := gtk.NewBuilderFromString(windowUI)
 
 	w := &Window{
-		ApplicationWindow:          adwWin,
-		appWin:                     win,
-		ctx:                        winCtx,
-		cancel:                     cancel,
-		client:                     client,
-		rootContent:                builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
-		hideSidebarBtn:             builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
-		newSessionSidebarBtn:       builder.GetObject("newSessionSidebarBtn").Cast().(*gtk.MenuButton),
-		newSessionSidebarPopover:   builder.GetObject("newSessionSidebarPopover").Cast().(*gtk.Popover),
-		newSessionSidebarListBox:   builder.GetObject("newSessionSidebarListBox").Cast().(*gtk.ListBox),
-		newSessionSidebarFolderBtn: builder.GetObject("newSessionSidebarFolderBtn").Cast().(*gtk.Button),
-		searchSessionsBtn:          builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
-		viewSwitcherSidebar:        builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
-		bottomSheet:                builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
-		showSidebarBtn:             builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
-		newSessionTopBtn:           builder.GetObject("newSessionTopBtn").Cast().(*gtk.MenuButton),
-		newSessionTopPopover:       builder.GetObject("newSessionTopPopover").Cast().(*gtk.Popover),
-		newSessionTopListBox:       builder.GetObject("newSessionTopListBox").Cast().(*gtk.ListBox),
-		newSessionTopFolderBtn:     builder.GetObject("newSessionTopFolderBtn").Cast().(*gtk.Button),
-		headerTitleStack:           builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
-		windowTitle:                builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
-		breadcrumbParentBtn:        builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
-		breadcrumbParentLabel:      builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
-		breadcrumbChildLabel:       builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
-		newWindowBtn:               builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
-		refreshBtn:                 builder.GetObject("refreshBtn").Cast().(*gtk.Button),
-		viewStack:                  builder.GetObject("viewStack").Cast().(*adw.ViewStack),
-		inputView:                  builder.GetObject("inputView").Cast().(*gtksource.View),
-		sendBtn:                    builder.GetObject("sendBtn").Cast().(*gtk.Button),
-		stopBtn:                    builder.GetObject("stopBtn").Cast().(*gtk.Button),
-		attachBtn:                  builder.GetObject("attachBtn").Cast().(*gtk.Button),
-		attachmentTray:             builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
-		composerPlaceholder:        builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
-		composerAgentBtn:           builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
-		composerModelBtn:           builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
-		agentPopover:               builder.GetObject("agentPopover").Cast().(*gtk.Popover),
-		modelPopover:               builder.GetObject("modelPopover").Cast().(*gtk.Popover),
-		agentPillLabel:             builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
-		modelStatusLabel:           builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
-		projectStatusBox:           builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
-		projectStatusLabel:         builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
-		branchStatusBox:            builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
-		branchStatusLabel:          builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
-		backgroundStatusBtn:        builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
-		shellStatusBox:             builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
-		shellStatusLabel:           builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
-		subagentStatusBox:          builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
-		subagentStatusLabel:        builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
-		tokRateStatusLabel:         builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
-		contextStatusLabel:         builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
-		sheetEmptyLabel:            builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
-		shellsSectionBox:           builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
-		shellListBox:               builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
-		subagentsSectionBox:        builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
-		sheetBackToParentBtn:       builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
-		subagentListBox:            builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
-		contextSectionBox:          builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
-		contextInfoGrid:            builder.GetObject("contextInfoGrid").Cast().(*gtk.Grid),
-		agentListBox:               builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
-		modelSearchEntry:           builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
-		modelListBox:               builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
-		tabs:                       make(map[string]*sessionTab),
-		childToRoot:                make(map[string]string),
-		modelNames:                 make(map[string]string),
-		modelLimits:                make(map[string]int),
-		branchCache:                make(map[string]string),
-		modelLastUsed:              make(map[string]int64),
-		expandedProjects:           make(map[string]bool),
-		collapsedProjects:          make(map[string]bool),
-		archivedSessions:           make(map[string]bool),
-		projectSessions:            make(map[string][]opencode.Session),
-		activeShells:               make(map[string]opencode.ShellItem),
-		shellOutputs:               make(map[string]string),
-		shellOutputLabels:          make(map[string]*gtk.Label),
-		closeBtnSessID:             make(map[uintptr]string),
-		hoveredRow:                 make(map[uintptr]bool),
-		rowControllers:             make(map[uintptr]bool),
-		rowProjectDir:              make(map[uintptr]string),
-		headerProjectDir:           make(map[uintptr]string),
+		ApplicationWindow:            adwWin,
+		appWin:                       win,
+		ctx:                          winCtx,
+		cancel:                       cancel,
+		client:                       client,
+		rootContent:                  builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
+		hideSidebarBtn:               builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
+		newSessionSidebarBtn:         builder.GetObject("newSessionSidebarBtn").Cast().(*gtk.MenuButton),
+		newSessionSidebarPopover:     builder.GetObject("newSessionSidebarPopover").Cast().(*gtk.Popover),
+		newSessionSidebarSearchEntry: builder.GetObject("newSessionSidebarSearchEntry").Cast().(*gtk.SearchEntry),
+		newSessionSidebarListBox:     builder.GetObject("newSessionSidebarListBox").Cast().(*gtk.ListBox),
+		newSessionSidebarFolderBtn:   builder.GetObject("newSessionSidebarFolderBtn").Cast().(*gtk.Button),
+		searchSessionsBtn:            builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
+		viewSwitcherSidebar:          builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
+		bottomSheet:                  builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
+		showSidebarBtn:               builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
+		newSessionTopBtn:             builder.GetObject("newSessionTopBtn").Cast().(*gtk.MenuButton),
+		newSessionTopPopover:         builder.GetObject("newSessionTopPopover").Cast().(*gtk.Popover),
+		newSessionTopSearchEntry:     builder.GetObject("newSessionTopSearchEntry").Cast().(*gtk.SearchEntry),
+		newSessionTopListBox:         builder.GetObject("newSessionTopListBox").Cast().(*gtk.ListBox),
+		newSessionTopFolderBtn:       builder.GetObject("newSessionTopFolderBtn").Cast().(*gtk.Button),
+		headerTitleStack:             builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
+		windowTitleBtn:               builder.GetObject("windowTitleBtn").Cast().(*gtk.MenuButton),
+		windowTitle:                  builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
+		renameSessionPopover:         builder.GetObject("renameSessionPopover").Cast().(*gtk.Popover),
+		renameSessionEntry:           builder.GetObject("renameSessionEntry").Cast().(*gtk.Entry),
+		renameSessionSaveBtn:         builder.GetObject("renameSessionSaveBtn").Cast().(*gtk.Button),
+		breadcrumbParentBtn:          builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
+		breadcrumbParentLabel:        builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
+		breadcrumbChildLabel:         builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
+		newWindowBtn:                 builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
+		refreshBtn:                   builder.GetObject("refreshBtn").Cast().(*gtk.Button),
+		takeChargeBtn:                builder.GetObject("takeChargeBtn").Cast().(*gtk.ToggleButton),
+		viewStack:                    builder.GetObject("viewStack").Cast().(*adw.ViewStack),
+		inputView:                    builder.GetObject("inputView").Cast().(*gtksource.View),
+		sendBtn:                      builder.GetObject("sendBtn").Cast().(*gtk.Button),
+		stopBtn:                      builder.GetObject("stopBtn").Cast().(*gtk.Button),
+		attachBtn:                    builder.GetObject("attachBtn").Cast().(*gtk.Button),
+		attachmentTray:               builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
+		composerPlaceholder:          builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
+		composerAgentBtn:             builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
+		composerModelBtn:             builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
+		agentPopover:                 builder.GetObject("agentPopover").Cast().(*gtk.Popover),
+		modelPopover:                 builder.GetObject("modelPopover").Cast().(*gtk.Popover),
+		agentPillLabel:               builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
+		modelStatusLabel:             builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
+		projectStatusBox:             builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
+		projectStatusLabel:           builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
+		branchStatusBox:              builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
+		branchStatusLabel:            builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
+		backgroundStatusBtn:          builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
+		shellStatusBox:               builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
+		shellStatusLabel:             builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
+		subagentStatusBox:            builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
+		subagentStatusLabel:          builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
+		tokRateStatusLabel:           builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
+		contextStatusLabel:           builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
+		sheetEmptyLabel:              builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
+		shellsSectionBox:             builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
+		shellListBox:                 builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
+		subagentsSectionBox:          builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
+		sheetBackToParentBtn:         builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
+		subagentListBox:              builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
+		contextSectionBox:            builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
+		contextInfoGrid:              builder.GetObject("contextInfoGrid").Cast().(*gtk.Grid),
+		agentListBox:                 builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
+		modelSearchEntry:             builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
+		modelListBox:                 builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
+		tabs:                         make(map[string]*sessionTab),
+		childToRoot:                  make(map[string]string),
+		modelNames:                   make(map[string]string),
+		modelLimits:                  make(map[string]int),
+		branchCache:                  make(map[string]string),
+		modelLastUsed:                make(map[string]int64),
+		expandedProjects:             make(map[string]bool),
+		collapsedProjects:            make(map[string]bool),
+		archivedSessions:             make(map[string]bool),
+		projectSessions:              make(map[string][]opencode.Session),
+		activeShells:                 make(map[string]opencode.ShellItem),
+		shellOutputs:                 make(map[string]string),
+		shellOutputLabels:            make(map[string]*gtk.Label),
+		closeBtnSessID:               make(map[uintptr]string),
+		hoveredRow:                   make(map[uintptr]bool),
+		rowControllers:               make(map[uintptr]bool),
+		rowProjectDir:                make(map[uintptr]string),
+		headerProjectDir:             make(map[uintptr]string),
+		takeChargeInFlight:           make(map[string]bool),
 	}
 	w.loadState()
 	inputScroll := builder.GetObject("inputScroll").Cast().(*gtk.ScrolledWindow)
@@ -632,11 +715,22 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		return false
 	})
 
-	w.setupNewSessionPopover(w.newSessionSidebarPopover, w.newSessionSidebarListBox, w.newSessionSidebarFolderBtn)
-	w.setupNewSessionPopover(w.newSessionTopPopover, w.newSessionTopListBox, w.newSessionTopFolderBtn)
+	w.setupNewSessionPopover(w.newSessionSidebarPopover, w.newSessionSidebarSearchEntry, w.newSessionSidebarListBox, w.newSessionSidebarFolderBtn)
+	w.setupNewSessionPopover(w.newSessionTopPopover, w.newSessionTopSearchEntry, w.newSessionTopListBox, w.newSessionTopFolderBtn)
+	w.renameSessionPopover.ConnectShow(func() {
+		if tab := w.currentTab(); tab != nil {
+			w.renameSessionEntry.SetText(tab.main.session.Title)
+			w.renameSessionEntry.GrabFocus()
+		}
+	})
+	w.renameSessionEntry.ConnectActivate(w.submitRenameSession)
+	w.renameSessionSaveBtn.ConnectClicked(w.submitRenameSession)
 	w.searchSessionsBtn.ConnectClicked(w.openSessionSearchDialog)
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
 	w.refreshBtn.ConnectClicked(w.loadAll)
+	w.takeChargeBtn.ConnectToggled(func() {
+		w.setTakeCharge(w.takeChargeBtn.Active())
+	})
 
 	// Window-level shortcuts: Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background.
 	winKeyCtrl := gtk.NewEventControllerKey()
@@ -798,6 +892,9 @@ func (w *Window) openNewWindow() {
 }
 
 func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
+	if sess.Time.Updated == 0 {
+		sess.Time.Updated = cmp.Or(sess.Time.Created, time.Now().UnixMilli())
+	}
 	normDir := normalizeProjectDir(sess.Location.Directory)
 	if w.ensureProjectOrder(normDir) {
 		w.saveState()
@@ -805,11 +902,16 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 	if tab, ok := w.tabs[sess.ID]; ok {
 		if sess.Title != "" && tab.main.session.Title != sess.Title {
 			tab.main.session.Title = sess.Title
-			tab.page.SetTitle(sess.Title)
+			if tab.page != nil {
+				tab.page.SetTitle(sess.Title)
+			}
 		}
 		if sess.Location.Directory != "" && tab.main.session.Location.Directory == "" {
 			tab.main.session.Location = sess.Location
 			w.syncSectionStarts()
+		}
+		if sess.Time.Updated > tab.main.session.Time.Updated {
+			w.touchSessionUpdated(tab, tab.main, sess.Time.Updated)
 		}
 		return tab
 	}
@@ -850,8 +952,12 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		w.tabOrder = slices.Insert(w.tabOrder, insertIdx, sess.ID)
 		for _, tailID := range w.tabOrder[insertIdx+1:] {
 			tailTab, ok := w.tabs[tailID]
-			if !ok {
+			if !ok || tailTab.stack == nil {
 				continue
+			}
+			var needsAttention bool
+			if tailTab.page != nil {
+				needsAttention = tailTab.page.NeedsAttention()
 			}
 			title := strings.TrimSpace(tailTab.main.session.Title)
 			if title == "" {
@@ -860,7 +966,9 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 			w.viewStack.Remove(tailTab.stack)
 			page := w.viewStack.AddTitled(tailTab.stack, tailID, title)
 			page.SetBadgeNumber(0)
+			page.SetNeedsAttention(needsAttention)
 			tailTab.page = page
+			tailTab.sidebarIndicator = nil
 		}
 	}
 	w.syncSectionStarts()
@@ -1039,6 +1147,97 @@ func (w *Window) archiveSession(sessID string) {
 	w.syncProjectSessionVisibility()
 	if wasCurrent && nextID != "" {
 		w.viewStack.SetVisibleChildName(nextID)
+		w.onVisibleTabChanged()
+	}
+	w.syncSwitcherIndicators()
+}
+
+func (w *Window) clearProjectSessions(rawDir string) {
+	normDir := normalizeProjectDir(rawDir)
+	if normDir == "" {
+		return
+	}
+	if w.archivedSessions == nil {
+		w.archivedSessions = make(map[string]bool)
+	}
+
+	toArchive := make(map[string]bool)
+	for _, s := range w.allSessions {
+		if s.ParentID == "" && normalizeProjectDir(s.Location.Directory) == normDir && s.ID != "" {
+			toArchive[s.ID] = true
+		}
+	}
+	if w.projectSessions != nil {
+		for _, s := range w.projectSessions[normDir] {
+			if s.ID != "" {
+				toArchive[s.ID] = true
+			}
+		}
+		delete(w.projectSessions, normDir)
+	}
+	for id, tab := range w.tabs {
+		if tab != nil && normalizeProjectDir(tab.main.session.Location.Directory) == normDir {
+			toArchive[id] = true
+		}
+	}
+	for id := range toArchive {
+		w.archivedSessions[id] = true
+	}
+	delete(w.collapsedProjects, normDir)
+	delete(w.expandedProjects, normDir)
+	w.saveState()
+
+	currentID := w.currentRootSessionID()
+	wasInProject := toArchive[currentID]
+	var nextID string
+	if wasInProject {
+		idx := slices.Index(w.tabOrder, currentID)
+		for i := idx + 1; i < len(w.tabOrder); i++ {
+			id := w.tabOrder[i]
+			if !toArchive[id] && w.tabs[id] != nil {
+				nextID = id
+				break
+			}
+		}
+		if nextID == "" {
+			for i := idx - 1; i >= 0; i-- {
+				id := w.tabOrder[i]
+				if !toArchive[id] && w.tabs[id] != nil {
+					nextID = id
+					break
+				}
+			}
+		}
+	}
+
+	prevPopulating := w.populating
+	w.populating = true
+	var nextOrder []string
+	for _, id := range w.tabOrder {
+		if !toArchive[id] {
+			nextOrder = append(nextOrder, id)
+			continue
+		}
+		if tab, ok := w.tabs[id]; ok {
+			tab.main.closeStreams()
+			for _, sub := range tab.subTimelines {
+				sub.closeStreams()
+			}
+			if w.viewStack != nil && tab.stack != nil {
+				w.viewStack.Remove(tab.stack)
+			}
+			delete(w.tabs, id)
+		}
+	}
+	w.tabOrder = nextOrder
+	w.syncSectionStarts()
+	w.populating = prevPopulating
+
+	w.syncProjectSessionVisibility()
+	if wasInProject && w.viewStack != nil {
+		if nextID != "" {
+			w.viewStack.SetVisibleChildName(nextID)
+		}
 		w.onVisibleTabChanged()
 	}
 	w.syncSwitcherIndicators()
@@ -1360,7 +1559,7 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 		messageWidgets:     make(map[string]gtk.Widgetter),
 		formWidgets:        make(map[string]*QuestionFormWidget),
 		seenMsgIDs:         make(map[string]bool),
-		blockingTools:      make(map[string]bool),
+		blockingTools:      make(map[string]time.Time),
 		blockingShellTools: make(map[string]bool),
 		blockingShellIDs:   make(map[string]string),
 		backgroundShellIDs: make(map[string]bool),
@@ -1390,14 +1589,94 @@ func (w *Window) syncNavigationChrome() {
 	tab := w.currentTab()
 	viewingSubagent := tab != nil && tab.activeSubID != ""
 
-	if viewingSubagent {
-		w.headerTitleStack.SetVisibleChildName("breadcrumb")
-	} else {
-		w.headerTitleStack.SetVisibleChildName("title")
+	if w.windowTitleBtn != nil {
+		w.windowTitleBtn.SetSensitive(tab != nil)
 	}
-	sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
-	w.showSidebarBtn.SetVisible(!sidebarVisible)
-	w.newSessionTopBtn.SetVisible(!sidebarVisible)
+	if w.headerTitleStack != nil {
+		if viewingSubagent {
+			w.headerTitleStack.SetVisibleChildName("breadcrumb")
+		} else {
+			w.headerTitleStack.SetVisibleChildName("title")
+		}
+	}
+	if w.rootContent != nil {
+		sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
+		if w.showSidebarBtn != nil {
+			w.showSidebarBtn.SetVisible(!sidebarVisible)
+		}
+		if w.newSessionTopBtn != nil {
+			w.newSessionTopBtn.SetVisible(!sidebarVisible)
+		}
+	}
+}
+
+func (w *Window) applySessionRename(sessionID, newTitle string) {
+	newTitle = strings.TrimSpace(newTitle)
+	if sessionID == "" || newTitle == "" {
+		return
+	}
+	for i := range w.allSessions {
+		if w.allSessions[i].ID == sessionID {
+			w.allSessions[i].Title = newTitle
+		}
+	}
+	for dir, list := range w.projectSessions {
+		for i := range list {
+			if list[i].ID == sessionID {
+				list[i].Title = newTitle
+				w.projectSessions[dir] = list
+			}
+		}
+	}
+	tab, conv := w.resolveConv(sessionID)
+	if conv != nil {
+		conv.session.Title = newTitle
+	}
+	if rootID, ok := w.childToRoot[sessionID]; ok {
+		if parentTab, ok := w.tabs[rootID]; ok {
+			w.upsertSubagent(parentTab, opencode.Session{ID: sessionID, ParentID: rootID, Title: newTitle})
+			if w.currentTab() == parentTab {
+				w.rebuildSubagentList(parentTab)
+			}
+		}
+	}
+	if tab != nil {
+		if conv == tab.main && tab.page != nil {
+			tab.page.SetTitle(newTitle)
+		}
+		if w.currentTab() == tab {
+			w.refreshHeaderAndBottomBar(tab)
+		}
+		w.syncSwitcherIndicators()
+	}
+}
+
+func (w *Window) submitRenameSession() {
+	if w.renameSessionPopover != nil {
+		w.renameSessionPopover.Popdown()
+	}
+	tab := w.currentTab()
+	if tab == nil || w.renameSessionEntry == nil {
+		return
+	}
+	newTitle := strings.TrimSpace(w.renameSessionEntry.Text())
+	sessID := tab.main.session.ID
+	if sessID == "" || newTitle == "" || newTitle == strings.TrimSpace(tab.main.session.Title) {
+		return
+	}
+	w.applySessionRename(sessID, newTitle)
+	if w.client == nil {
+		return
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		err := w.client.RenameSession(w.ctx, sessID, newTitle)
+		return func() {
+			if err != nil {
+				slog.Error("failed to rename session", "sessionID", sessID, "err", err)
+				app.Error(w.ctx, err)
+			}
+		}
+	})
 }
 
 func (w *Window) currentRootSessionID() string {
@@ -1776,14 +2055,38 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 	countLabel.SetVisible(false)
 	hBox.Append(countLabel)
 
-	outerBox.Append(hBox)
-
 	ptr := outerBox.Object.Native()
 	w.headerProjectDir[ptr] = normDir
 
+	clearBtn := gtk.NewButtonFromIconName("window-close-symbolic")
+	clearBtn.AddCSSClass("flat")
+	clearBtn.AddCSSClass("circular")
+	clearBtn.AddCSSClass("glup-sidebar-close-btn")
+	clearBtn.AddCSSClass("glup-sidebar-project-close-btn")
+	clearBtn.SetTooltipText("Hide Project")
+	clearBtn.SetVAlign(gtk.AlignCenter)
+	clearBtn.ConnectClicked(func() {
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.clearProjectSessions(d)
+		}
+	})
+	hBox.Append(clearBtn)
+
+	outerBox.Append(hBox)
+
 	click := gtk.NewGestureClick()
 	click.SetButton(1)
-	click.ConnectReleased(func(_ int, _, _ float64) {
+	click.ConnectReleased(func(_ int, x, y float64) {
+		if picked := hBox.Pick(x, y, gtk.PickDefault); picked != nil {
+			for p := gtk.Widgetter(picked); p != nil; p = gtk.BaseWidget(p).Parent() {
+				if gtk.BaseWidget(p).Object.Native() == clearBtn.Object.Native() {
+					return
+				}
+				if gtk.BaseWidget(p).Object.Native() == hBox.Object.Native() {
+					break
+				}
+			}
+		}
 		click.SetState(gtk.EventSequenceClaimed)
 		if d := w.headerProjectDir[ptr]; d != "" {
 			w.toggleProjectCollapsed(d)
@@ -2018,47 +2321,110 @@ func (w *Window) syncProjectSessionVisibility() {
 	}
 }
 
-func (w *Window) reorderTabsByProject() {
-	if len(w.tabOrder) <= 1 {
-		return
+func (w *Window) compareTabIDs(idA, idB string) int {
+	if idA == idB {
+		return 0
 	}
-	slices.SortFunc(w.tabOrder, func(idA, idB string) int {
-		tabA := w.tabs[idA]
-		tabB := w.tabs[idB]
-		if tabA == nil || tabB == nil {
-			return 0
-		}
-		dirA := normalizeProjectDir(tabA.main.session.Location.Directory)
-		dirB := normalizeProjectDir(tabB.main.session.Location.Directory)
-		if dirA != dirB {
-			return w.compareProjectOrder(dirA, dirB)
-		}
-		timeA := tabA.main.session.Time.Updated
-		if timeA == 0 {
-			timeA = tabA.main.session.Time.Created
-		}
-		timeB := tabB.main.session.Time.Updated
-		if timeB == 0 {
-			timeB = tabB.main.session.Time.Created
-		}
-		return cmp.Compare(timeB, timeA)
-	})
+	tabA := w.tabs[idA]
+	tabB := w.tabs[idB]
+	if tabA == nil || tabB == nil {
+		return 0
+	}
+	dirA := normalizeProjectDir(tabA.main.session.Location.Directory)
+	dirB := normalizeProjectDir(tabB.main.session.Location.Directory)
+	if dirA != dirB {
+		return w.compareProjectOrder(dirA, dirB)
+	}
+	timeA := cmp.Or(tabA.main.session.Time.Updated, tabA.main.session.Time.Created)
+	timeB := cmp.Or(tabB.main.session.Time.Updated, tabB.main.session.Time.Created)
+	if c := cmp.Compare(timeB, timeA); c != 0 {
+		return c
+	}
+	return cmp.Compare(idB, idA)
+}
 
+func (w *Window) reorderTabsByProject() bool {
+	if len(w.tabOrder) <= 1 || slices.IsSortedFunc(w.tabOrder, w.compareTabIDs) {
+		return false
+	}
+	oldOrder := slices.Clone(w.tabOrder)
+	slices.SortFunc(w.tabOrder, w.compareTabIDs)
+	firstDiff := 0
+	for firstDiff < len(w.tabOrder) && w.tabOrder[firstDiff] == oldOrder[firstDiff] {
+		firstDiff++
+	}
+	if firstDiff >= len(w.tabOrder) || w.viewStack == nil {
+		return firstDiff < len(w.tabOrder)
+	}
+
+	prevPopulating := w.populating
+	w.populating = true
 	currID := w.viewStack.VisibleChildName()
-	for _, id := range w.tabOrder {
+	for _, id := range w.tabOrder[firstDiff:] {
 		tab := w.tabs[id]
-		if tab == nil {
+		if tab == nil || tab.stack == nil {
 			continue
 		}
+		var needsAttention bool
+		if tab.page != nil {
+			needsAttention = tab.page.NeedsAttention()
+		}
 		w.viewStack.Remove(tab.stack)
-		title := tab.main.session.Title
-		if strings.TrimSpace(title) == "" {
+		title := strings.TrimSpace(tab.main.session.Title)
+		if title == "" {
 			title = "Untitled"
 		}
-		tab.page = w.viewStack.AddTitled(tab.stack, id, title)
+		page := w.viewStack.AddTitled(tab.stack, id, title)
+		page.SetBadgeNumber(0)
+		page.SetNeedsAttention(needsAttention)
+		tab.page = page
+		tab.sidebarIndicator = nil
 	}
-	if currID != "" {
+	if currID != "" && w.tabs[currID] != nil {
 		w.viewStack.SetVisibleChildName(currID)
+	}
+	w.populating = prevPopulating
+	return true
+}
+
+func (w *Window) touchSessionUpdated(tab *sessionTab, conv *convTimeline, updatedMs int64) {
+	if updatedMs <= 0 {
+		updatedMs = time.Now().UnixMilli()
+	}
+	if conv != nil && updatedMs > conv.session.Time.Updated {
+		conv.session.Time.Updated = updatedMs
+	}
+	if tab == nil || tab.main == nil {
+		return
+	}
+	if updatedMs > tab.main.session.Time.Updated {
+		tab.main.session.Time.Updated = updatedMs
+	}
+	sessID := tab.main.session.ID
+	for i := range w.allSessions {
+		if w.allSessions[i].ID == sessID && updatedMs > w.allSessions[i].Time.Updated {
+			w.allSessions[i].Time.Updated = updatedMs
+		}
+	}
+	dir := normalizeProjectDir(tab.main.session.Location.Directory)
+	if list := w.projectSessions[dir]; len(list) > 0 {
+		for i := range list {
+			if list[i].ID == sessID && updatedMs > list[i].Time.Updated {
+				list[i].Title = cmp.Or(tab.main.session.Title, list[i].Title)
+				list[i].Time.Updated = updatedMs
+			}
+		}
+		slices.SortFunc(list, func(a, b opencode.Session) int {
+			return cmp.Compare(cmp.Or(b.Time.Updated, b.Time.Created), cmp.Or(a.Time.Updated, a.Time.Created))
+		})
+		w.projectSessions[dir] = list
+	}
+	if w.reorderTabsByProject() {
+		w.syncSectionStarts()
+		w.syncProjectSessionVisibility()
+		w.syncSwitcherIndicators()
+	} else {
+		w.updateSwitcherIndicators()
 	}
 }
 
@@ -2150,7 +2516,11 @@ func (w *Window) syncSwitcherIndicators() {
 	}
 
 	// 1. In AdwViewSwitcherSidebar: walk listbox rows.
-	if lb := findListBox(w.viewSwitcherSidebar); lb != nil {
+	var lb *gtk.ListBox
+	if w.viewSwitcherSidebar != nil {
+		lb = findListBox(w.viewSwitcherSidebar)
+	}
+	if lb != nil {
 		var rowIdx int
 		var activeRow *gtk.ListBoxRow
 		var sectionIdx int
@@ -2528,9 +2898,133 @@ func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
 	})
 }
 
+// TakeChargeDirective is the autonomous decision prompt sent as the answer to
+// every pending question when "Take charge" mode is active.
+const TakeChargeDirective = "The user is currently away (Take Charge mode is active). Proceed autonomously by choosing the most recommended or sensible option for this question. Record this question, the option you selected, and your reasoning, and report all autonomous choices made at the end of your work."
+
+func buildTakeChargeAnswer(form opencode.FormInfo) map[string]any {
+	if len(form.Fields) == 0 {
+		return map[string]any{"q0": TakeChargeDirective}
+	}
+	ans := make(map[string]any, len(form.Fields))
+	for _, f := range form.Fields {
+		if f.Key == "" {
+			continue
+		}
+		switch f.Type {
+		case "multiselect":
+			ans[f.Key] = []string{TakeChargeDirective}
+		case "boolean":
+			ans[f.Key] = true
+		default:
+			ans[f.Key] = TakeChargeDirective
+		}
+	}
+	return ans
+}
+
+func isFormSettledOrMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "FormAlreadySettledError") ||
+		strings.Contains(msg, "FormNotFoundError") ||
+		strings.Contains(msg, "http 404") ||
+		strings.Contains(msg, "http 409")
+}
+
+func (w *Window) setTakeCharge(active bool) {
+	if w.takeCharge == active {
+		return
+	}
+	w.takeCharge = active
+	if w.takeChargeBtn != nil {
+		if w.takeChargeBtn.Active() != active {
+			w.takeChargeBtn.SetActive(active)
+		}
+		if active {
+			w.takeChargeBtn.SetTooltipText("Take Charge: Active — questions are auto-answered while away")
+		} else {
+			w.takeChargeBtn.SetTooltipText("Take Charge: Off — click to auto-answer questions while away")
+		}
+	}
+	if !active {
+		return
+	}
+	var pending []opencode.FormInfo
+	for _, tab := range w.tabs {
+		if tab.main != nil {
+			pending = append(pending, tab.main.pendingForms...)
+		}
+		for _, sub := range tab.subTimelines {
+			pending = append(pending, sub.pendingForms...)
+		}
+	}
+	for _, form := range pending {
+		w.replyFormTakeCharge(form)
+	}
+	if w.client != nil {
+		w.loadPendingFormsForAllDirs(w.projectOrder)
+	}
+}
+
+func (w *Window) replyFormTakeCharge(form opencode.FormInfo) {
+	if form.ID == "" || form.SessionID == "" || w.client == nil {
+		return
+	}
+	if w.takeChargeInFlight == nil {
+		w.takeChargeInFlight = make(map[string]bool)
+	}
+	if w.takeChargeInFlight[form.ID] {
+		return
+	}
+	w.takeChargeInFlight[form.ID] = true
+
+	sessID := form.SessionID
+	formID := form.ID
+	ans := buildTakeChargeAnswer(form)
+
+	var qw *QuestionFormWidget
+	if _, conv := w.resolveConv(sessID); conv != nil {
+		if existing, ok := conv.formWidgets[formID]; ok {
+			qw = existing
+			qw.SetBusy(true)
+		}
+	}
+
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gtkutil.Async(ctx, func() func() {
+		err := w.client.ReplyForm(ctx, sessID, formID, ans)
+		if err != nil && strings.Contains(err.Error(), "FormInvalidAnswerError") {
+			err = w.client.CancelForm(ctx, sessID, formID, TakeChargeDirective)
+		}
+		return func() {
+			delete(w.takeChargeInFlight, formID)
+			if err != nil && !isFormSettledOrMissingError(err) {
+				slog.Error("failed to auto-reply to form in take charge mode", "sessionID", sessID, "formID", formID, "err", err)
+				if qw != nil {
+					qw.SetBusy(false)
+				}
+				return
+			}
+			w.removePendingForm(sessID, formID)
+		}
+	})
+}
+
 func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 	if form.ID == "" || form.SessionID == "" {
 		return
+	}
+	if w.takeCharge {
+		w.replyFormTakeCharge(form)
+		if w.client != nil {
+			return
+		}
 	}
 	tab, conv := w.resolveConv(form.SessionID)
 	if tab == nil || conv == nil {
@@ -2554,7 +3048,7 @@ func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 		w.ensureFormWidget(tab, conv, form)
 		conv.keepPendingAtBottom()
 		if conv.scroll != nil {
-			conv.scroll.ScrollToBottom()
+			conv.scroll.ScrollToBottomIfBottomed()
 		}
 	}
 }
@@ -2710,13 +3204,23 @@ func (w *Window) refreshHeaderAndBottomBar(tab *sessionTab) {
 		if subTitle == "" {
 			subTitle = conv.session.ID
 		}
-		w.breadcrumbParentLabel.SetLabel(mainTitle)
-		w.breadcrumbChildLabel.SetLabel(subTitle)
-		w.sheetBackToParentBtn.SetVisible(true)
+		if w.breadcrumbParentLabel != nil {
+			w.breadcrumbParentLabel.SetLabel(mainTitle)
+		}
+		if w.breadcrumbChildLabel != nil {
+			w.breadcrumbChildLabel.SetLabel(subTitle)
+		}
+		if w.sheetBackToParentBtn != nil {
+			w.sheetBackToParentBtn.SetVisible(true)
+		}
 	} else {
-		w.windowTitle.SetTitle(mainTitle)
-		w.windowTitle.SetSubtitle(shortDir(tab.main.session.Location.Directory))
-		w.sheetBackToParentBtn.SetVisible(false)
+		if w.windowTitle != nil {
+			w.windowTitle.SetTitle(mainTitle)
+			w.windowTitle.SetSubtitle(shortDir(tab.main.session.Location.Directory))
+		}
+		if w.sheetBackToParentBtn != nil {
+			w.sheetBackToParentBtn.SetVisible(false)
+		}
 	}
 
 	w.syncNavigationChrome()
@@ -2936,8 +3440,9 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			conv.formWidgets = make(map[string]*QuestionFormWidget)
 			conv.pendingForms = nil
 			conv.revertBanner = nil
+			prevBlocking := conv.blockingTools
 			conv.seenMsgIDs = make(map[string]bool)
-			conv.blockingTools = make(map[string]bool)
+			conv.blockingTools = make(map[string]time.Time)
 			conv.blockingShellTools = make(map[string]bool)
 			conv.blockingShellIDs = make(map[string]string)
 			conv.backgroundShellIDs = make(map[string]bool)
@@ -2973,6 +3478,11 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 					}
 				} else if msg.Type == "synthetic" && isSubagentOrShellSynthetic(msg) {
 					conv.markSyntheticTargetCompleted(msg)
+				}
+			}
+			for id := range conv.blockingTools {
+				if prevStart, ok := prevBlocking[id]; ok && !prevStart.IsZero() {
+					conv.blockingTools[id] = prevStart
 				}
 			}
 			conv.runningTools = runningTools
@@ -3265,7 +3775,7 @@ func (w *Window) reconcileTail(sessionID string) {
 			conv.keepPendingAtBottom()
 
 			if appended {
-				conv.scroll.ScrollToBottom()
+				conv.scroll.ScrollToBottomIfBottomed()
 			}
 			if tab != nil && w.currentTab() == tab {
 				w.updateBottomBar(tab)
@@ -3313,8 +3823,28 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 		w.rebuildContextInfo(nil)
 		return
 	}
+	now := time.Now()
+	showBg := tab.shouldShowBackgroundHint(now)
 	if w.backgroundStatusBtn != nil {
-		w.backgroundStatusBtn.SetVisible(tab.blockingSessionID() != "")
+		w.backgroundStatusBtn.SetVisible(showBg)
+	}
+	if !showBg {
+		if delay, ok := tab.nextBackgroundHintDelay(now); ok && w.ctx != nil {
+			ms := uint(delay.Milliseconds()) + 20
+			if ms < 50 {
+				ms = 50
+			}
+			tabID := tab.main.session.ID
+			glib.TimeoutAdd(ms, func() bool {
+				if w.ctx.Err() != nil {
+					return false
+				}
+				if cur := w.currentTab(); cur != nil && cur.main.session.ID == tabID {
+					w.updateBottomBar(cur)
+				}
+				return false
+			})
+		}
 	}
 	conv := tab.activeConv()
 	agent := conv.session.Agent
@@ -4419,46 +4949,77 @@ func (w *Window) switchModel(model opencode.ModelRef) {
 	})
 }
 
-func (w *Window) setupNewSessionPopover(popover *gtk.Popover, listBox *gtk.ListBox, folderBtn *gtk.Button) {
-	var rowDirs []string
-	popover.ConnectShow(func() {
+func (w *Window) setupNewSessionPopover(popover *gtk.Popover, searchEntry *gtk.SearchEntry, listBox *gtk.ListBox, folderBtn *gtk.Button) {
+	emptyLabel := gtk.NewLabel("No matching projects")
+	emptyLabel.AddCSSClass("dim-label")
+	emptyLabel.SetMarginTop(12)
+	emptyLabel.SetMarginBottom(12)
+	listBox.SetPlaceholder(emptyLabel)
+
+	type projectMatch struct {
+		dir   string
+		row   *gtk.ListBoxRow
+		score int
+	}
+
+	var allDirs []string
+	var currentMatches []projectMatch
+
+	activateSelected := func() {
+		sel := listBox.SelectedRow()
+		if sel == nil && len(currentMatches) > 0 {
+			sel = currentMatches[0].row
+		}
+		if sel != nil {
+			for _, m := range currentMatches {
+				if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
+					popover.Popdown()
+					w.createNewSessionInDir(m.dir)
+					return
+				}
+			}
+		}
+	}
+
+	rebuildRows := func(query string) {
 		for c := listBox.FirstChild(); c != nil; {
 			next := gtk.BaseWidget(c).NextSibling()
 			listBox.Remove(c)
 			c = next
 		}
-		rowDirs = nil
-
-		var dirs []string
-		seen := make(map[string]bool)
-		addDir := func(raw string) {
-			d := normalizeProjectDir(raw)
-			if d != "" && !seen[d] {
-				seen[d] = true
-				dirs = append(dirs, d)
-			}
-		}
-		for _, d := range w.projectOrder {
-			addDir(d)
-		}
-		for _, id := range w.tabOrder {
-			if tab := w.tabs[id]; tab != nil {
-				addDir(tab.main.session.Location.Directory)
-			}
-		}
-		for _, s := range w.allSessions {
-			addDir(s.Location.Directory)
-		}
-		if cwd, err := os.Getwd(); err == nil && cwd != "" {
-			addDir(cwd)
-		}
+		currentMatches = nil
 
 		currentDir := ""
 		if tab := w.currentTab(); tab != nil {
 			currentDir = normalizeProjectDir(tab.main.session.Location.Directory)
 		}
 
-		for _, dir := range dirs {
+		q := strings.TrimSpace(query)
+		for _, dir := range allDirs {
+			candidate := projectName(dir) + " " + shortDir(dir) + " " + dir
+			score, ok := fuzzyMatchScore(q, candidate)
+			if !ok {
+				continue
+			}
+			currentMatches = append(currentMatches, projectMatch{
+				dir:   dir,
+				score: score,
+			})
+		}
+		if q != "" {
+			slices.SortStableFunc(currentMatches, func(a, b projectMatch) int {
+				if a.score != b.score {
+					if a.score > b.score {
+						return -1
+					}
+					return 1
+				}
+				return 0
+			})
+		}
+
+		for i := range currentMatches {
+			dir := currentMatches[i].dir
 			row := gtk.NewListBoxRow()
 			hBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
 			hBox.SetMarginTop(6)
@@ -4497,21 +5058,96 @@ func (w *Window) setupNewSessionPopover(popover *gtk.Popover, listBox *gtk.ListB
 
 			row.SetChild(hBox)
 			listBox.Append(row)
-			rowDirs = append(rowDirs, dir)
+			currentMatches[i].row = row
+		}
+		if len(currentMatches) > 0 && currentMatches[0].row != nil {
+			listBox.SelectRow(currentMatches[0].row)
+		}
+	}
+
+	popover.ConnectShow(func() {
+		allDirs = nil
+		seen := make(map[string]bool)
+		addDir := func(raw string) {
+			d := normalizeProjectDir(raw)
+			if d != "" && !seen[d] {
+				seen[d] = true
+				allDirs = append(allDirs, d)
+			}
+		}
+		for _, d := range w.projectOrder {
+			addDir(d)
+		}
+		for _, id := range w.tabOrder {
+			if tab := w.tabs[id]; tab != nil {
+				addDir(tab.main.session.Location.Directory)
+			}
+		}
+		for _, s := range w.allSessions {
+			addDir(s.Location.Directory)
+		}
+		if cwd, err := os.Getwd(); err == nil && cwd != "" {
+			addDir(cwd)
+		}
+
+		if searchEntry != nil {
+			searchEntry.SetText("")
+			rebuildRows("")
+			searchEntry.GrabFocus()
+		} else {
+			rebuildRows("")
 		}
 	})
+
+	if searchEntry != nil {
+		searchEntry.ConnectSearchChanged(func() {
+			rebuildRows(searchEntry.Text())
+		})
+		searchEntry.ConnectActivate(activateSelected)
+		searchEntry.ConnectStopSearch(func() {
+			popover.Popdown()
+		})
+
+		keyCtrl := gtk.NewEventControllerKey()
+		keyCtrl.ConnectKeyPressed(func(keyval, _ uint, _ gdk.ModifierType) bool {
+			if keyval == gdk.KEY_Down || keyval == gdk.KEY_Up {
+				if len(currentMatches) == 0 {
+					return false
+				}
+				selIdx := 0
+				if sel := listBox.SelectedRow(); sel != nil {
+					for i, m := range currentMatches {
+						if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
+							selIdx = i
+							break
+						}
+					}
+				}
+				if keyval == gdk.KEY_Down && selIdx+1 < len(currentMatches) {
+					listBox.SelectRow(currentMatches[selIdx+1].row)
+					return true
+				}
+				if keyval == gdk.KEY_Up && selIdx > 0 {
+					listBox.SelectRow(currentMatches[selIdx-1].row)
+					return true
+				}
+			}
+			return false
+		})
+		searchEntry.AddController(keyCtrl)
+	}
 
 	listBox.ConnectRowActivated(func(row *gtk.ListBoxRow) {
 		if row == nil {
 			return
 		}
-		idx := row.Index()
-		if idx < 0 || idx >= len(rowDirs) {
-			return
+		for _, m := range currentMatches {
+			if m.row != nil && m.row.Object.Native() == row.Object.Native() {
+				popover.Popdown()
+				w.createNewSessionInDir(m.dir)
+				return
+			}
 		}
-		dir := rowDirs[idx]
-		popover.Popdown()
-		w.createNewSessionInDir(dir)
 	})
 
 	folderBtn.ConnectClicked(func() {
@@ -4727,6 +5363,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			conv.timelineBox.Append(uw)
 			conv.keepPendingAtBottom()
 			conv.scroll.ScrollToBottom()
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(sessionID, true)
 
 			gtkutil.Async(w.ctx, func() func() {
@@ -4783,6 +5420,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	conv.timelineBox.Append(uw)
 	conv.keepPendingAtBottom()
 	conv.scroll.ScrollToBottom()
+	w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 	w.setConvActive(sessionID, true)
 
 	opts := parseMentions(text, w.skills, w.agents, w.activeDirectory())
@@ -5012,7 +5650,7 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 	if conv.loaded {
 		conv.timelineBox.Append(uw)
 		conv.keepPendingAtBottom()
-		conv.scroll.ScrollToBottom()
+		conv.scroll.ScrollToBottomIfBottomed()
 	}
 }
 
@@ -5649,7 +6287,7 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		}
 		conv.keepPendingAtBottom()
 		if active && conv.scroll != nil {
-			conv.scroll.ScrollToBottom()
+			conv.scroll.ScrollToBottomIfBottomed()
 		}
 	}
 	if conv == tab.main {
@@ -5773,16 +6411,40 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			if tab, ok := w.tabs[sess.ID]; ok {
 				if sess.Title != "" && tab.main.session.Title != sess.Title {
 					tab.main.session.Title = sess.Title
-					tab.page.SetTitle(sess.Title)
-					w.syncSwitcherIndicators()
+					if tab.page != nil {
+						tab.page.SetTitle(sess.Title)
+					}
 				}
-				if sess.Time.Updated != 0 {
-					tab.main.session.Time.Updated = sess.Time.Updated
+				if sess.Agent != "" {
+					tab.main.session.Agent = sess.Agent
 				}
-				if sess.Location.Directory != "" && tab.main.session.Location.Directory == "" {
+				if sess.Model.ID != "" {
+					tab.main.session.Model = sess.Model
+				}
+				if sess.Outcome != "" {
+					tab.main.session.Outcome = sess.Outcome
+				}
+				if sess.Time.Created != 0 {
+					tab.main.session.Time.Created = sess.Time.Created
+				}
+				if sess.Time.Busy != 0 {
+					tab.main.session.Time.Busy = sess.Time.Busy
+				}
+				if sess.Time.Idle != 0 {
+					tab.main.session.Time.Idle = sess.Time.Idle
+				}
+				if sess.Tokens.Input+sess.Tokens.Output+sess.Tokens.Cache.Read > 0 {
+					tab.main.session.Tokens = sess.Tokens
+				}
+				tab.main.session.Revert = sess.Revert
+				if sess.Location.Directory != "" {
 					tab.main.session.Location = sess.Location
 				}
-				tab.main.session = sess
+				if sess.Time.Updated != 0 {
+					w.touchSessionUpdated(tab, tab.main, sess.Time.Updated)
+				} else {
+					w.syncSwitcherIndicators()
+				}
 				if w.currentTab() == tab {
 					w.refreshHeaderAndBottomBar(tab)
 				}
@@ -5841,6 +6503,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.execution.started":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			tab, conv := w.resolveConv(d.SessionID)
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, true)
 			w.setSubagentActive(d.SessionID, true, "")
 			w.reconcileTail(d.SessionID)
@@ -5850,13 +6514,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			tab, conv := w.resolveConv(d.SessionID)
-			now := time.Now().UnixMilli()
-			if tab != nil {
-				tab.main.session.Time.Updated = now
-			}
-			if conv != nil {
-				conv.session.Time.Updated = now
-			}
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, false)
 			outcome := "succeeded"
 			if ev.Type == "session.execution.failed" {
@@ -5896,11 +6554,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.InboxEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			tab, conv := w.resolveConv(d.SessionID)
-			if tab != nil {
-				tab.main.session.Time.Updated = time.Now().UnixMilli()
-			}
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
-				conv.session.Time.Updated = time.Now().UnixMilli()
 				w.onInboxEnqueued(tab, conv, d)
 			}
 		}
@@ -5948,11 +6603,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		}
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			tab, conv := w.resolveConv(d.SessionID)
-			if tab != nil {
-				tab.main.session.Time.Updated = time.Now().UnixMilli()
-			}
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
-				conv.session.Time.Updated = time.Now().UnixMilli()
 				if conv.loaded {
 					w.reconcileTail(d.SessionID)
 				}
@@ -5991,8 +6643,19 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					w.reconcileTail(d.SessionID)
 				}
 			}
-			if tab != nil && w.currentTab() == tab {
-				w.refreshHeaderAndBottomBar(tab)
+			if tab != nil {
+				if conv == tab.main {
+					if w.reorderTabsByProject() {
+						w.syncSectionStarts()
+						w.syncProjectSessionVisibility()
+						w.syncSwitcherIndicators()
+					} else {
+						w.syncSectionStarts()
+					}
+				}
+				if w.currentTab() == tab {
+					w.refreshHeaderAndBottomBar(tab)
+				}
 			}
 		}
 
@@ -6002,26 +6665,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			Title     string `json:"title"`
 		}
 		if json.Unmarshal(ev.Data, &d) == nil && d.Title != "" {
-			tab, conv := w.resolveConv(d.SessionID)
-			if conv != nil {
-				conv.session.Title = d.Title
-			}
-			if rootID, ok := w.childToRoot[d.SessionID]; ok {
-				if parentTab, ok := w.tabs[rootID]; ok {
-					w.upsertSubagent(parentTab, opencode.Session{ID: d.SessionID, ParentID: rootID, Title: d.Title})
-					if w.currentTab() == parentTab {
-						w.rebuildSubagentList(parentTab)
-					}
-				}
-			}
-			if tab != nil {
-				if conv == tab.main {
-					tab.page.SetTitle(d.Title)
-				}
-				if w.currentTab() == tab {
-					w.refreshHeaderAndBottomBar(tab)
-				}
-			}
+			w.applySessionRename(d.SessionID, d.Title)
 		}
 
 	case "session.agent.selected":
@@ -6060,11 +6704,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.StepStartedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
-			if tab != nil {
-				tab.main.session.Time.Updated = time.Now().UnixMilli()
-			}
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
-				conv.session.Time.Updated = time.Now().UnixMilli()
 				conv.streamStart = time.Now()
 				conv.streamEnd = time.Time{}
 				conv.streamedChars = 0
@@ -6103,11 +6744,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.StepEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
-			if tab != nil {
-				tab.main.session.Time.Updated = time.Now().UnixMilli()
-			}
+			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
-				conv.session.Time.Updated = time.Now().UnixMilli()
 				totalTok := d.Tokens.Output + d.Tokens.Reasoning
 				if totalTok > 0 && !conv.streamStart.IsZero() {
 					var dur float64
@@ -6259,7 +6897,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				}
 				if d.ID != "" {
 					if isBlockingBackgroundableTool(name, "running", d.Input) {
-						conv.blockingTools[d.ID] = true
+						if conv.blockingTools[d.ID].IsZero() {
+							conv.blockingTools[d.ID] = time.Now()
+						}
 						if isShellToolName(name) {
 							conv.blockingShellTools[d.ID] = true
 						}

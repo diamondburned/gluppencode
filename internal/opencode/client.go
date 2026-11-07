@@ -310,6 +310,13 @@ func (c *Client) CreateSessionWithOptions(ctx context.Context, req CreateSession
 	return &sess, nil
 }
 
+// RenameSession updates the title of a session (PATCH /api/session/{sessionID}).
+func (c *Client) RenameSession(ctx context.Context, sessionID, title string) error {
+	path := fmt.Sprintf("/api/session/%s", url.PathEscape(sessionID))
+	body := map[string]string{"title": title}
+	return c.doJSON(ctx, http.MethodPatch, path, body, nil)
+}
+
 // StageRevert stages a revert to a specific message ID in a session (POST /api/session/{sessionID}/revert/stage).
 func (c *Client) StageRevert(ctx context.Context, sessionID, messageID string, revertFiles bool) (*Session, error) {
 	path := fmt.Sprintf("/api/session/%s/revert/stage", url.PathEscape(sessionID))
@@ -346,7 +353,7 @@ func (c *Client) ClearRevert(ctx context.Context, sessionID string) (*Session, e
 func (c *Client) CommitRevert(ctx context.Context, sessionID string) (*Session, error) {
 	path := fmt.Sprintf("/api/session/%s/revert/commit", url.PathEscape(sessionID))
 	var raw json.RawMessage
-	if err := c.doJSON(ctx, http.MethodPost, path, nil, &raw); err != nil {
+	if err := c.doJSON(ctx, http.MethodPost, path, map[string]any{}, &raw); err != nil {
 		return nil, err
 	}
 	var sess Session
@@ -359,7 +366,7 @@ func (c *Client) CommitRevert(ctx context.Context, sessionID string) (*Session, 
 // CompactSession manually triggers compaction on a session (POST /api/session/{sessionID}/compact).
 func (c *Client) CompactSession(ctx context.Context, sessionID string) error {
 	path := fmt.Sprintf("/api/session/%s/compact", url.PathEscape(sessionID))
-	return c.doJSON(ctx, http.MethodPost, path, nil, nil)
+	return c.doJSON(ctx, http.MethodPost, path, map[string]any{}, nil)
 }
 
 // ActiveStatus describes an active session's execution state.
@@ -1188,7 +1195,7 @@ func (c *Client) Interrupt(ctx context.Context, sessionID string) error {
 // (POST /api/session/{sessionID}/background).
 func (c *Client) BackgroundSession(ctx context.Context, sessionID string) error {
 	path := fmt.Sprintf("/api/session/%s/background", url.PathEscape(sessionID))
-	return c.doJSON(ctx, http.MethodPost, path, nil, nil)
+	return c.doJSON(ctx, http.MethodPost, path, map[string]any{}, nil)
 }
 
 // FormOption describes a single selectable choice in a FormField.

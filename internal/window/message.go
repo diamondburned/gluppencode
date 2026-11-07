@@ -217,6 +217,9 @@ type ToolWidget struct {
 	*gtk.Box
 	ctx context.Context
 
+	headerRow       *gtk.Box
+	summaryRow      *gtk.Box
+	detailsBox      *gtk.Box
 	toolIcon        *gtk.Image
 	titleLabel      *gtk.Label
 	subtitleLabel   *gtk.Label
@@ -238,22 +241,43 @@ type ToolWidget struct {
 	imageWidgets []gtk.Widgetter
 	diffWidgets  []*gtk.Label
 
-	toolID          string
-	toolName        string
-	partStatus      string
-	metaStatus      string
-	isBackground    bool
-	hasBgBadge      bool
-	shellID         string
-	liveShellOutput string
-	childSessionID  string
-	onOpenSubagent  func(string)
+	toolID             string
+	toolName           string
+	partStatus         string
+	metaStatus         string
+	isBackground       bool
+	hasBgBadge         bool
+	subagentClickWired bool
+	shellID            string
+	liveShellOutput    string
+	childSessionID     string
+	onOpenSubagent     func(string)
+}
+
+func isNonExpandableTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "read", "subagent", "task":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSubagentTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "subagent", "task":
+		return true
+	default:
+		return false
+	}
 }
 
 // NewToolWidget creates a new ToolWidget for an inline tool invocation.
 func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(string)) *ToolWidget {
 	builder := gtk.NewBuilderFromString(toolUI)
 	root := builder.GetObject("rootContent").Cast().(*gtk.Box)
+	headerRow := builder.GetObject("headerRow").Cast().(*gtk.Box)
+	summaryRow := builder.GetObject("summaryRow").Cast().(*gtk.Box)
 	toolIcon := builder.GetObject("toolIcon").Cast().(*gtk.Image)
 	titleLabel := builder.GetObject("titleLabel").Cast().(*gtk.Label)
 	subtitleLabel := builder.GetObject("subtitleLabel").Cast().(*gtk.Label)
@@ -279,6 +303,9 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 	tw := &ToolWidget{
 		Box:             root,
 		ctx:             ctx,
+		headerRow:       headerRow,
+		summaryRow:      summaryRow,
+		detailsBox:      detailsBox,
 		toolIcon:        toolIcon,
 		titleLabel:      titleLabel,
 		subtitleLabel:   subtitleLabel,
@@ -305,7 +332,38 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		}
 	})
 
+	tw.applyToolKind()
 	return tw
+}
+
+func (t *ToolWidget) applyToolKind() {
+	if isNonExpandableTool(t.toolName) && t.detailsExpander != nil && t.headerRow != nil && t.summaryRow != nil {
+		t.detailsExpander.SetExpanded(false)
+		t.detailsExpander.SetLabelWidget(nil)
+		t.headerRow.Remove(t.detailsExpander)
+		t.headerRow.Prepend(t.summaryRow)
+		t.summaryRow.AddCSSClass("glup-tool-expander")
+		if t.detailsBox != nil {
+			t.Remove(t.detailsBox)
+			t.detailsBox = nil
+		}
+		t.detailsExpander = nil
+	}
+	if isSubagentTool(t.toolName) && !t.subagentClickWired && t.headerRow != nil {
+		t.subagentClickWired = true
+		click := gtk.NewGestureClick()
+		click.SetButton(1)
+		click.ConnectReleased(func(_ int, _, _ float64) {
+			if t.childSessionID != "" && t.onOpenSubagent != nil {
+				t.onOpenSubagent(t.childSessionID)
+			}
+		})
+		t.headerRow.AddController(click)
+		if t.childSessionID != "" {
+			t.headerRow.AddCSSClass("glup-tool-clickable")
+			t.headerRow.SetCursorFromName("pointer")
+		}
+	}
 }
 
 func formatToolTitle(name string) string {
@@ -405,6 +463,10 @@ func (t *ToolWidget) setChildSessionID(id string) {
 	t.childSessionID = id
 	setViewSessionButtonContent(t.actionBtn)
 	t.actionBtn.SetVisible(true)
+	if t.headerRow != nil {
+		t.headerRow.AddCSSClass("glup-tool-clickable")
+		t.headerRow.SetCursorFromName("pointer")
+	}
 }
 
 // ShellID returns the background shell ID associated with this tool widget, if any.
@@ -536,7 +598,6 @@ func (t *ToolWidget) SetInput(raw any) {
 		agent, _ := m["agent"].(string)
 		desc, _ := m["description"].(string)
 		sessID, _ := m["sessionID"].(string)
-		prompt, _ := m["prompt"].(string)
 		model, _ := m["model"].(string)
 
 		if sessID != "" {
@@ -559,11 +620,7 @@ func (t *ToolWidget) SetInput(raw any) {
 			t.titleLabel.SetLabel(agentTitle)
 			t.subtitleLabel.SetLabel(desc)
 		}
-
-		if prompt != "" {
-			t.inputBuf.SetText("Prompt:\n" + prompt)
-			t.inputView.SetVisible(true)
-		} else {
+		if t.inputView != nil {
 			t.inputView.SetVisible(false)
 		}
 
@@ -896,6 +953,9 @@ func formatQuestionToolInput(m map[string]any) (subtitle, details string) {
 
 // AppendInputDelta appends a streaming delta to the tool's input view.
 func (t *ToolWidget) AppendInputDelta(delta string) {
+	if isNonExpandableTool(t.toolName) || t.inputBuf == nil {
+		return
+	}
 	end := t.inputBuf.EndIter()
 	t.inputBuf.Insert(end, delta)
 }
@@ -925,6 +985,21 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 	}
 	t.imageBox.SetVisible(hasImage)
 
+	if isSubagentTool(t.toolName) {
+		if t.childSessionID == "" {
+			for _, item := range items {
+				if id := extractSessionID(item.Text); id != "" {
+					t.setChildSessionID(id)
+					break
+				}
+			}
+		}
+		return
+	}
+	if strings.EqualFold(t.toolName, "read") {
+		return
+	}
+
 	var sb strings.Builder
 	for _, item := range items {
 		txt := strings.TrimSpace(item.Text)
@@ -953,7 +1028,7 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 	} else if out != "" {
 		t.outputBuf.SetText(out)
 		t.outputScroll.SetVisible(true)
-		if errVal != nil {
+		if errVal != nil && t.detailsExpander != nil {
 			t.detailsExpander.SetVisible(true)
 			t.detailsExpander.SetExpanded(true)
 		}
@@ -962,11 +1037,6 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 	if t.shellID == "" && (t.toolName == "shell" || t.toolName == "bash") {
 		if shID := extractShellID(out); shID != "" {
 			t.shellID = shID
-		}
-	}
-	if t.childSessionID == "" && (t.toolName == "subagent" || t.toolName == "task") {
-		if id := extractSessionID(out); id != "" {
-			t.setChildSessionID(id)
 		}
 	}
 }
@@ -1116,6 +1186,7 @@ func (w *AssistantMessageWidget) EnsureTool(id, name string) *ToolWidget {
 			tw.toolName = name
 			tw.titleLabel.SetLabel(formatToolTitle(name))
 			setInitialToolIcon(tw.toolIcon, name)
+			tw.applyToolKind()
 		}
 		return tw
 	}
@@ -1228,19 +1299,16 @@ func stripSubagentTags(text string) string {
 	return text
 }
 
-// SyntheticSubagentWidget renders a subagent completion notice with an expandable body.
+// SyntheticSubagentWidget renders a subagent or shell completion notice.
 type SyntheticSubagentWidget struct {
 	*gtk.Box
 	expander *gtk.Expander
 }
 
 // NewSyntheticSubagentWidget creates a new SyntheticSubagentWidget for a completed subagent or shell.
-func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpenSubagent func(string)) *SyntheticSubagentWidget {
+func NewSyntheticSubagentWidget(_ context.Context, msg opencode.Message, onOpenSubagent func(string)) *SyntheticSubagentWidget {
 	root := gtk.NewBox(gtk.OrientationVertical, 2)
 	root.AddCSSClass("glup-tool-inline")
-
-	expander := gtk.NewExpander("")
-	expander.AddCSSClass("glup-tool-expander")
 
 	trimmedText := strings.TrimSpace(msg.Text)
 	isShell := strings.HasPrefix(trimmedText, "<shell")
@@ -1275,6 +1343,10 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 		childID = c
 	} else if c, ok := msg.Metadata["sessionID"].(string); ok && c != "" {
 		childID = c
+	} else if matches := subagentSessionRe.FindStringSubmatch(trimmedText); len(matches) > 1 {
+		childID = matches[1]
+	} else {
+		childID = extractSessionID(trimmedText)
 	}
 
 	summaryRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
@@ -1305,13 +1377,22 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 	summaryRow.Append(titleLbl)
 	summaryRow.Append(descLbl)
 
-	expander.SetHExpand(true)
-	expander.SetVAlign(gtk.AlignCenter)
-	expander.SetLabelWidget(summaryRow)
-
 	headerRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	headerRow.SetHExpand(true)
-	headerRow.Append(expander)
+
+	var expander *gtk.Expander
+	if isShell {
+		expander = gtk.NewExpander("")
+		expander.AddCSSClass("glup-tool-expander")
+		expander.SetHExpand(true)
+		expander.SetVAlign(gtk.AlignCenter)
+		expander.SetLabelWidget(summaryRow)
+		headerRow.Append(expander)
+	} else {
+		summaryRow.AddCSSClass("glup-tool-expander")
+		summaryRow.SetVAlign(gtk.AlignCenter)
+		headerRow.Append(summaryRow)
+	}
 
 	state := strings.ToLower(strings.TrimSpace(msg.Status))
 	if state == "" {
@@ -1333,6 +1414,15 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 	headerRow.Append(statusLabel)
 
 	if !isShell && childID != "" && onOpenSubagent != nil {
+		headerRow.AddCSSClass("glup-tool-clickable")
+		headerRow.SetCursorFromName("pointer")
+		click := gtk.NewGestureClick()
+		click.SetButton(1)
+		click.ConnectReleased(func(_ int, _, _ float64) {
+			onOpenSubagent(childID)
+		})
+		headerRow.AddController(click)
+
 		btn := gtk.NewButton()
 		setViewSessionButtonContent(btn)
 		btn.SetVAlign(gtk.AlignCenter)
@@ -1346,13 +1436,13 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 
 	root.Append(headerRow)
 
-	body := stripSubagentTags(msg.Text)
-	if body != "" {
-		bodyBox := gtk.NewBox(gtk.OrientationVertical, 4)
-		bodyBox.AddCSSClass("glup-tool-body")
-		bodyBox.SetMarginTop(4)
-		bodyBox.SetVisible(false)
-		if isShell {
+	if isShell && expander != nil {
+		body := stripSubagentTags(msg.Text)
+		if body != "" {
+			bodyBox := gtk.NewBox(gtk.OrientationVertical, 4)
+			bodyBox.AddCSSClass("glup-tool-body")
+			bodyBox.SetMarginTop(4)
+			bodyBox.SetVisible(false)
 			tv := gtk.NewTextView()
 			tv.SetEditable(false)
 			tv.SetCursorVisible(false)
@@ -1365,15 +1455,11 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 			scroll.SetPropagateNaturalHeight(true)
 			scroll.SetChild(tv)
 			bodyBox.Append(scroll)
-		} else {
-			mv := mdstream.NewView(ctx)
-			mv.SetStatic(body)
-			bodyBox.Append(mv)
+			expander.NotifyProperty("expanded", func() {
+				bodyBox.SetVisible(expander.Expanded())
+			})
+			root.Append(bodyBox)
 		}
-		expander.NotifyProperty("expanded", func() {
-			bodyBox.SetVisible(expander.Expanded())
-		})
-		root.Append(bodyBox)
 	}
 
 	return &SyntheticSubagentWidget{

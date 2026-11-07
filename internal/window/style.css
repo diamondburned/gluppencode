@@ -59,6 +59,19 @@ sidebar .navigation-sidebar > .header > header.glup-sidebar-project-header,
 	background-color: color-mix(in srgb, currentColor 7%, transparent);
 }
 
+.glup-sidebar-project-close-btn {
+	opacity: 0;
+}
+
+.glup-sidebar-project-header-box:hover .glup-sidebar-project-close-btn {
+	opacity: 0.6;
+}
+
+.glup-sidebar-project-header-box:hover .glup-sidebar-project-close-btn:hover {
+	opacity: 1;
+	background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+
 .glup-sidebar-project-chevron {
 	opacity: 0.55;
 	transition: transform 150ms ease, opacity 120ms ease;
@@ -314,6 +327,14 @@ sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
 	font-size: 0.86em;
 	opacity: 0.9;
 	padding: 1px 0;
+}
+
+.glup-tool-clickable {
+	border-radius: 6px;
+}
+
+.glup-tool-clickable:hover {
+	background-color: alpha(@theme_fg_color, 0.05);
 }
 
 .glup-tool-images {
@@ -715,6 +736,12 @@ button.glup-status-background:hover {
 	opacity: 0.78;
 }
 
+menubutton.glup-window-title-btn > button {
+	font-weight: normal;
+	padding: 2px 10px;
+	border-radius: 8px;
+}
+
 .glup-sheet-content {
 	padding: 28px 16px 24px 16px;
 	min-height: 110px;
@@ -976,4 +1003,13 @@ button.glup-status-background:hover {
 	border-radius: 6px;
 	padding: 6px 8px;
 	margin-top: 4px;
+}
+
+togglebutton.glup-take-charge-btn:checked {
+	color: @accent_color;
+	background-color: alpha(@accent_bg_color, 0.22);
+}
+
+togglebutton.glup-take-charge-btn:checked:hover {
+	background-color: alpha(@accent_bg_color, 0.32);
 }

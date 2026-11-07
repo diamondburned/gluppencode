@@ -3,7 +3,9 @@
   <gresource prefix="/so/libdb/gluppencode/icons/scalable/actions/">
     <file preprocess="xml-stripblanks" alias="arrow-downward-symbolic.svg">scalable/actions/arrow-downward-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="arrow-forward-symbolic.svg">scalable/actions/arrow-forward-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="auto-mode-symbolic.svg">scalable/actions/auto-mode-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="avatar-default-symbolic.svg">scalable/actions/avatar-default-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="bolt-symbolic.svg">scalable/actions/bolt-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="channel-broadcast-symbolic.svg">scalable/actions/channel-broadcast-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="channel-symbolic.svg">scalable/actions/channel-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="chat-bubble-simple-symbolic.svg">scalable/actions/chat-bubble-simple-symbolic.svg</file>

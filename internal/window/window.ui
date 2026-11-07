@@ -47,6 +47,11 @@
                           <class name="glup-popover-content"/>
                         </style>
                         <child>
+                          <object class="GtkSearchEntry" id="newSessionSidebarSearchEntry">
+                            <property name="placeholder-text">Search projects…</property>
+                          </object>
+                        </child>
+                        <child>
                           <object class="GtkScrolledWindow">
                             <property name="hscrollbar-policy">never</property>
                             <property name="vscrollbar-policy">automatic</property>
@@ -54,7 +59,7 @@
                             <property name="max-content-height">260</property>
                             <property name="child">
                               <object class="GtkListBox" id="newSessionSidebarListBox">
-                                <property name="selection-mode">none</property>
+                                <property name="selection-mode">single</property>
                                 <property name="activate-on-single-click">true</property>
                                 <style>
                                   <class name="boxed-list"/>
@@ -147,6 +152,11 @@
                               <class name="glup-popover-content"/>
                             </style>
                             <child>
+                              <object class="GtkSearchEntry" id="newSessionTopSearchEntry">
+                                <property name="placeholder-text">Search projects…</property>
+                              </object>
+                            </child>
+                            <child>
                               <object class="GtkScrolledWindow">
                                 <property name="hscrollbar-policy">never</property>
                                 <property name="vscrollbar-policy">automatic</property>
@@ -154,7 +164,7 @@
                                 <property name="max-content-height">260</property>
                                 <property name="child">
                                   <object class="GtkListBox" id="newSessionTopListBox">
-                                    <property name="selection-mode">none</property>
+                                    <property name="selection-mode">single</property>
                                     <property name="activate-on-single-click">true</property>
                                     <style>
                                       <class name="boxed-list"/>
@@ -204,9 +214,50 @@
                       <object class="GtkStackPage">
                         <property name="name">title</property>
                         <property name="child">
-                          <object class="AdwWindowTitle" id="windowTitle">
-                            <property name="title">Gluppencode</property>
-                            <property name="subtitle">Select or create a session</property>
+                          <object class="GtkMenuButton" id="windowTitleBtn">
+                            <property name="halign">center</property>
+                            <property name="valign">center</property>
+                            <property name="sensitive">false</property>
+                            <property name="tooltip-text">Rename Session</property>
+                            <style>
+                              <class name="flat"/>
+                              <class name="glup-window-title-btn"/>
+                            </style>
+                            <property name="child">
+                              <object class="AdwWindowTitle" id="windowTitle">
+                                <property name="title">Gluppencode</property>
+                                <property name="subtitle">Select or create a session</property>
+                              </object>
+                            </property>
+                            <property name="popover">
+                              <object class="GtkPopover" id="renameSessionPopover">
+                                <property name="has-arrow">false</property>
+                                <property name="child">
+                                  <object class="GtkBox">
+                                    <property name="orientation">horizontal</property>
+                                    <property name="spacing">6</property>
+                                    <property name="width-request">340</property>
+                                    <style>
+                                      <class name="glup-popover-content"/>
+                                    </style>
+                                    <child>
+                                      <object class="GtkEntry" id="renameSessionEntry">
+                                        <property name="hexpand">true</property>
+                                        <property name="placeholder-text">Session name…</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkButton" id="renameSessionSaveBtn">
+                                        <property name="label">Rename</property>
+                                        <style>
+                                          <class name="suggested-action"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </property>
+                              </object>
+                            </property>
                           </object>
                         </property>
                       </object>
@@ -268,6 +319,15 @@
                   <object class="GtkButton" id="refreshBtn">
                     <property name="icon-name">refresh-symbolic</property>
                     <property name="tooltip-text">Refresh Sessions</property>
+                  </object>
+                </child>
+                <child type="end">
+                  <object class="GtkToggleButton" id="takeChargeBtn">
+                    <property name="icon-name">auto-mode-symbolic</property>
+                    <property name="tooltip-text">Take Charge: Off — click to auto-answer questions while away</property>
+                    <style>
+                      <class name="glup-take-charge-btn"/>
+                    </style>
                   </object>
                 </child>
               </object>

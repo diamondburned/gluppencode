@@ -1418,6 +1418,10 @@ func TestRevertEndpoints(t *testing.T) {
 	if capturedCompactReq == nil {
 		t.Fatal("CompactSession request not captured")
 	}
+	compactBody, _ := io.ReadAll(capturedCompactReq.Body)
+	if strings.TrimSpace(string(compactBody)) != "{}" {
+		t.Errorf("expected CompactSession body '{}', got %q", string(compactBody))
+	}
 
 	// BackgroundSession
 	if err := client.BackgroundSession(ctx, "ses_123"); err != nil {
@@ -1425,6 +1429,10 @@ func TestRevertEndpoints(t *testing.T) {
 	}
 	if capturedBackgroundReq == nil {
 		t.Fatal("BackgroundSession request not captured")
+	}
+	bgBody, _ := io.ReadAll(capturedBackgroundReq.Body)
+	if strings.TrimSpace(string(bgBody)) != "{}" {
+		t.Errorf("expected BackgroundSession body '{}', got %q", string(bgBody))
 	}
 }
 
@@ -2131,5 +2139,31 @@ func TestSessionCreatedEventAndIsRunning(t *testing.T) {
 	resumed.Time.Busy = 3000
 	if !resumed.IsRunning() {
 		t.Errorf("expected resumed session (Busy > Idle) to be running")
+	}
+
+	var patchedTitle string
+	var patchedPath string
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				patchedPath = req.URL.Path
+				if req.Method != http.MethodPatch {
+					t.Errorf("expected PATCH, got %s", req.Method)
+				}
+				var body map[string]string
+				if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+					t.Fatalf("decode RenameSession body: %v", err)
+				}
+				patchedTitle = body["title"]
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+			}),
+		},
+	}
+	if err := client.RenameSession(context.Background(), "ses_root_1", "Renamed Session Title"); err != nil {
+		t.Fatalf("RenameSession failed: %v", err)
+	}
+	if patchedPath != "/api/session/ses_root_1" || patchedTitle != "Renamed Session Title" {
+		t.Errorf("RenameSession sent (%q, %q), want (/api/session/ses_root_1, Renamed Session Title)", patchedPath, patchedTitle)
 	}
 }
