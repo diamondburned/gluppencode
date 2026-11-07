@@ -48,9 +48,13 @@ func loadPersistedState(path string) persistedState {
 	if st.ArchivedSessions == nil {
 		st.ArchivedSessions = make(map[string]bool)
 	}
-	if st.CollapsedProjects == nil {
-		st.CollapsedProjects = make(map[string]bool)
+	cleanCollapsed := make(map[string]bool, len(st.CollapsedProjects))
+	for dir, v := range st.CollapsedProjects {
+		if norm := normalizeProjectDir(dir); norm != "" && v {
+			cleanCollapsed[norm] = true
+		}
 	}
+	st.CollapsedProjects = cleanCollapsed
 	var cleanOrder []string
 	seen := make(map[string]bool, len(st.ProjectOrder))
 	for _, dir := range st.ProjectOrder {

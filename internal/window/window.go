@@ -1397,23 +1397,27 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 	if hBox == nil {
 		return nil
 	}
-	var rowPtr uintptr
+	hBoxPtr := hBox.Object.Native()
 	if row != nil {
-		rowPtr = row.Object.Native()
-		if !w.rowControllers[rowPtr] {
-			w.rowControllers[rowPtr] = true
-			rp := rowPtr
+		if !w.rowControllers[hBoxPtr] {
+			w.rowControllers[hBoxPtr] = true
+			hp := hBoxPtr
 			motion := gtk.NewEventControllerMotion()
 			motion.ConnectEnter(func(_, _ float64) {
-				w.hoveredRow[rp] = true
+				w.hoveredRow[hp] = true
 				w.updateSwitcherIndicators()
 			})
 			motion.ConnectLeave(func() {
-				delete(w.hoveredRow, rp)
+				delete(w.hoveredRow, hp)
 				w.updateSwitcherIndicators()
 			})
-			row.AddController(motion)
+			hBox.AddController(motion)
+		}
 
+		rowPtr := row.Object.Native()
+		if !w.rowControllers[rowPtr] {
+			w.rowControllers[rowPtr] = true
+			rp := rowPtr
 			dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
 			dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
 				row.AddCSSClass("glup-project-drop-target")
@@ -1459,7 +1463,7 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 			}
 			if box, ok := childBase.Cast().(*gtk.Box); ok && spinner != nil && label != nil && closeBtn != nil {
 				w.closeBtnSessID[closeBtn.Object.Native()] = sessID
-				return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: rowPtr}
+				return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
 			}
 		}
 	}
@@ -1498,7 +1502,7 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 
 	hBox.SetVAlign(gtk.AlignCenter)
 	hBox.Append(box)
-	return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: rowPtr}
+	return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
 }
 
 func updateRowShowMore(row *gtk.ListBoxRow, hiddenCount int, onExpand func()) {
@@ -1568,7 +1572,11 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 	outerBox.AddCSSClass("glup-sidebar-project-header")
 	outerBox.SetMarginStart(8)
 	outerBox.SetMarginEnd(8)
-	outerBox.SetMarginTop(6)
+	if includeSeparator {
+		outerBox.SetMarginTop(2)
+	} else {
+		outerBox.SetMarginTop(6)
+	}
 	outerBox.SetMarginBottom(2)
 
 	if includeSeparator {
@@ -2111,7 +2119,6 @@ func (w *Window) syncSwitcherIndicators() {
 			}
 			if rowIdx < len(visibleTabOrder) {
 				sessID := visibleTabOrder[rowIdx]
-				row.AddCSSClass("glup-sidebar-conversation-row")
 				if tab, ok := w.tabs[sessID]; ok {
 					rawDir := tab.main.session.Location.Directory
 					dir := normalizeProjectDir(rawDir)
@@ -2129,6 +2136,7 @@ func (w *Window) syncSwitcherIndicators() {
 
 					if collapsed {
 						updateRowShowMore(row, 0, nil)
+						row.RemoveCSSClass("glup-sidebar-conversation-row")
 						row.AddCSSClass("glup-sidebar-row-collapsed")
 						row.SetActivatable(false)
 						row.SetSelectable(false)
@@ -2137,6 +2145,7 @@ func (w *Window) syncSwitcherIndicators() {
 						}
 					} else {
 						row.RemoveCSSClass("glup-sidebar-row-collapsed")
+						row.AddCSSClass("glup-sidebar-conversation-row")
 						row.SetActivatable(true)
 						row.SetSelectable(true)
 						if rc := row.Child(); rc != nil {
@@ -2392,7 +2401,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	w.tabOrder = make([]string, 0, len(topSessions))
 
 	projCount := make(map[string]int)
-	var firstID string
+	var firstID, firstUncollapsedID string
 	for _, sess := range topSessions {
 		dir := normalizeProjectDir(sess.Location.Directory)
 		count := projCount[dir]
@@ -2400,6 +2409,9 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		if count < 5 || sess.ID == prevSelected || isRunning || w.expandedProjects[dir] {
 			if firstID == "" {
 				firstID = sess.ID
+			}
+			if firstUncollapsedID == "" && !w.collapsedProjects[dir] {
+				firstUncollapsedID = sess.ID
 			}
 			w.addSessionTab(sess)
 			w.tabOrder = append(w.tabOrder, sess.ID)
@@ -2413,7 +2425,11 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 
 	targetID := prevSelected
 	if _, ok := w.tabs[targetID]; !ok {
-		targetID = firstID
+		if firstUncollapsedID != "" {
+			targetID = firstUncollapsedID
+		} else {
+			targetID = firstID
+		}
 	}
 	w.populating = false
 	if targetID != "" {

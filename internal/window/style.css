@@ -70,18 +70,6 @@ sidebar .navigation-sidebar > .header > header.glup-sidebar-project-header,
 	border-radius: 6px;
 }
 
-sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed,
-sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:hover,
-sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:active,
-sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
-	min-height: 0;
-	margin: 0;
-	padding: 0;
-	border: none;
-	background-color: transparent;
-	box-shadow: none;
-}
-
 .glup-sidebar-close-btn {
 	min-width: 20px;
 	min-height: 20px;
@@ -175,11 +163,12 @@ sidebar .navigation-sidebar > row.glup-has-show-more:selected:active {
 	box-shadow: none;
 }
 
-sidebar .navigation-sidebar > row.glup-has-show-more:hover > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+sidebar .navigation-sidebar > row.glup-has-show-more > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:hover {
 	background-color: color-mix(in srgb, currentColor 7%, transparent);
 }
 
-sidebar .navigation-sidebar > row.glup-has-show-more:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+sidebar .navigation-sidebar > row.glup-has-show-more:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:hover,
+sidebar .navigation-sidebar > row.glup-has-show-more > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:active {
 	background-color: color-mix(in srgb, currentColor 16%, transparent);
 }
 
@@ -187,12 +176,29 @@ sidebar .navigation-sidebar > row.glup-has-show-more:selected > box.glup-sidebar
 	background-color: color-mix(in srgb, currentColor 10%, transparent);
 }
 
-sidebar .navigation-sidebar > row.glup-has-show-more:selected:hover > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+sidebar .navigation-sidebar > row.glup-has-show-more:selected > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:hover {
 	background-color: color-mix(in srgb, currentColor 13%, transparent);
 }
 
-sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box {
+sidebar .navigation-sidebar > row.glup-has-show-more:selected:active > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:hover,
+sidebar .navigation-sidebar > row.glup-has-show-more:selected > box.glup-sidebar-row-vbox > box.glup-sidebar-conversation-box:active {
 	background-color: color-mix(in srgb, currentColor 19%, transparent);
+}
+
+sidebar .navigation-sidebar > row.glup-sidebar-conversation-row.glup-sidebar-row-collapsed,
+sidebar .navigation-sidebar > row.glup-sidebar-conversation-row.glup-sidebar-row-collapsed:hover,
+sidebar .navigation-sidebar > row.glup-sidebar-conversation-row.glup-sidebar-row-collapsed:active,
+sidebar .navigation-sidebar > row.glup-sidebar-conversation-row.glup-sidebar-row-collapsed:selected,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:hover,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:active,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
+	min-height: 0;
+	margin: 0;
+	padding: 0;
+	border: none;
+	background-color: transparent;
+	box-shadow: none;
 }
 
 .glup-user-images {
