@@ -1,6 +1,7 @@
 package window
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -10,6 +11,7 @@ import (
 	"unicode/utf16"
 	"unsafe"
 
+	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
@@ -828,5 +830,386 @@ func TestFormatIntWithCommas(t *testing.T) {
 		if got := formatIntWithCommas(tt.in); got != tt.want {
 			t.Errorf("formatIntWithCommas(%d) = %q, want %q", tt.in, got, tt.want)
 		}
+	}
+}
+
+func TestIsBlockingBackgroundableTool(t *testing.T) {
+	tests := []struct {
+		name   string
+		tool   string
+		status string
+		input  any
+		want   bool
+	}{
+		{
+			name:   "foreground running shell",
+			tool:   "shell",
+			status: "running",
+			input:  map[string]any{"command": "sleep 10"},
+			want:   true,
+		},
+		{
+			name:   "foreground running subagent",
+			tool:   "subagent",
+			status: "running",
+			input:  map[string]any{"agent": "explore", "prompt": "check files"},
+			want:   true,
+		},
+		{
+			name:   "backgrounded shell is not blocking",
+			tool:   "shell",
+			status: "running",
+			input:  map[string]any{"command": "sleep 10", "background": true},
+			want:   false,
+		},
+		{
+			name:   "completed shell is not blocking",
+			tool:   "shell",
+			status: "completed",
+			input:  map[string]any{"command": "sleep 10"},
+			want:   false,
+		},
+		{
+			name:   "streaming input before call is not blocking",
+			tool:   "shell",
+			status: "streaming",
+			input:  nil,
+			want:   false,
+		},
+		{
+			name:   "non-backgroundable tool is not blocking",
+			tool:   "read",
+			status: "running",
+			input:  map[string]any{"path": "/tmp/a"},
+			want:   false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isBlockingBackgroundableTool(tt.tool, tt.status, tt.input); got != tt.want {
+				t.Errorf("isBlockingBackgroundableTool(%q, %q, %v) = %v, want %v", tt.tool, tt.status, tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBlockingSessionID(t *testing.T) {
+	mainConv := &convTimeline{
+		session:       opencode.Session{ID: "ses_main"},
+		active:        true,
+		blockingTools: map[string]bool{"tool_1": true},
+	}
+	subConv := &convTimeline{
+		session:       opencode.Session{ID: "ses_sub"},
+		active:        true,
+		blockingTools: map[string]bool{},
+	}
+	tab := &sessionTab{
+		main:         mainConv,
+		subTimelines: map[string]*convTimeline{"ses_sub": subConv},
+	}
+
+	if got := tab.blockingSessionID(); got != "ses_main" {
+		t.Fatalf("blockingSessionID() = %q, want ses_main", got)
+	}
+
+	// Viewing subagent while main is blocking still resolves ses_main.
+	tab.activeSubID = "ses_sub"
+	if got := tab.blockingSessionID(); got != "ses_main" {
+		t.Fatalf("blockingSessionID() while viewing subagent = %q, want ses_main", got)
+	}
+
+	// If subagent itself is blocking on a backgroundable tool, activeConv takes precedence.
+	subConv.blockingTools["tool_sub"] = true
+	if got := tab.blockingSessionID(); got != "ses_sub" {
+		t.Fatalf("blockingSessionID() with blocking subagent = %q, want ses_sub", got)
+	}
+
+	// When inactive, not blocking.
+	mainConv.active = false
+	subConv.active = false
+	if got := tab.blockingSessionID(); got != "" {
+		t.Fatalf("blockingSessionID() when inactive = %q, want empty", got)
+	}
+}
+
+func TestFormatQuestionToolInput(t *testing.T) {
+	input := map[string]any{
+		"questions": []any{
+			map[string]any{
+				"header":   "Database",
+				"question": "Which database should we use?",
+				"options": []any{
+					map[string]any{"label": "PostgreSQL (Recommended)", "description": "Relational DB"},
+					map[string]any{"label": "SQLite", "description": "Embedded DB"},
+				},
+			},
+		},
+	}
+
+	sub, details := formatQuestionToolInput(input)
+	if sub != "Which database should we use?" {
+		t.Errorf("subtitle = %q, want 'Which database should we use?'", sub)
+	}
+	if !strings.Contains(details, "1. [Database] Which database should we use?") ||
+		!strings.Contains(details, "• PostgreSQL (Recommended) — Relational DB") {
+		t.Errorf("unexpected details: %q", details)
+	}
+
+	multiInput := map[string]any{
+		"questions": []any{
+			map[string]any{"header": "DB", "question": "Q1"},
+			map[string]any{"header": "Cache", "question": "Q2"},
+		},
+	}
+	subMulti, _ := formatQuestionToolInput(multiInput)
+	if subMulti != "DB, Cache" {
+		t.Errorf("multi subtitle = %q, want 'DB, Cache'", subMulti)
+	}
+}
+
+func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK cannot be initialized")
+	}
+
+	form := opencode.FormInfo{
+		ID:        "frm_test_1",
+		SessionID: "ses_bg",
+		Title:     "Questions",
+		Fields: []opencode.FormField{
+			{
+				Key:         "q0",
+				Title:       "Database",
+				Description: "Which database should we use?",
+				Type:        "string",
+				Options: []opencode.FormOption{
+					{Value: "PostgreSQL", Label: "PostgreSQL", Description: "Relational"},
+					{Value: "SQLite", Label: "SQLite", Description: "Embedded"},
+				},
+				Custom: true,
+			},
+			{
+				Key:         "q1",
+				Title:       "Features",
+				Description: "Select features",
+				Type:        "multiselect",
+				Options: []opencode.FormOption{
+					{Value: "Auth", Label: "Auth"},
+					{Value: "Metrics", Label: "Metrics"},
+				},
+				Custom: true,
+			},
+		},
+	}
+
+	var submitted map[string]any
+	var dismissed bool
+	qw := NewQuestionFormWidget(
+		form,
+		func(ans map[string]any) { submitted = ans },
+		func() { dismissed = true },
+	)
+
+	// Initially q0 has first option selected, but q1 (multiselect, required) has none selected -> invalid.
+	if _, ok := qw.CollectAnswers(); ok {
+		t.Fatal("expected CollectAnswers to be invalid before selecting a multiselect option")
+	}
+	if qw.submitBtn.Sensitive() {
+		t.Fatal("expected submitBtn to be insensitive when required multiselect is empty")
+	}
+
+	// Select an option in q1 and type a custom answer in q0.
+	qw.fields[1].options[0].btn.SetActive(true)
+	qw.fields[1].customEntry.SetText("Tracing")
+	qw.fields[0].customEntry.SetText("CockroachDB")
+
+	ans, ok := qw.CollectAnswers()
+	if !ok {
+		t.Fatal("expected CollectAnswers to succeed after filling fields")
+	}
+	if ans["q0"] != "CockroachDB" {
+		t.Errorf("ans[q0] = %v, want CockroachDB", ans["q0"])
+	}
+	q1Vals, _ := ans["q1"].([]string)
+	if !slices.Equal(q1Vals, []string{"Auth", "Tracing"}) {
+		t.Errorf("ans[q1] = %v, want [Auth, Tracing]", q1Vals)
+	}
+
+	if !qw.Submit() {
+		t.Fatal("expected qw.Submit() to succeed")
+	}
+	if submitted == nil || submitted["q0"] != "CockroachDB" {
+		t.Errorf("expected onSubmit to be called with answers, got %+v", submitted)
+	}
+
+	qw.SetBusy(false)
+	qw.Dismiss()
+	if !dismissed {
+		t.Errorf("expected onDismiss to be called")
+	}
+
+	// Verify NeedsAttention behavior on background tab:
+	// 1. setConvActive(true), reasoning delta, and tool call must NOT set NeedsAttention.
+	// 2. text delta or form.created MUST set NeedsAttention.
+	vs := adw.NewViewStack()
+	win := &Window{
+		viewStack:   vs,
+		stopBtn:     gtk.NewButton(),
+		tabs:        make(map[string]*sessionTab),
+		childToRoot: make(map[string]string),
+	}
+	fgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_fg", "Foreground")
+	bgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_bg", "Background")
+	win.tabs["ses_fg"] = &sessionTab{
+		page: fgPage,
+		main: &convTimeline{
+			session:       opencode.Session{ID: "ses_fg", Title: "Foreground"},
+			formWidgets:   make(map[string]*QuestionFormWidget),
+			blockingTools: make(map[string]bool),
+			toolNames:     make(map[string]string),
+		},
+	}
+	bgTab := &sessionTab{
+		page: bgPage,
+		main: &convTimeline{
+			session:       opencode.Session{ID: "ses_bg", Title: "Background"},
+			formWidgets:   make(map[string]*QuestionFormWidget),
+			blockingTools: make(map[string]bool),
+			toolNames:     make(map[string]string),
+		},
+	}
+	win.tabs["ses_bg"] = bgTab
+	vs.SetVisibleChildName("ses_fg")
+
+	win.setConvActive("ses_bg", true)
+	if bgTab.page.NeedsAttention() {
+		t.Fatal("setConvActive(true) should not set NeedsAttention before text or question")
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "session.reasoning.delta",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","ordinal":0,"delta":"thinking..."}`),
+	})
+	if bgTab.page.NeedsAttention() {
+		t.Fatal("session.reasoning.delta should not set NeedsAttention")
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.called",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","id":"t1","name":"read","input":{"path":"a.go"}}`),
+	})
+	if bgTab.page.NeedsAttention() {
+		t.Fatal("session.tool.called should not set NeedsAttention")
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "session.text.delta",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","ordinal":1,"delta":"Hello user"}`),
+	})
+	if !bgTab.page.NeedsAttention() {
+		t.Fatal("session.text.delta with non-empty text should set NeedsAttention on background tab")
+	}
+
+	// Reset and test form.created
+	bgTab.page.SetNeedsAttention(false)
+	bgTab.main.loaded = true
+	win.handleEvent(opencode.Event{
+		Type: "form.created",
+		Data: json.RawMessage(`{"form":{"id":"frm_99","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"Choice","description":"Pick one","type":"string","options":[{"value":"A","label":"A"}]}]}}`),
+	})
+	if !bgTab.page.NeedsAttention() {
+		t.Fatal("form.created should set NeedsAttention on background tab")
+	}
+	if len(bgTab.main.pendingForms) != 1 || bgTab.main.formWidgets["frm_99"] == nil {
+		t.Fatalf("expected pending form frm_99 to be added to bgTab, got %+v", bgTab.main.pendingForms)
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "form.replied",
+		Data: json.RawMessage(`{"id":"frm_99","sessionID":"ses_bg","answer":{"q0":"A"}}`),
+	})
+	if len(bgTab.main.pendingForms) != 0 || bgTab.main.formWidgets["frm_99"] != nil {
+		t.Fatalf("expected pending form frm_99 to be removed after form.replied, got %+v", bgTab.main.pendingForms)
+	}
+}
+
+func TestSystemNoticeAndSwitchMessages(t *testing.T) {
+	restartMsg := opencode.Message{
+		ID:          "msg_restart",
+		Type:        "synthetic",
+		Description: "Continuing after restart",
+		Text:        "The server restarted while you were working. Continue from where you left off.",
+		Metadata:    map[string]any{"notice": "restart"},
+	}
+	if isSubagentOrShellSynthetic(restartMsg) {
+		t.Fatal("restart synthetic message should not be classified as subagent/shell completion")
+	}
+	icon, title, sub := formatSystemNoticeSummary(restartMsg)
+	if icon != "refresh-symbolic" || title != "Continuing after restart" || sub != "" {
+		t.Errorf("restart summary = (%q, %q, %q), want (refresh-symbolic, Continuing after restart, '')", icon, title, sub)
+	}
+
+	instrMsg := opencode.Message{
+		ID:          "msg_instr",
+		Type:        "system",
+		Description: "Instructions updated: core/codemode, core/mcp-guidance, core/skill-guidance",
+		Text:        "Updated instructions body",
+		Metadata: map[string]any{
+			"notice":             "instructions",
+			"instructionSources": []any{"core/codemode", "core/mcp-guidance", "core/skill-guidance"},
+		},
+	}
+	icon, title, sub = formatSystemNoticeSummary(instrMsg)
+	if icon != "channel-broadcast-symbolic" || title != "Instructions updated:" || sub != "core/codemode, core/mcp-guidance, core/skill-guidance" {
+		t.Errorf("instructions summary = (%q, %q, %q)", icon, title, sub)
+	}
+
+	subagentMsg := opencode.Message{
+		ID:          "msg_sub",
+		Type:        "synthetic",
+		Description: "Explore codebase",
+		Text:        "<subagent sessionID=\"ses_child\" state=\"completed\">\ndone\n</subagent>",
+		Metadata:    map[string]any{"source": "subagent", "childID": "ses_child"},
+	}
+	if !isSubagentOrShellSynthetic(subagentMsg) {
+		t.Fatal("subagent synthetic message should be classified as subagent/shell completion")
+	}
+
+	skillMsg := opencode.Message{
+		ID:   "msg_skill",
+		Type: "skill",
+		Name: "oklch-skill",
+		Text: "Skill instructions...",
+	}
+	icon, title, sub = formatSystemNoticeSummary(skillMsg)
+	if icon != "arrow-forward-symbolic" || title != "Skill" || sub != "oklch-skill" {
+		t.Errorf("skill summary = (%q, %q, %q)", icon, title, sub)
+	}
+
+	if !gtk.InitCheck() {
+		return
+	}
+	vs := adw.NewViewStack()
+	win := &Window{
+		viewStack:   vs,
+		tabs:        make(map[string]*sessionTab),
+		childToRoot: make(map[string]string),
+	}
+	tab := win.addSessionTab(opencode.Session{ID: "ses_1", Title: "Test"})
+
+	if w := win.buildMessageWidget(tab, tab.main, restartMsg); w == nil {
+		t.Fatal("expected SystemNoticeWidget for restartMsg")
+	} else if _, ok := w.(*SystemNoticeWidget); !ok {
+		t.Fatalf("expected *SystemNoticeWidget for restartMsg, got %T", w)
+	}
+	if w := win.buildMessageWidget(tab, tab.main, instrMsg); w == nil {
+		t.Fatal("expected SystemNoticeWidget for instrMsg")
+	}
+	if w := win.buildMessageWidget(tab, tab.main, subagentMsg); w == nil {
+		t.Fatal("expected SyntheticSubagentWidget for subagentMsg")
+	} else if _, ok := w.(*SyntheticSubagentWidget); !ok {
+		t.Fatalf("expected *SyntheticSubagentWidget for subagentMsg, got %T", w)
 	}
 }

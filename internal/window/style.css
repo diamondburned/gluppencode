@@ -595,32 +595,6 @@ GtkSourceAssistant.completion box.details * {
 	margin: 0;
 }
 
-.glup-horiz-tab-strip {
-	padding: 2px 4px;
-}
-
-.glup-horiz-tab-btn {
-	min-width: 140px;
-	min-height: 32px;
-	padding: 2px 8px;
-	border-radius: 6px;
-	font-weight: 500;
-}
-
-.glup-horiz-tab-btn.glup-horiz-tab-active {
-	background-color: color-mix(in srgb, currentColor 10%, transparent);
-	font-weight: 600;
-}
-
-.glup-horiz-tab-proj {
-	font-size: 0.8em;
-	opacity: 0.65;
-}
-
-.glup-horiz-tab-title {
-	font-size: 0.9em;
-}
-
 .glup-status-bar {
 	padding: 8px 18px;
 	border-top: 1px solid alpha(@borders, 0.5);
@@ -646,6 +620,21 @@ GtkSourceAssistant.completion box.details * {
 	color: #10b981;
 	border: 1px solid alpha(#10b981, 0.35);
 	font-weight: 600;
+}
+
+button.glup-status-background {
+	background-color: alpha(@warning_bg_color, 0.18);
+	color: @warning_color;
+	border: 1px solid alpha(@warning_color, 0.4);
+	font-weight: 600;
+	font-size: 0.82em;
+	min-height: 18px;
+	padding: 4px 10px;
+	border-radius: 6px;
+}
+
+button.glup-status-background:hover {
+	background-color: alpha(@warning_bg_color, 0.28);
 }
 
 .glup-status-model {
@@ -750,6 +739,12 @@ GtkSourceAssistant.completion box.details * {
 	font-weight: 500;
 }
 
+.glup-switcher-prefix {
+	min-width: 14px;
+	min-height: 14px;
+	margin-right: 4px;
+}
+
 .glup-switcher-suffix {
 	margin-left: 6px;
 }
@@ -845,4 +840,62 @@ GtkSourceAssistant.completion box.details * {
 
 .glup-search-list row:selected .dim-label {
 	opacity: 0.8;
+}
+
+.glup-question-card {
+	background-color: var(--card-bg-color, @card_bg_color);
+	color: var(--card-fg-color, @card_fg_color);
+	border: 1px solid alpha(@accent_color, 0.35);
+	border-radius: 12px;
+	padding: 14px 16px;
+	margin: 10px 0;
+	box-shadow: 0 1px 4px alpha(#000000, 0.08);
+}
+
+.glup-question-icon {
+	color: @accent_color;
+}
+
+.glup-question-card-title {
+	font-weight: 700;
+	font-size: 0.96em;
+}
+
+.glup-question-field {
+	padding: 8px 10px;
+	border-radius: 8px;
+	background-color: alpha(@theme_fg_color, 0.035);
+	border: 1px solid alpha(@borders, 0.4);
+}
+
+.glup-question-header-chip {
+	font-size: 0.78em;
+	font-weight: 700;
+	color: @accent_color;
+	background-color: alpha(@accent_bg_color, 0.16);
+	border: 1px solid alpha(@accent_color, 0.3);
+	border-radius: 6px;
+	padding: 2px 8px;
+}
+
+.glup-question-prompt {
+	font-weight: 600;
+	font-size: 0.94em;
+}
+
+.glup-question-option-row {
+	padding: 4px 6px;
+	border-radius: 6px;
+}
+
+.glup-question-option-row:hover {
+	background-color: alpha(@theme_fg_color, 0.04);
+}
+
+.glup-question-opt-label {
+	font-weight: 500;
+}
+
+.glup-question-opt-desc {
+	font-size: 0.86em;
 }

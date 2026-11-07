@@ -320,6 +320,8 @@ func formatToolTitle(name string) string {
 		return "Execute"
 	case "subagent", "task":
 		return "Subagent"
+	case "question":
+		return "Question"
 	default:
 		if len(name) > 0 {
 			return strings.ToUpper(name[:1]) + name[1:]
@@ -342,6 +344,8 @@ func setInitialToolIcon(icon *gtk.Image, name string) {
 		icon.SetFromIconName("system-run-symbolic")
 	case "subagent", "task":
 		icon.SetFromIconName("system-users-symbolic")
+	case "question":
+		icon.SetFromIconName("forum-symbolic")
 	default:
 		icon.SetFromIconName("utilities-terminal-symbolic")
 	}
@@ -547,6 +551,18 @@ func (t *ToolWidget) SetInput(raw any) {
 			t.inputView.SetVisible(false)
 		}
 
+	case "question":
+		t.toolIcon.SetFromIconName("forum-symbolic")
+		t.titleLabel.SetLabel("Question")
+		sub, details := formatQuestionToolInput(m)
+		t.subtitleLabel.SetLabel(sub)
+		if details != "" {
+			t.inputBuf.SetText(details)
+			t.inputView.SetVisible(true)
+		} else {
+			t.inputView.SetVisible(false)
+		}
+
 	default:
 		t.titleLabel.SetLabel(formatToolTitle(t.toolName))
 		if summary := summarizeToolInput(m); summary != "" {
@@ -660,6 +676,82 @@ func summarizeToolInput(m map[string]any) string {
 		}
 	}
 	return ""
+}
+
+func formatQuestionToolInput(m map[string]any) (subtitle, details string) {
+	if m == nil {
+		return "", ""
+	}
+	rawQs, ok := m["questions"].([]any)
+	if !ok || len(rawQs) == 0 {
+		return "", ""
+	}
+
+	var headers []string
+	var firstQuestion string
+	var sb strings.Builder
+
+	for i, item := range rawQs {
+		qm, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		hdr, _ := qm["header"].(string)
+		qText, _ := qm["question"].(string)
+		hdr = strings.TrimSpace(hdr)
+		qText = strings.TrimSpace(qText)
+		if hdr != "" {
+			headers = append(headers, hdr)
+		}
+		if firstQuestion == "" && qText != "" {
+			firstQuestion = qText
+		}
+
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n")
+		}
+		if hdr != "" && qText != "" {
+			fmt.Fprintf(&sb, "%d. [%s] %s", i+1, hdr, qText)
+		} else if qText != "" {
+			fmt.Fprintf(&sb, "%d. %s", i+1, qText)
+		} else if hdr != "" {
+			fmt.Fprintf(&sb, "%d. %s", i+1, hdr)
+		}
+
+		if opts, ok := qm["options"].([]any); ok {
+			for _, rawOpt := range opts {
+				om, ok := rawOpt.(map[string]any)
+				if !ok {
+					continue
+				}
+				lbl, _ := om["label"].(string)
+				desc, _ := om["description"].(string)
+				lbl = strings.TrimSpace(lbl)
+				desc = strings.TrimSpace(desc)
+				if lbl == "" {
+					continue
+				}
+				if desc != "" {
+					fmt.Fprintf(&sb, "\n   • %s — %s", lbl, desc)
+				} else {
+					fmt.Fprintf(&sb, "\n   • %s", lbl)
+				}
+			}
+		}
+	}
+
+	if len(rawQs) == 1 && firstQuestion != "" {
+		subtitle = strings.ReplaceAll(firstQuestion, "\n", " ")
+		if runes := []rune(subtitle); len(runes) > 80 {
+			subtitle = string(runes[:80]) + "…"
+		}
+	} else if len(headers) > 0 {
+		subtitle = strings.Join(headers, ", ")
+	} else if len(rawQs) > 1 {
+		subtitle = fmt.Sprintf("%d questions", len(rawQs))
+	}
+
+	return subtitle, sb.String()
 }
 
 // AppendInputDelta appends a streaming delta to the tool's input view.
@@ -1116,6 +1208,160 @@ func NewSyntheticSubagentWidget(ctx context.Context, msg opencode.Message, onOpe
 	}
 }
 
+// isSubagentOrShellSynthetic reports whether a synthetic message represents a completed
+// background subagent or shell job rather than a general system notice.
+func isSubagentOrShellSynthetic(msg opencode.Message) bool {
+	if msg.Metadata != nil {
+		if src, _ := msg.Metadata["source"].(string); src == "subagent" || src == "shell" {
+			return true
+		}
+		if c, _ := msg.Metadata["childID"].(string); c != "" {
+			return true
+		}
+		if s, _ := msg.Metadata["shellID"].(string); s != "" {
+			return true
+		}
+	}
+	trimmed := strings.TrimSpace(msg.Text)
+	return strings.HasPrefix(trimmed, "<subagent") || strings.HasPrefix(trimmed, "<shell")
+}
+
+// SystemNoticeWidget renders an inline system/synthetic/skill notice in the conversation timeline
+// (e.g. "Continuing after restart", "Instructions updated: core/codemode, ...").
+type SystemNoticeWidget struct {
+	*gtk.Box
+	expander *gtk.Expander
+}
+
+func formatSystemNoticeSummary(msg opencode.Message) (iconName, title, subtitle string) {
+	iconName = "channel-broadcast-symbolic"
+	if msg.Type == "skill" {
+		iconName = "arrow-forward-symbolic"
+		skillName := strings.TrimSpace(msg.Name)
+		if skillName == "" {
+			skillName = strings.TrimSpace(msg.Skill)
+		}
+		if skillName != "" {
+			return iconName, "Skill", skillName
+		}
+		return iconName, "Skill", ""
+	}
+
+	noticeKind, _ := msg.Metadata["notice"].(string)
+	if noticeKind == "restart" {
+		iconName = "refresh-symbolic"
+	}
+
+	desc := strings.TrimSpace(msg.Description)
+	if desc == "" {
+		if noticeKind == "restart" {
+			desc = "Continuing after restart"
+		} else if msg.Type == "system" || noticeKind == "instructions" {
+			var sources []string
+			if rawSrcs, ok := msg.Metadata["instructionSources"].([]any); ok {
+				for _, s := range rawSrcs {
+					if str, ok := s.(string); ok && strings.TrimSpace(str) != "" {
+						sources = append(sources, strings.TrimSpace(str))
+					}
+				}
+			}
+			if len(sources) > 0 {
+				desc = "Instructions updated: " + strings.Join(sources, ", ")
+			} else {
+				desc = "Instructions updated"
+			}
+		} else if line := strings.TrimSpace(strings.SplitN(strings.TrimSpace(msg.Text), "\n", 2)[0]); line != "" {
+			desc = line
+		} else {
+			desc = "System notice"
+		}
+	}
+
+	if strings.Contains(strings.ToLower(desc), "restart") {
+		iconName = "refresh-symbolic"
+	}
+
+	if prefix, rest, ok := strings.Cut(desc, ":"); ok && strings.TrimSpace(rest) != "" {
+		return iconName, strings.TrimSpace(prefix) + ":", strings.TrimSpace(rest)
+	}
+	return iconName, desc, ""
+}
+
+// NewSystemNoticeWidget creates an inline notice widget for a system, general synthetic, or skill message.
+func NewSystemNoticeWidget(ctx context.Context, msg opencode.Message) *SystemNoticeWidget {
+	root := gtk.NewBox(gtk.OrientationVertical, 2)
+	root.AddCSSClass("glup-tool-inline")
+	root.AddCSSClass("glup-system-notice")
+
+	iconName, titleText, subtitleText := formatSystemNoticeSummary(msg)
+
+	summaryRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	summaryRow.SetHExpand(true)
+
+	icon := gtk.NewImageFromIconName(iconName)
+	icon.AddCSSClass("glup-tool-icon")
+	icon.SetVAlign(gtk.AlignCenter)
+	summaryRow.Append(icon)
+
+	titleLbl := gtk.NewLabel(titleText)
+	titleLbl.AddCSSClass("glup-tool-title")
+	titleLbl.SetXAlign(0)
+	titleLbl.SetVAlign(gtk.AlignCenter)
+	summaryRow.Append(titleLbl)
+
+	if subtitleText != "" {
+		subLbl := gtk.NewLabel(subtitleText)
+		subLbl.AddCSSClass("glup-tool-subtitle")
+		subLbl.SetHExpand(true)
+		subLbl.SetXAlign(0)
+		subLbl.SetVAlign(gtk.AlignCenter)
+		subLbl.SetEllipsize(pango.EllipsizeEnd)
+		summaryRow.Append(subLbl)
+	}
+
+	body := strings.TrimSpace(msg.Text)
+	if body == "" || body == titleText {
+		summaryRow.SetMarginStart(4)
+		root.Append(summaryRow)
+		return &SystemNoticeWidget{Box: root}
+	}
+
+	expander := gtk.NewExpander("")
+	expander.AddCSSClass("glup-tool-expander")
+	expander.SetHExpand(true)
+	expander.SetVAlign(gtk.AlignCenter)
+	expander.SetLabelWidget(summaryRow)
+	root.Append(expander)
+
+	bodyBox := gtk.NewBox(gtk.OrientationVertical, 4)
+	bodyBox.AddCSSClass("glup-tool-body")
+	bodyBox.SetMarginTop(4)
+	bodyBox.SetVisible(false)
+
+	tv := gtk.NewTextView()
+	tv.SetEditable(false)
+	tv.SetCursorVisible(false)
+	tv.SetMonospace(true)
+	tv.SetWrapMode(gtk.WrapWordChar)
+	tv.Buffer().SetText(body)
+
+	scroll := gtk.NewScrolledWindow()
+	scroll.SetMaxContentHeight(220)
+	scroll.SetPropagateNaturalHeight(true)
+	scroll.SetChild(tv)
+	bodyBox.Append(scroll)
+
+	expander.NotifyProperty("expanded", func() {
+		bodyBox.SetVisible(expander.Expanded())
+	})
+	root.Append(bodyBox)
+
+	return &SystemNoticeWidget{
+		Box:      root,
+		expander: expander,
+	}
+}
+
 // AgentSwitchedWidget renders a single-line subtle notice when the agent is changed.
 type AgentSwitchedWidget struct {
 	*gtk.Box
@@ -1132,6 +1378,40 @@ func NewAgentSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
 	} else {
 		text = fmt.Sprintf("Agent: %s", formatAgentDisplayName(msg.Agent))
 	}
+
+	lbl := gtk.NewLabel(text)
+	lbl.SetXAlign(0)
+	root.Append(lbl)
+
+	return &AgentSwitchedWidget{Box: root}
+}
+
+// NewModelSwitchedWidget creates a subtle notice indicating a model switch.
+func NewModelSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
+	root := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	root.AddCSSClass("glup-timeline-notice")
+
+	var text string
+	if msg.PreviousModel != nil && msg.PreviousModel.ID != "" {
+		text = fmt.Sprintf("Switched model from %s to %s", msg.PreviousModel.String(), msg.Model.String())
+	} else {
+		text = fmt.Sprintf("Switched model to %s", msg.Model.String())
+	}
+
+	lbl := gtk.NewLabel(text)
+	lbl.SetXAlign(0)
+	root.Append(lbl)
+
+	return &AgentSwitchedWidget{Box: root}
+}
+
+// NewLocationSwitchedWidget creates a subtle notice indicating a session directory move.
+func NewLocationSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
+	root := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	root.AddCSSClass("glup-timeline-notice")
+
+	dir := strings.TrimSpace(msg.Location.Directory)
+	text := fmt.Sprintf("Moved to %s", shortDir(dir))
 
 	lbl := gtk.NewLabel(text)
 	lbl.SetXAlign(0)
@@ -1249,4 +1529,333 @@ func (b *RevertBannerWidget) Update(revertedCount int, diff string) {
 		b.diffBadge.SetVisible(false)
 		b.diffExpander.SetVisible(false)
 	}
+}
+
+type questionOptionState struct {
+	value string
+	btn   *gtk.CheckButton
+}
+
+type questionFieldState struct {
+	field       opencode.FormField
+	options     []questionOptionState
+	customCheck *gtk.CheckButton
+	customEntry *gtk.Entry
+}
+
+// QuestionFormWidget renders an interactive OpenCode V2 question / form card.
+type QuestionFormWidget struct {
+	*gtk.Box
+	FormID     string
+	fields     []questionFieldState
+	submitBtn  *gtk.Button
+	dismissBtn *gtk.Button
+	onSubmit   func(map[string]any)
+	onDismiss  func()
+}
+
+// NewQuestionFormWidget creates an interactive card for answering or dismissing a FormInfo.
+func NewQuestionFormWidget(
+	form opencode.FormInfo,
+	onSubmit func(map[string]any),
+	onDismiss func(),
+) *QuestionFormWidget {
+	root := gtk.NewBox(gtk.OrientationVertical, 10)
+	root.AddCSSClass("glup-question-card")
+
+	hdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	hdr.SetVAlign(gtk.AlignCenter)
+
+	icon := gtk.NewImageFromIconName("forum-symbolic")
+	icon.AddCSSClass("glup-question-icon")
+	hdr.Append(icon)
+
+	cardTitle := strings.TrimSpace(form.Title)
+	if cardTitle == "" {
+		cardTitle = "Questions"
+	}
+	titleLbl := gtk.NewLabel(cardTitle)
+	titleLbl.AddCSSClass("glup-question-card-title")
+	titleLbl.SetXAlign(0)
+	titleLbl.SetHExpand(true)
+	hdr.Append(titleLbl)
+
+	root.Append(hdr)
+
+	if desc := strings.TrimSpace(form.Description); desc != "" {
+		descLbl := gtk.NewLabel(desc)
+		descLbl.AddCSSClass("dim-label")
+		descLbl.SetXAlign(0)
+		descLbl.SetWrap(true)
+		descLbl.SetWrapMode(pango.WrapWordChar)
+		root.Append(descLbl)
+	}
+
+	qw := &QuestionFormWidget{
+		Box:       root,
+		FormID:    form.ID,
+		onSubmit:  onSubmit,
+		onDismiss: onDismiss,
+	}
+
+	for _, f := range form.Fields {
+		fieldBox := gtk.NewBox(gtk.OrientationVertical, 6)
+		fieldBox.AddCSSClass("glup-question-field")
+
+		fHdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
+		fHdr.SetVAlign(gtk.AlignCenter)
+		hasHeader := false
+
+		if hdrText := strings.TrimSpace(f.Title); hdrText != "" {
+			chip := gtk.NewLabel(hdrText)
+			chip.AddCSSClass("glup-question-header-chip")
+			chip.SetXAlign(0)
+			fHdr.Append(chip)
+			hasHeader = true
+		}
+		if f.Type == "multiselect" {
+			multiLbl := gtk.NewLabel("Select all that apply")
+			multiLbl.AddCSSClass("dim-label")
+			multiLbl.AddCSSClass("caption")
+			fHdr.Append(multiLbl)
+			hasHeader = true
+		}
+		if hasHeader {
+			fieldBox.Append(fHdr)
+		}
+
+		if qText := strings.TrimSpace(f.Description); qText != "" {
+			qLbl := gtk.NewLabel(qText)
+			qLbl.AddCSSClass("glup-question-prompt")
+			qLbl.SetXAlign(0)
+			qLbl.SetWrap(true)
+			qLbl.SetWrapMode(pango.WrapWordChar)
+			qLbl.SetSelectable(true)
+			fieldBox.Append(qLbl)
+		}
+
+		fs := questionFieldState{field: f}
+		isMulti := f.Type == "multiselect"
+		var groupLeader *gtk.CheckButton
+
+		optsBox := gtk.NewBox(gtk.OrientationVertical, 4)
+		for idx, opt := range f.Options {
+			val := opt.Value
+			if val == "" {
+				val = opt.Label
+			}
+			lblText := opt.Label
+			if lblText == "" {
+				lblText = val
+			}
+
+			chk := gtk.NewCheckButton()
+			if !isMulti {
+				if groupLeader == nil {
+					groupLeader = chk
+				} else {
+					chk.SetGroup(groupLeader)
+				}
+				if idx == 0 {
+					chk.SetActive(true)
+				}
+			}
+
+			optContent := gtk.NewBox(gtk.OrientationVertical, 2)
+			optContent.SetHExpand(true)
+			optLbl := gtk.NewLabel(lblText)
+			optLbl.AddCSSClass("glup-question-opt-label")
+			optLbl.SetXAlign(0)
+			optLbl.SetWrap(true)
+			optLbl.SetWrapMode(pango.WrapWordChar)
+			optContent.Append(optLbl)
+
+			if optDesc := strings.TrimSpace(opt.Description); optDesc != "" {
+				dLbl := gtk.NewLabel(optDesc)
+				dLbl.AddCSSClass("glup-question-opt-desc")
+				dLbl.AddCSSClass("dim-label")
+				dLbl.SetXAlign(0)
+				dLbl.SetWrap(true)
+				dLbl.SetWrapMode(pango.WrapWordChar)
+				optContent.Append(dLbl)
+			}
+
+			chk.SetChild(optContent)
+			chk.AddCSSClass("glup-question-option-row")
+			chk.ConnectToggled(func() {
+				qw.syncValidState()
+			})
+			optsBox.Append(chk)
+
+			fs.options = append(fs.options, questionOptionState{
+				value: val,
+				btn:   chk,
+			})
+		}
+
+		if f.Custom || len(f.Options) == 0 {
+			customRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
+			customRow.SetVAlign(gtk.AlignCenter)
+			customRow.AddCSSClass("glup-question-option-row")
+
+			var customChk *gtk.CheckButton
+			if len(f.Options) > 0 {
+				customChk = gtk.NewCheckButton()
+				if !isMulti && groupLeader != nil {
+					customChk.SetGroup(groupLeader)
+				}
+				customRow.Append(customChk)
+			}
+
+			entry := gtk.NewEntry()
+			entry.SetHExpand(true)
+			entry.SetPlaceholderText("Type a custom answer…")
+			entry.ConnectChanged(func() {
+				if customChk != nil && strings.TrimSpace(entry.Text()) != "" && !customChk.Active() {
+					customChk.SetActive(true)
+				}
+				qw.syncValidState()
+			})
+			entry.ConnectActivate(func() {
+				qw.Submit()
+			})
+			if customChk != nil {
+				customChk.ConnectToggled(func() {
+					if customChk.Active() {
+						entry.GrabFocus()
+					}
+					qw.syncValidState()
+				})
+			}
+
+			customRow.Append(entry)
+			optsBox.Append(customRow)
+
+			fs.customCheck = customChk
+			fs.customEntry = entry
+		}
+
+		fieldBox.Append(optsBox)
+		root.Append(fieldBox)
+		qw.fields = append(qw.fields, fs)
+	}
+
+	actionsRow := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	actionsRow.SetHAlign(gtk.AlignEnd)
+
+	dismissBtn := gtk.NewButtonWithLabel("Dismiss")
+	dismissBtn.ConnectClicked(func() {
+		qw.Dismiss()
+	})
+	actionsRow.Append(dismissBtn)
+
+	submitBtn := gtk.NewButtonWithLabel("Submit")
+	submitBtn.AddCSSClass("suggested-action")
+	submitBtn.ConnectClicked(func() {
+		qw.Submit()
+	})
+	actionsRow.Append(submitBtn)
+
+	root.Append(actionsRow)
+
+	qw.submitBtn = submitBtn
+	qw.dismissBtn = dismissBtn
+	qw.syncValidState()
+	return qw
+}
+
+// Submit validates and submits the current answers if valid.
+func (qw *QuestionFormWidget) Submit() bool {
+	if qw.submitBtn != nil && !qw.submitBtn.Sensitive() {
+		return false
+	}
+	ans, ok := qw.CollectAnswers()
+	if !ok {
+		return false
+	}
+	qw.SetBusy(true)
+	if qw.onSubmit != nil {
+		qw.onSubmit(ans)
+	}
+	return true
+}
+
+// Dismiss cancels/dismisses the form.
+func (qw *QuestionFormWidget) Dismiss() {
+	if qw.dismissBtn != nil && !qw.dismissBtn.Sensitive() {
+		return
+	}
+	qw.SetBusy(true)
+	if qw.onDismiss != nil {
+		qw.onDismiss()
+	}
+}
+
+// SetBusy enables or disables the form buttons while a request is in flight.
+func (qw *QuestionFormWidget) SetBusy(busy bool) {
+	if qw.dismissBtn != nil {
+		qw.dismissBtn.SetSensitive(!busy)
+	}
+	if busy {
+		if qw.submitBtn != nil {
+			qw.submitBtn.SetSensitive(false)
+		}
+	} else {
+		qw.syncValidState()
+	}
+}
+
+func (qw *QuestionFormWidget) syncValidState() {
+	if qw.submitBtn == nil {
+		return
+	}
+	_, ok := qw.CollectAnswers()
+	qw.submitBtn.SetSensitive(ok)
+}
+
+// CollectAnswers extracts the current field values and reports whether all required fields have answers.
+func (qw *QuestionFormWidget) CollectAnswers() (map[string]any, bool) {
+	out := make(map[string]any, len(qw.fields))
+	for _, fs := range qw.fields {
+		isMulti := fs.field.Type == "multiselect"
+		if isMulti {
+			var vals []string
+			for _, opt := range fs.options {
+				if opt.btn != nil && opt.btn.Active() {
+					vals = append(vals, opt.value)
+				}
+			}
+			if fs.customEntry != nil {
+				customText := strings.TrimSpace(fs.customEntry.Text())
+				if customText != "" && (fs.customCheck == nil || fs.customCheck.Active()) {
+					vals = append(vals, customText)
+				}
+			}
+			if len(vals) == 0 && !fs.field.Optional {
+				return nil, false
+			}
+			out[fs.field.Key] = vals
+		} else {
+			var val string
+			if fs.customCheck != nil && fs.customCheck.Active() {
+				if fs.customEntry != nil {
+					val = strings.TrimSpace(fs.customEntry.Text())
+				}
+			} else if fs.customCheck == nil && fs.customEntry != nil && len(fs.options) == 0 {
+				val = strings.TrimSpace(fs.customEntry.Text())
+			} else {
+				for _, opt := range fs.options {
+					if opt.btn != nil && opt.btn.Active() {
+						val = opt.value
+						break
+					}
+				}
+			}
+			if val == "" && !fs.field.Optional {
+				return nil, false
+			}
+			out[fs.field.Key] = val
+		}
+	}
+	return out, true
 }

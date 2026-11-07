@@ -53,6 +53,8 @@ type convTimeline struct {
 	revertBanner   *RevertBannerWidget
 	thinkingLabel  *gtk.Label
 	pendingPrompts []*pendingPrompt
+	pendingForms   []opencode.FormInfo
+	formWidgets    map[string]*QuestionFormWidget
 	seenMsgIDs     map[string]bool
 	messages       []opencode.Message
 	nextCursor     string
@@ -62,10 +64,37 @@ type convTimeline struct {
 	loaded         bool
 	active         bool
 	runningTools   int
+	blockingTools  map[string]bool
+	toolNames      map[string]string
 	streamStart    time.Time
 	streamEnd      time.Time
 	streamedChars  int
 	lastTokRate    string
+}
+
+func isBackgroundableToolName(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "shell", "bash", "subagent", "task":
+		return true
+	default:
+		return false
+	}
+}
+
+func isBlockingBackgroundableTool(name, status string, input any) bool {
+	if status != "running" || !isBackgroundableToolName(name) {
+		return false
+	}
+	if m := opencode.ParseToolInputMap(input); m != nil {
+		if bg, ok := m["background"].(bool); ok && bg {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *convTimeline) isBlockingOnBackgroundable() bool {
+	return c != nil && c.active && len(c.blockingTools) > 0
 }
 
 func (c *convTimeline) closeStreams() {
@@ -91,13 +120,20 @@ func (c *convTimeline) keepPendingAtBottom() {
 			}
 		}
 	}
+	for _, f := range c.pendingForms {
+		if qw := c.formWidgets[f.ID]; qw != nil && qw.Parent() != nil {
+			if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(qw) {
+				c.timelineBox.ReorderChildAfter(qw, last)
+			}
+		}
+	}
 	if c.thinkingLabel != nil {
 		if c.thinkingLabel.Parent() == nil {
 			c.timelineBox.Append(c.thinkingLabel)
 		} else if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.thinkingLabel) {
 			c.timelineBox.ReorderChildAfter(c.thinkingLabel, last)
 		}
-		c.thinkingLabel.SetVisible(c.active)
+		c.thinkingLabel.SetVisible(c.active && len(c.pendingForms) == 0)
 	}
 	if c.revertBanner != nil && c.revertBanner.Visible() && c.revertBanner.Parent() != nil {
 		if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.revertBanner) {
@@ -123,7 +159,6 @@ type sessionTab struct {
 	activeSubID      string
 	gitBranch        string
 	sidebarIndicator *switcherIndicator
-	headerIndicator  *switcherIndicator
 }
 
 func (t *sessionTab) activeConv() *convTimeline {
@@ -133,6 +168,19 @@ func (t *sessionTab) activeConv() *convTimeline {
 		}
 	}
 	return t.main
+}
+
+func (t *sessionTab) blockingSessionID() string {
+	if t == nil {
+		return ""
+	}
+	if conv := t.activeConv(); conv.isBlockingOnBackgroundable() {
+		return conv.session.ID
+	}
+	if t.main.isBlockingOnBackgroundable() {
+		return t.main.session.ID
+	}
+	return ""
 }
 
 type agentRowData struct {
@@ -179,11 +227,8 @@ type Window struct {
 	breadcrumbParentBtn    *gtk.Button
 	breadcrumbParentLabel  *gtk.Label
 	breadcrumbChildLabel   *gtk.Label
-	horizTabScroll         *gtk.ScrolledWindow
-	horizTabBox            *gtk.Box
 	newWindowBtn           *gtk.Button
 	refreshBtn             *gtk.Button
-	tabModeBtn             *gtk.ToggleButton
 	viewStack              *adw.ViewStack
 
 	inputView      *gtksource.View
@@ -210,6 +255,7 @@ type Window struct {
 	projectStatusLabel  *gtk.Label
 	branchStatusBox     *gtk.Box
 	branchStatusLabel   *gtk.Label
+	backgroundStatusBtn *gtk.Button
 	shellStatusBox      *gtk.Box
 	shellStatusLabel    *gtk.Label
 	subagentStatusBox   *gtk.Box
@@ -262,9 +308,7 @@ type Window struct {
 	rowProjectDir    map[uintptr]string
 	headerProjectDir map[uintptr]string
 
-	horizontalTabs bool
-	isMobile       bool
-	populating     bool
+	populating bool
 }
 
 // NewWindow creates a new main window from window.ui.
@@ -310,11 +354,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		breadcrumbParentBtn:        builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
 		breadcrumbParentLabel:      builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
 		breadcrumbChildLabel:       builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
-		horizTabScroll:             builder.GetObject("horizTabScroll").Cast().(*gtk.ScrolledWindow),
-		horizTabBox:                builder.GetObject("horizTabBox").Cast().(*gtk.Box),
 		newWindowBtn:               builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
 		refreshBtn:                 builder.GetObject("refreshBtn").Cast().(*gtk.Button),
-		tabModeBtn:                 builder.GetObject("tabModeBtn").Cast().(*gtk.ToggleButton),
 		viewStack:                  builder.GetObject("viewStack").Cast().(*adw.ViewStack),
 		inputView:                  builder.GetObject("inputView").Cast().(*gtksource.View),
 		sendBtn:                    builder.GetObject("sendBtn").Cast().(*gtk.Button),
@@ -332,6 +373,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		projectStatusLabel:         builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
 		branchStatusBox:            builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
 		branchStatusLabel:          builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
+		backgroundStatusBtn:        builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
 		shellStatusBox:             builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
 		shellStatusLabel:           builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
 		subagentStatusBox:          builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
@@ -427,23 +469,12 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	statusBarBox.AddController(statusClick)
 
-	// Wire AdwViewStack to vertical sidebar switcher and set up horizontal scrollbar.
-	w.viewSwitcherSidebar.SetStack(w.viewStack)
-
-	horizScrollCtrl := gtk.NewEventControllerScroll(gtk.EventControllerScrollBothAxes)
-	horizScrollCtrl.ConnectScroll(func(dx, dy float64) bool {
-		hadj := w.horizTabScroll.HAdjustment()
-		if hadj == nil {
-			return false
-		}
-		delta := dx
-		if dy != 0 {
-			delta = dy * 30
-		}
-		hadj.SetValue(hadj.Value() + delta)
-		return true
+	w.backgroundStatusBtn.ConnectClicked(func() {
+		w.backgroundCurrentSession()
 	})
-	w.horizTabScroll.AddController(horizScrollCtrl)
+
+	// Wire AdwViewStack to vertical sidebar switcher.
+	w.viewSwitcherSidebar.SetStack(w.viewStack)
 
 	// Clicking an item in the sidebar returns to the main conversation if viewing a subagent,
 	// and closes the overlay sidebar if collapsed on mobile.
@@ -472,16 +503,12 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.onVisibleTabChanged()
 	})
 
-	// Sidebar show/hide & horizontal/vertical tab switching.
+	// Sidebar show/hide.
 	w.hideSidebarBtn.ConnectClicked(func() {
 		w.rootContent.SetShowSidebar(false)
 		w.syncNavigationChrome()
 	})
 	w.showSidebarBtn.ConnectClicked(func() {
-		if w.horizontalTabs && !w.isMobile {
-			w.tabModeBtn.SetActive(false)
-			return
-		}
 		w.rootContent.SetShowSidebar(!w.rootContent.ShowSidebar())
 		w.syncNavigationChrome()
 	})
@@ -489,15 +516,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.syncNavigationChrome()
 	})
 	w.rootContent.NotifyProperty("collapsed", func() {
-		w.isMobile = w.rootContent.Collapsed()
 		w.syncNavigationChrome()
 	})
 
-	w.tabModeBtn.ConnectToggled(func() {
-		w.toggleTabMode()
-	})
-
-	// Mobile adaptive breakpoint: always use vertical tabs in collapsed overlay sidebar on narrow screens.
+	// Mobile adaptive breakpoint: collapse sidebar into overlay on narrow screens.
 	bp := adw.NewBreakpoint(adw.BreakpointConditionParse("max-width: 680sp"))
 	bp.AddSetter(w.rootContent, "collapsed", true)
 	adwWin.AddBreakpoint(bp)
@@ -519,7 +541,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
 	w.refreshBtn.ConnectClicked(w.loadAll)
 
-	// Window-level shortcuts: Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions.
+	// Window-level shortcuts: Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background.
 	winKeyCtrl := gtk.NewEventControllerKey()
 	winKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if (keyval == gdk.KEY_N || keyval == gdk.KEY_n) && state.Has(gdk.ControlMask) && state.Has(gdk.ShiftMask) {
@@ -530,17 +552,27 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 			w.openSessionSearchDialog()
 			return true
 		}
+		if (keyval == gdk.KEY_B || keyval == gdk.KEY_b) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
+			if w.backgroundCurrentSession() {
+				return true
+			}
+		}
 		return false
 	})
 	adwWin.AddController(winKeyCtrl)
 
-	// Composer Enter / Ctrl+Enter / Shift+Enter handling and Ctrl+V clipboard image pasting.
+	// Composer Enter / Ctrl+Enter / Shift+Enter handling, Ctrl+B to background, and Ctrl+V clipboard image pasting.
 	steerKeyCtrl := gtk.NewEventControllerKey()
 	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
 			w.sendPromptWithDelivery(opencode.DeliverySteer)
 			return true
+		}
+		if (keyval == gdk.KEY_B || keyval == gdk.KEY_b) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
+			if w.backgroundCurrentSession() {
+				return true
+			}
 		}
 		return false
 	})
@@ -1229,7 +1261,10 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 		assistantMap:   make(map[string]*AssistantMessageWidget),
 		compactionMap:  make(map[string]*CompactionWidget),
 		messageWidgets: make(map[string]gtk.Widgetter),
+		formWidgets:    make(map[string]*QuestionFormWidget),
 		seenMsgIDs:     make(map[string]bool),
+		blockingTools:  make(map[string]bool),
+		toolNames:      make(map[string]string),
 	}
 
 	vadj := scroll.VAdjustment()
@@ -1251,40 +1286,18 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	return conv
 }
 
-func (w *Window) toggleTabMode() {
-	w.horizontalTabs = w.tabModeBtn.Active()
-	if w.horizontalTabs && !w.isMobile {
-		w.rootContent.SetShowSidebar(false)
-	} else if !w.horizontalTabs && !w.isMobile {
-		w.rootContent.SetShowSidebar(true)
-	}
-	w.syncProjectSessionVisibility()
-	w.syncNavigationChrome()
-	w.syncSwitcherIndicators()
-}
-
 func (w *Window) syncNavigationChrome() {
 	tab := w.currentTab()
 	viewingSubagent := tab != nil && tab.activeSubID != ""
-	useHorizontal := w.horizontalTabs && !w.isMobile
 
-	switch {
-	case viewingSubagent:
+	if viewingSubagent {
 		w.headerTitleStack.SetVisibleChildName("breadcrumb")
-		sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
-		w.showSidebarBtn.SetVisible(!sidebarVisible)
-		w.newSessionTopBtn.SetVisible(!sidebarVisible)
-	case useHorizontal:
-		w.headerTitleStack.SetVisibleChildName("switcher")
-		w.showSidebarBtn.SetVisible(false)
-		w.newSessionTopBtn.SetVisible(true)
-	default:
+	} else {
 		w.headerTitleStack.SetVisibleChildName("title")
-		sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
-		w.showSidebarBtn.SetVisible(!sidebarVisible)
-		w.newSessionTopBtn.SetVisible(!sidebarVisible)
 	}
-	w.tabModeBtn.SetVisible(!w.isMobile)
+	sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
+	w.showSidebarBtn.SetVisible(!sidebarVisible)
+	w.newSessionTopBtn.SetVisible(!sidebarVisible)
 }
 
 func (w *Window) currentRootSessionID() string {
@@ -1456,19 +1469,26 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 		}
 	}
 
+	var spinner *adw.Spinner
+	var suffixBox *gtk.Box
+	var label *gtk.Label
+	var closeBtn *gtk.Button
+
 	for child := hBox.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
 		childBase := gtk.BaseWidget(child)
-		if childBase != nil && childBase.HasCSSClass("glup-switcher-suffix") {
-			var spinner *adw.Spinner
-			var label *gtk.Label
-			var closeBtn *gtk.Button
+		if childBase == nil {
+			continue
+		}
+		if childBase.HasCSSClass("glup-switcher-prefix") {
+			if sp, ok := childBase.Cast().(*adw.Spinner); ok {
+				spinner = sp
+			}
+		}
+		if childBase.HasCSSClass("glup-switcher-suffix") {
 			for inner := childBase.FirstChild(); inner != nil; inner = gtk.BaseWidget(inner).NextSibling() {
 				innerBase := gtk.BaseWidget(inner)
 				if innerBase == nil {
 					continue
-				}
-				if sp, ok := innerBase.Cast().(*adw.Spinner); ok {
-					spinner = sp
 				}
 				if lbl, ok := innerBase.Cast().(*gtk.Label); ok {
 					label = lbl
@@ -1477,11 +1497,22 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 					closeBtn = btn
 				}
 			}
-			if box, ok := childBase.Cast().(*gtk.Box); ok && spinner != nil && label != nil && closeBtn != nil {
-				w.closeBtnSessID[closeBtn.Object.Native()] = sessID
-				return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
+			if box, ok := childBase.Cast().(*gtk.Box); ok {
+				suffixBox = box
 			}
 		}
+	}
+	if spinner != nil && suffixBox != nil && label != nil && closeBtn != nil {
+		w.closeBtnSessID[closeBtn.Object.Native()] = sessID
+		return &switcherIndicator{box: suffixBox, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
+	}
+
+	if spinner == nil {
+		spinner = adw.NewSpinner()
+		spinner.AddCSSClass("glup-switcher-prefix")
+		spinner.SetVAlign(gtk.AlignCenter)
+		spinner.SetVisible(false)
+		hBox.Prepend(spinner)
 	}
 
 	box := gtk.NewBox(gtk.OrientationHorizontal, 4)
@@ -1490,17 +1521,13 @@ func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow
 	box.SetVAlign(gtk.AlignCenter)
 	box.SetHExpand(false)
 
-	spinner := adw.NewSpinner()
-	spinner.SetVisible(false)
-	box.Append(spinner)
-
-	label := gtk.NewLabel("")
+	label = gtk.NewLabel("")
 	label.AddCSSClass("caption")
 	label.AddCSSClass("dim-label")
 	label.SetVisible(false)
 	box.Append(label)
 
-	closeBtn := gtk.NewButtonFromIconName("window-close-symbolic")
+	closeBtn = gtk.NewButtonFromIconName("window-close-symbolic")
 	closeBtn.AddCSSClass("flat")
 	closeBtn.AddCSSClass("circular")
 	closeBtn.AddCSSClass("glup-sidebar-close-btn")
@@ -1974,99 +2001,6 @@ func (w *Window) expandProjectSessions(dir string) {
 	step(0)
 }
 
-func (w *Window) syncHorizTabStrip() {
-	if !w.horizontalTabs || w.isMobile {
-		return
-	}
-	currentID := w.currentRootSessionID()
-
-	for c := w.horizTabBox.FirstChild(); c != nil; {
-		next := gtk.BaseWidget(c).NextSibling()
-		w.horizTabBox.Remove(c)
-		c = next
-	}
-
-	var activeBtn *gtk.Button
-	for _, sessID := range w.tabOrder {
-		tab, ok := w.tabs[sessID]
-		if !ok || !tab.page.Visible() {
-			continue
-		}
-
-		id := sessID
-		btn := gtk.NewButton()
-		btn.AddCSSClass("flat")
-		btn.AddCSSClass("glup-horiz-tab-btn")
-
-		box := gtk.NewBox(gtk.OrientationHorizontal, 6)
-		box.SetHExpand(true)
-		box.SetVAlign(gtk.AlignCenter)
-
-		rawDir := tab.main.session.Location.Directory
-		pName := projectName(rawDir)
-		if pName != "" {
-			projLabel := gtk.NewLabel(pName)
-			projLabel.AddCSSClass("dim-label")
-			projLabel.AddCSSClass("caption")
-			projLabel.AddCSSClass("glup-horiz-tab-proj")
-			projLabel.SetXAlign(0)
-			box.Append(projLabel)
-		}
-
-		title := strings.TrimSpace(tab.main.session.Title)
-		if title == "" {
-			title = "Untitled"
-		}
-		titleLabel := gtk.NewLabel(title)
-		titleLabel.AddCSSClass("glup-horiz-tab-title")
-		titleLabel.SetEllipsize(pango.EllipsizeEnd)
-		titleLabel.SetHExpand(true)
-		titleLabel.SetXAlign(0)
-		box.Append(titleLabel)
-
-		if tab.main.active {
-			spinner := adw.NewSpinner()
-			spinner.SetVisible(true)
-			box.Append(spinner)
-		} else if id != currentID {
-			timemark := formatRelativeTimemark(tab.main.session.Time.Updated)
-			if timemark != "" {
-				ageLabel := gtk.NewLabel(timemark)
-				ageLabel.AddCSSClass("dim-label")
-				ageLabel.AddCSSClass("caption")
-				box.Append(ageLabel)
-			}
-		}
-
-		btn.SetChild(box)
-		btn.SetTooltipText(fmt.Sprintf("%s (%s)", title, shortDir(rawDir)))
-
-		if id == currentID {
-			btn.AddCSSClass("glup-horiz-tab-active")
-			activeBtn = btn
-		}
-
-		btn.ConnectClicked(func() {
-			w.viewStack.SetVisibleChildName(id)
-			w.onVisibleTabChanged()
-		})
-
-		w.horizTabBox.Append(btn)
-	}
-
-	if activeBtn != nil {
-		glib.IdleAdd(func() bool {
-			if rect, ok := activeBtn.ComputeBounds(w.horizTabBox); ok {
-				hadj := w.horizTabScroll.HAdjustment()
-				if hadj != nil {
-					hadj.ClampPage(float64(rect.Origin().X()), float64(rect.Origin().X()+rect.Size().Width()))
-				}
-			}
-			return false
-		})
-	}
-}
-
 func (w *Window) syncSwitcherIndicators() {
 	if len(w.tabOrder) == 0 {
 		return
@@ -2195,7 +2129,6 @@ func (w *Window) syncSwitcherIndicators() {
 		}
 	}
 
-	w.syncHorizTabStrip()
 	w.updateSwitcherIndicators()
 }
 
@@ -2213,22 +2146,18 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 	if ind.closeBtn != nil {
 		ind.closeBtn.SetVisible(showClose)
 	}
+	if ind.spinner != nil {
+		ind.spinner.SetVisible(active)
+	}
 
 	switch {
-	case active:
-		ind.spinner.SetVisible(true)
-		ind.label.SetVisible(false)
-		ind.box.SetVisible(true)
 	case showClose:
-		ind.spinner.SetVisible(false)
 		ind.label.SetVisible(false)
 		ind.box.SetVisible(true)
 	case focused:
-		ind.spinner.SetVisible(false)
 		ind.label.SetVisible(false)
 		ind.box.SetVisible(false)
 	default:
-		ind.spinner.SetVisible(false)
 		timemark := formatRelativeTimemark(tab.main.session.Time.Updated)
 		if timemark != "" {
 			ind.label.SetLabel(timemark)
@@ -2244,10 +2173,6 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 func (w *Window) updateSwitcherIndicators() {
 	for sessID, tab := range w.tabs {
 		w.updateIndicator(tab.sidebarIndicator, sessID, tab)
-		w.updateIndicator(tab.headerIndicator, sessID, tab)
-	}
-	if w.horizontalTabs && !w.isMobile {
-		w.syncHorizTabStrip()
 	}
 }
 
@@ -2459,6 +2384,163 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		w.syncSwitcherIndicators()
 		w.inputView.GrabFocus()
 	})
+	w.loadPendingFormsForAllDirs(discoveredDirs)
+}
+
+func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
+	seen := make(map[string]bool)
+	var uniqueDirs []string
+	for _, raw := range dirs {
+		d := normalizeProjectDir(raw)
+		if d != "" && !seen[d] {
+			seen[d] = true
+			uniqueDirs = append(uniqueDirs, d)
+		}
+	}
+	if len(uniqueDirs) == 0 {
+		uniqueDirs = []string{""}
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		var (
+			mu       sync.Mutex
+			allForms []opencode.FormInfo
+			wg       sync.WaitGroup
+		)
+		for _, dir := range uniqueDirs {
+			d := dir
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				forms, err := w.client.ListForms(w.ctx, d)
+				if err == nil && len(forms) > 0 {
+					mu.Lock()
+					allForms = append(allForms, forms...)
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		return func() {
+			for _, f := range allForms {
+				w.upsertPendingForm(f)
+			}
+		}
+	})
+}
+
+func (w *Window) upsertPendingForm(form opencode.FormInfo) {
+	if form.ID == "" || form.SessionID == "" {
+		return
+	}
+	tab, conv := w.resolveConv(form.SessionID)
+	if tab == nil || conv == nil {
+		return
+	}
+	found := false
+	for i, existing := range conv.pendingForms {
+		if existing.ID == form.ID {
+			conv.pendingForms[i] = form
+			found = true
+			break
+		}
+	}
+	if !found {
+		conv.pendingForms = append(conv.pendingForms, form)
+	}
+	if tab.main.session.ID != w.currentRootSessionID() {
+		tab.page.SetNeedsAttention(true)
+	}
+	if conv.loaded {
+		w.ensureFormWidget(tab, conv, form)
+		conv.keepPendingAtBottom()
+		if conv.scroll != nil {
+			conv.scroll.ScrollToBottom()
+		}
+	}
+}
+
+func (w *Window) removePendingForm(sessionID, formID string) {
+	if formID == "" {
+		return
+	}
+	_, conv := w.resolveConv(sessionID)
+	if conv == nil {
+		// Search across all tabs if sessionID wasn't resolved directly.
+		for _, t := range w.tabs {
+			if _, ok := t.main.formWidgets[formID]; ok {
+				conv = t.main
+				break
+			}
+			for _, sub := range t.subTimelines {
+				if _, ok := sub.formWidgets[formID]; ok {
+					conv = sub
+					break
+				}
+			}
+		}
+	}
+	if conv == nil {
+		return
+	}
+	next := conv.pendingForms[:0]
+	for _, f := range conv.pendingForms {
+		if f.ID != formID {
+			next = append(next, f)
+		}
+	}
+	conv.pendingForms = next
+	if qw, ok := conv.formWidgets[formID]; ok {
+		delete(conv.formWidgets, formID)
+		if conv.timelineBox != nil {
+			conv.timelineBox.Remove(qw)
+		}
+	}
+	conv.keepPendingAtBottom()
+}
+
+func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form opencode.FormInfo) *QuestionFormWidget {
+	if qw, ok := conv.formWidgets[form.ID]; ok {
+		return qw
+	}
+	sessID := conv.session.ID
+	formID := form.ID
+	var qw *QuestionFormWidget
+	qw = NewQuestionFormWidget(
+		form,
+		func(ans map[string]any) {
+			gtkutil.Async(w.ctx, func() func() {
+				err := w.client.ReplyForm(w.ctx, sessID, formID, ans)
+				return func() {
+					if err != nil {
+						slog.Error("failed to reply to form", "sessionID", sessID, "formID", formID, "err", err)
+						qw.SetBusy(false)
+						app.Error(w.ctx, err)
+						return
+					}
+					w.removePendingForm(sessID, formID)
+				}
+			})
+		},
+		func() {
+			gtkutil.Async(w.ctx, func() func() {
+				err := w.client.CancelForm(w.ctx, sessID, formID, "")
+				return func() {
+					if err != nil {
+						slog.Error("failed to cancel form", "sessionID", sessID, "formID", formID, "err", err)
+						qw.SetBusy(false)
+						app.Error(w.ctx, err)
+						return
+					}
+					w.removePendingForm(sessID, formID)
+				}
+			})
+		},
+	)
+	conv.formWidgets[form.ID] = qw
+	if conv.timelineBox != nil {
+		conv.timelineBox.Append(qw)
+	}
+	return qw
 }
 
 func (w *Window) addSessionTab(sess opencode.Session) *sessionTab {
@@ -2606,9 +2688,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			page       *opencode.MessagePage
 			err        error
 			inboxItems []opencode.InboxItem
+			forms      []opencode.FormInfo
 			wg         sync.WaitGroup
 		)
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, "")
@@ -2616,6 +2699,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 		go func() {
 			defer wg.Done()
 			inboxItems, _ = w.client.ListInbox(w.ctx, sessionID)
+		}()
+		go func() {
+			defer wg.Done()
+			forms, _ = w.client.ListSessionForms(w.ctx, sessionID)
 		}()
 		wg.Wait()
 
@@ -2633,8 +2720,12 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			conv.assistantMap = make(map[string]*AssistantMessageWidget)
 			conv.compactionMap = make(map[string]*CompactionWidget)
 			conv.messageWidgets = make(map[string]gtk.Widgetter)
+			conv.formWidgets = make(map[string]*QuestionFormWidget)
+			conv.pendingForms = nil
 			conv.revertBanner = nil
 			conv.seenMsgIDs = make(map[string]bool)
+			conv.blockingTools = make(map[string]bool)
+			conv.toolNames = make(map[string]string)
 
 			if page == nil {
 				conv.messages = nil
@@ -2657,8 +2748,16 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				}
 				if msg.Type == "assistant" {
 					for _, part := range msg.Content {
-						if part.Type == "tool" && (part.State.Status == "running" || part.State.Status == "streaming") {
-							runningTools++
+						if part.Type == "tool" {
+							if part.ID != "" && part.Name != "" {
+								conv.toolNames[part.ID] = part.Name
+							}
+							if part.State.Status == "running" || part.State.Status == "streaming" {
+								runningTools++
+							}
+							if part.ID != "" && isBlockingBackgroundableTool(part.Name, part.State.Status, part.State.Input) {
+								conv.blockingTools[part.ID] = true
+							}
 						}
 					}
 				}
@@ -2688,6 +2787,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 					Delivery:  item.Delivery,
 					Item:      &item,
 				})
+			}
+
+			for _, form := range forms {
+				w.upsertPendingForm(form)
 			}
 
 			tab.page.SetBadgeNumber(0)
@@ -2816,12 +2919,24 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 		return cw
 
 	case "synthetic":
-		return NewSyntheticSubagentWidget(w.ctx, msg, func(subID string) {
-			w.openSubagentByID(tab, subID)
-		})
+		if isSubagentOrShellSynthetic(msg) {
+			return NewSyntheticSubagentWidget(w.ctx, msg, func(subID string) {
+				w.openSubagentByID(tab, subID)
+			})
+		}
+		return NewSystemNoticeWidget(w.ctx, msg)
+
+	case "system", "skill":
+		return NewSystemNoticeWidget(w.ctx, msg)
 
 	case "agent-switched":
 		return NewAgentSwitchedWidget(msg)
+
+	case "model-switched":
+		return NewModelSwitchedWidget(msg)
+
+	case "location-switched":
+		return NewLocationSwitchedWidget(msg)
 
 	default:
 		return nil
@@ -2834,10 +2949,35 @@ func (w *Window) reconcileTail(sessionID string) {
 		return
 	}
 	gtkutil.Async(w.ctx, func() func() {
-		page, err := w.client.ListMessagesPage(w.ctx, sessionID, 10, "")
+		var (
+			page  *opencode.MessagePage
+			err   error
+			forms []opencode.FormInfo
+			wg    sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 10, "")
+		}()
+		go func() {
+			defer wg.Done()
+			forms, _ = w.client.ListSessionForms(w.ctx, sessionID)
+		}()
+		wg.Wait()
 		return func() {
 			if err != nil || page == nil {
 				return
+			}
+			activeFormIDs := make(map[string]bool, len(forms))
+			for _, f := range forms {
+				activeFormIDs[f.ID] = true
+				w.upsertPendingForm(f)
+			}
+			for i := len(conv.pendingForms) - 1; i >= 0; i-- {
+				if id := conv.pendingForms[i].ID; !activeFormIDs[id] {
+					w.removePendingForm(sessionID, id)
+				}
 			}
 			var appended bool
 			findPrevWidget := func(idx int) gtk.Widgetter {
@@ -2852,6 +2992,24 @@ func (w *Window) reconcileTail(sessionID string) {
 			for _, msg := range page.Messages {
 				if cw, ok := conv.compactionMap[msg.ID]; ok && msg.Type == "compaction" {
 					cw.Update(msg)
+				}
+				if msg.Type == "assistant" {
+					for _, part := range msg.Content {
+						if part.Type == "tool" && part.ID != "" {
+							if part.Name != "" {
+								conv.toolNames[part.ID] = part.Name
+							}
+							name := part.Name
+							if name == "" {
+								name = conv.toolNames[part.ID]
+							}
+							if isBlockingBackgroundableTool(name, part.State.Status, part.State.Input) {
+								conv.blockingTools[part.ID] = true
+							} else {
+								delete(conv.blockingTools, part.ID)
+							}
+						}
+					}
 				}
 			}
 
@@ -2931,9 +3089,15 @@ func (w *Window) onStreamDelta(tab *sessionTab, conv *convTimeline, deltaLen int
 
 func (w *Window) updateBottomBar(tab *sessionTab) {
 	if tab == nil {
+		if w.backgroundStatusBtn != nil {
+			w.backgroundStatusBtn.SetVisible(false)
+		}
 		w.tokRateStatusLabel.SetVisible(false)
 		w.rebuildContextInfo(nil)
 		return
+	}
+	if w.backgroundStatusBtn != nil {
+		w.backgroundStatusBtn.SetVisible(tab.blockingSessionID() != "")
 	}
 	conv := tab.activeConv()
 	agent := conv.session.Agent
@@ -4842,6 +5006,36 @@ func (w *Window) interruptSession() {
 	})
 }
 
+func (w *Window) backgroundCurrentSession() bool {
+	tab := w.currentTab()
+	if tab == nil {
+		return false
+	}
+	sessionID := tab.blockingSessionID()
+	if sessionID == "" {
+		return false
+	}
+	if _, conv := w.resolveConv(sessionID); conv != nil {
+		clear(conv.blockingTools)
+	}
+	w.updateBottomBar(tab)
+	rootID := tab.main.session.ID
+	gtkutil.Async(w.ctx, func() func() {
+		err := w.client.BackgroundSession(w.ctx, sessionID)
+		return func() {
+			if err != nil {
+				slog.Error("failed to background session", "sessionID", sessionID, "err", err)
+				return
+			}
+			w.refreshShells()
+			if rootID != "" {
+				w.loadChildSubagents(rootID)
+			}
+		}
+	})
+	return true
+}
+
 func (w *Window) resolveConv(sessionID string) (*sessionTab, *convTimeline) {
 	if tab, ok := w.tabs[sessionID]; ok {
 		return tab, tab.main
@@ -4863,20 +5057,21 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		conv.active = active
 		if !active {
 			conv.runningTools = 0
+			clear(conv.blockingTools)
 		}
 		conv.keepPendingAtBottom()
-		if active {
+		if active && conv.scroll != nil {
 			conv.scroll.ScrollToBottom()
 		}
 	}
 	if conv == tab.main {
 		tab.page.SetBadgeNumber(0)
 	}
-	if tab.main.session.ID != w.currentRootSessionID() && active {
-		tab.page.SetNeedsAttention(true)
-	}
-	if w.currentTab() == tab && tab.activeConv() == conv {
-		w.updateBusyState(active)
+	if w.currentTab() == tab {
+		if tab.activeConv() == conv {
+			w.updateBusyState(active)
+		}
+		w.updateBottomBar(tab)
 	}
 	w.updateSwitcherIndicators()
 }
@@ -5142,7 +5337,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			}
 		}
 
-	case "session.inbox.delivered", "session.synthetic",
+	case "session.inbox.delivered", "session.synthetic", "session.instructions.updated", "session.skill.activated",
 		"session.compaction.started", "session.compaction.ended", "session.compaction.failed":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
@@ -5160,6 +5355,26 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
 					w.loadChildSubagents(rootID)
 				}
+			}
+		}
+
+	case "session.moved":
+		var d struct {
+			SessionID string            `json:"sessionID"`
+			Location  opencode.Location `json:"location"`
+		}
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			tab, conv := w.resolveConv(d.SessionID)
+			if conv != nil {
+				if d.Location.Directory != "" {
+					conv.session.Location = d.Location
+				}
+				if conv.loaded {
+					w.reconcileTail(d.SessionID)
+				}
+			}
+			if tab != nil && w.currentTab() == tab {
+				w.refreshHeaderAndBottomBar(tab)
 			}
 		}
 
@@ -5189,6 +5404,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil && d.Agent != "" {
 				conv.session.Agent = d.Agent
+				if conv.loaded {
+					w.reconcileTail(d.SessionID)
+				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
 				}
@@ -5203,6 +5421,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				conv.session.Model = d.Model
 				w.updateModelLastUsed(d.Model, time.Now().UnixMilli())
 				w.rebuildModelList()
+				if conv.loaded {
+					w.reconcileTail(d.SessionID)
+				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
 				}
@@ -5339,6 +5560,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
+				if tab != nil && tab.main.session.ID != w.currentRootSessionID() && strings.TrimSpace(d.Delta) != "" {
+					tab.page.SetNeedsAttention(true)
+				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 					aw.AppendTextDelta(d.Ordinal, d.Delta)
@@ -5350,6 +5574,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.TextEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
+			if tab != nil && tab.main.session.ID != w.currentRootSessionID() && strings.TrimSpace(d.Text) != "" {
+				tab.page.SetNeedsAttention(true)
+			}
 			if conv != nil && conv.loaded {
 				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 				aw.FinalizeText(d.Ordinal, d.Text)
@@ -5362,6 +5589,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				conv.runningTools++
+				if d.ID != "" && d.Name != "" {
+					conv.toolNames[d.ID] = d.Name
+				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 					tw := aw.EnsureTool(d.ID, d.Name)
@@ -5388,14 +5618,33 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
-			if conv != nil && conv.loaded {
-				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-				tw := aw.EnsureTool(d.ID, d.Name)
-				tw.SetStatus("running")
-				tw.SetInput(d.Input)
-				tw.SetMetadata(d.Metadata)
+			if conv != nil {
+				if d.ID != "" && d.Name != "" {
+					conv.toolNames[d.ID] = d.Name
+				}
+				name := d.Name
+				if name == "" && d.ID != "" {
+					name = conv.toolNames[d.ID]
+				}
+				if d.ID != "" {
+					if isBlockingBackgroundableTool(name, "running", d.Input) {
+						conv.blockingTools[d.ID] = true
+					} else {
+						delete(conv.blockingTools, d.ID)
+					}
+				}
+				if conv.loaded {
+					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
+					tw := aw.EnsureTool(d.ID, d.Name)
+					tw.SetStatus("running")
+					tw.SetInput(d.Input)
+					tw.SetMetadata(d.Metadata)
+				}
+				if w.currentTab() == tab {
+					w.updateBottomBar(tab)
+				}
 			}
-			if d.Name == "subagent" {
+			if d.Name == "subagent" || d.Name == "task" {
 				w.loadChildSubagents(d.SessionID)
 			}
 		}
@@ -5404,19 +5653,31 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
-			if conv != nil && conv.loaded {
-				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
-				tw := aw.EnsureTool(d.ID, d.Name)
-				if d.Text != "" {
-					tw.SetStatus(d.Text)
+			if conv != nil {
+				if d.ID != "" && d.Input != nil {
+					if m := opencode.ParseToolInputMap(d.Input); m != nil {
+						if bg, ok := m["background"].(bool); ok && bg {
+							delete(conv.blockingTools, d.ID)
+						}
+					}
 				}
-				if d.Input != nil {
-					tw.SetInput(d.Input)
+				if conv.loaded {
+					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
+					tw := aw.EnsureTool(d.ID, d.Name)
+					if d.Text != "" {
+						tw.SetStatus(d.Text)
+					}
+					if d.Input != nil {
+						tw.SetInput(d.Input)
+					}
+					if len(d.Content) > 0 {
+						tw.SetOutput(d.Content, d.Error)
+					}
+					tw.SetMetadata(d.Metadata)
 				}
-				if len(d.Content) > 0 {
-					tw.SetOutput(d.Content, d.Error)
+				if w.currentTab() == tab {
+					w.updateBottomBar(tab)
 				}
-				tw.SetMetadata(d.Metadata)
 			}
 		}
 
@@ -5428,12 +5689,18 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if conv.runningTools > 0 {
 					conv.runningTools--
 				}
+				if d.ID != "" {
+					delete(conv.blockingTools, d.ID)
+				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 					tw := aw.EnsureTool(d.ID, d.Name)
 					tw.SetStatus("completed")
 					tw.SetOutput(d.Content, nil)
 					tw.SetMetadata(d.Metadata)
+				}
+				if w.currentTab() == tab {
+					w.updateBottomBar(tab)
 				}
 			}
 		}
@@ -5446,12 +5713,18 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if conv.runningTools > 0 {
 					conv.runningTools--
 				}
+				if d.ID != "" {
+					delete(conv.blockingTools, d.ID)
+				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 					tw := aw.EnsureTool(d.ID, d.Name)
 					tw.SetStatus("failed")
 					tw.SetOutput(d.Content, d.Error)
 					tw.SetMetadata(d.Metadata)
+				}
+				if w.currentTab() == tab {
+					w.updateBottomBar(tab)
 				}
 			}
 		}
@@ -5517,6 +5790,24 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				w.updateShellStatus()
 				w.rebuildShellList()
 			}
+		}
+
+	case "form.created":
+		var d opencode.FormCreatedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.Form.ID != "" {
+			w.upsertPendingForm(d.Form)
+		}
+
+	case "form.replied":
+		var d opencode.FormRepliedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.ID != "" {
+			w.removePendingForm(d.SessionID, d.ID)
+		}
+
+	case "form.cancelled":
+		var d opencode.FormCancelledEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.ID != "" {
+			w.removePendingForm(d.SessionID, d.ID)
 		}
 	}
 }

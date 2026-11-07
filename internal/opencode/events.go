@@ -157,3 +157,21 @@ type ShellEvent struct {
 	Info    ShellItem `json:"info,omitempty"`
 	Shell   ShellItem `json:"shell,omitempty"`
 }
+
+// FormCreatedEvent is emitted on "form.created".
+type FormCreatedEvent struct {
+	Form FormInfo `json:"form"`
+}
+
+// FormRepliedEvent is emitted on "form.replied".
+type FormRepliedEvent struct {
+	ID        string         `json:"id"`
+	SessionID string         `json:"sessionID"`
+	Answer    map[string]any `json:"answer,omitempty"`
+}
+
+// FormCancelledEvent is emitted on "form.cancelled".
+type FormCancelledEvent struct {
+	ID        string `json:"id"`
+	SessionID string `json:"sessionID"`
+}

@@ -660,22 +660,26 @@ type ContentPart struct {
 
 // Message represents a timeline entry in a session.
 type Message struct {
-	ID          string           `json:"id"`
-	Type        string           `json:"type"` // "user", "assistant", "synthetic", "system", "skill", "shell", "compaction", "agent-switched"
-	Text        string           `json:"text,omitempty"`
-	Agent       string           `json:"agent,omitempty"`
-	Model       ModelRef         `json:"model,omitempty"`
-	Files       []FileAttachment `json:"files,omitempty"`
-	Summary     string           `json:"summary,omitempty"`     // for type == "compaction"
-	Status      string           `json:"status,omitempty"`      // for type == "compaction" ("running", "completed", "failed")
-	Reason      string           `json:"reason,omitempty"`      // for type == "compaction" ("auto", "manual")
-	Previous    string           `json:"previous,omitempty"`    // for type == "agent-switched"
-	Description string           `json:"description,omitempty"` // for type == "synthetic"
-	Metadata    map[string]any   `json:"metadata,omitempty"`    // for type == "synthetic" or "compaction"
-	Content     []ContentPart    `json:"content,omitempty"`
-	Cost        float64          `json:"cost,omitempty"`
-	Tokens      TokenUsage       `json:"tokens,omitempty"`
-	Time        struct {
+	ID            string           `json:"id"`
+	Type          string           `json:"type"` // "user", "assistant", "synthetic", "system", "skill", "shell", "compaction", "agent-switched", "model-switched", "location-switched"
+	Text          string           `json:"text,omitempty"`
+	Agent         string           `json:"agent,omitempty"`
+	Model         ModelRef         `json:"model,omitempty"`
+	Name          string           `json:"name,omitempty"`     // for type == "skill"
+	Skill         string           `json:"skill,omitempty"`    // for type == "skill"
+	Location      Location         `json:"location,omitempty"` // for type == "location-switched"
+	Files         []FileAttachment `json:"files,omitempty"`
+	Summary       string           `json:"summary,omitempty"`     // for type == "compaction"
+	Status        string           `json:"status,omitempty"`      // for type == "compaction" ("running", "completed", "failed")
+	Reason        string           `json:"reason,omitempty"`      // for type == "compaction" ("auto", "manual")
+	Previous      string           `json:"previous,omitempty"`    // for type == "agent-switched"
+	PreviousModel *ModelRef        `json:"-"`                     // for type == "model-switched"
+	Description   string           `json:"description,omitempty"` // for type == "synthetic" or "system"
+	Metadata      map[string]any   `json:"metadata,omitempty"`    // for type == "synthetic", "system", or "compaction"
+	Content       []ContentPart    `json:"content,omitempty"`
+	Cost          float64          `json:"cost,omitempty"`
+	Tokens        TokenUsage       `json:"tokens,omitempty"`
+	Time          struct {
 		Created   int64 `json:"created"`
 		Streamed  int64 `json:"streamed,omitempty"`
 		Completed int64 `json:"completed,omitempty"`
@@ -683,7 +687,7 @@ type Message struct {
 }
 
 // UnmarshalJSON unmarshals a Message, gracefully handling the "previous" field which can be
-// either a string (for agent-switched) or an object (for model-switched).
+// either a string (for agent-switched) or an object (for model-switched / location-switched).
 func (m *Message) UnmarshalJSON(b []byte) error {
 	type rawMessage Message
 	var raw struct {
@@ -694,8 +698,16 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = Message(raw.rawMessage)
-	if len(raw.Previous) > 0 && raw.Previous[0] == '"' {
-		_ = json.Unmarshal(raw.Previous, &m.Previous)
+	if len(raw.Previous) > 0 {
+		switch raw.Previous[0] {
+		case '"':
+			_ = json.Unmarshal(raw.Previous, &m.Previous)
+		case '{':
+			var pm ModelRef
+			if json.Unmarshal(raw.Previous, &pm) == nil && pm.ID != "" {
+				m.PreviousModel = &pm
+			}
+		}
 	}
 	return nil
 }
@@ -1049,6 +1061,94 @@ func (c *Client) CancelInbox(ctx context.Context, sessionID, inboxID string) err
 func (c *Client) Interrupt(ctx context.Context, sessionID string) error {
 	path := fmt.Sprintf("/api/session/%s/interrupt", url.PathEscape(sessionID))
 	return c.doJSON(ctx, http.MethodPost, path, map[string]any{}, nil)
+}
+
+// BackgroundSession moves active foreground backgroundable tools for a session into background observation
+// (POST /api/session/{sessionID}/background).
+func (c *Client) BackgroundSession(ctx context.Context, sessionID string) error {
+	path := fmt.Sprintf("/api/session/%s/background", url.PathEscape(sessionID))
+	return c.doJSON(ctx, http.MethodPost, path, nil, nil)
+}
+
+// FormOption describes a single selectable choice in a FormField.
+type FormOption struct {
+	Value       string `json:"value"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// FormField describes an interactive input field or question in a FormInfo.
+type FormField struct {
+	Key         string       `json:"key"`
+	Title       string       `json:"title"`
+	Description string       `json:"description,omitempty"`
+	Type        string       `json:"type"` // "string", "multiselect", "boolean"
+	Options     []FormOption `json:"options,omitempty"`
+	Custom      bool         `json:"custom,omitempty"`
+	Optional    bool         `json:"optional,omitempty"`
+}
+
+// FormInfo represents a pending interactive form or question prompt in a session.
+type FormInfo struct {
+	ID          string         `json:"id"`
+	SessionID   string         `json:"sessionID"`
+	Title       string         `json:"title"`
+	Description string         `json:"description,omitempty"`
+	Fields      []FormField    `json:"fields"`
+	Metadata    map[string]any `json:"metadata,omitempty"`
+}
+
+// ListForms lists pending forms across sessions (GET /api/form).
+func (c *Client) ListForms(ctx context.Context, directory string) ([]FormInfo, error) {
+	path := "/api/form"
+	if directory != "" {
+		v := url.Values{}
+		v.Set("directory", directory)
+		path += "?" + v.Encode()
+	}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var forms []FormInfo
+	if err := decodeDataOrDirect(raw, &forms); err != nil {
+		return nil, err
+	}
+	return forms, nil
+}
+
+// ListSessionForms lists pending forms for a session (GET /api/session/{sessionID}/form).
+func (c *Client) ListSessionForms(ctx context.Context, sessionID string) ([]FormInfo, error) {
+	path := fmt.Sprintf("/api/session/%s/form", url.PathEscape(sessionID))
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var forms []FormInfo
+	if err := decodeDataOrDirect(raw, &forms); err != nil {
+		return nil, err
+	}
+	return forms, nil
+}
+
+// ReplyForm submits answers for a pending form (POST /api/session/{sessionID}/form/{formID}/reply).
+// The server answers 204 No Content.
+func (c *Client) ReplyForm(ctx context.Context, sessionID, formID string, answer map[string]any) error {
+	path := fmt.Sprintf("/api/session/%s/form/%s/reply", url.PathEscape(sessionID), url.PathEscape(formID))
+	body := map[string]any{"answer": answer}
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+// CancelForm dismisses/cancels a pending form (DELETE /api/session/{sessionID}/form/{formID}).
+// The server answers 204 No Content.
+func (c *Client) CancelForm(ctx context.Context, sessionID, formID, message string) error {
+	path := fmt.Sprintf("/api/session/%s/form/%s", url.PathEscape(sessionID), url.PathEscape(formID))
+	if message != "" {
+		v := url.Values{}
+		v.Set("message", message)
+		path += "?" + v.Encode()
+	}
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
 // Event is an SSE event emitted by /api/event.

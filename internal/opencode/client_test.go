@@ -1313,10 +1313,11 @@ func TestRevertEndpoints(t *testing.T) {
 	t.Parallel()
 
 	var (
-		capturedStageBody  map[string]any
-		capturedClearReq   *http.Request
-		capturedCommitReq  *http.Request
-		capturedCompactReq *http.Request
+		capturedStageBody     map[string]any
+		capturedClearReq      *http.Request
+		capturedCommitReq     *http.Request
+		capturedCompactReq    *http.Request
+		capturedBackgroundReq *http.Request
 	)
 
 	client := &Client{
@@ -1352,6 +1353,12 @@ func TestRevertEndpoints(t *testing.T) {
 					}, nil
 				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/compact":
 					capturedCompactReq = req
+					return &http.Response{
+						StatusCode: http.StatusNoContent,
+						Body:       io.NopCloser(strings.NewReader("")),
+					}, nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/background":
+					capturedBackgroundReq = req
 					return &http.Response{
 						StatusCode: http.StatusNoContent,
 						Body:       io.NopCloser(strings.NewReader("")),
@@ -1410,6 +1417,14 @@ func TestRevertEndpoints(t *testing.T) {
 	}
 	if capturedCompactReq == nil {
 		t.Fatal("CompactSession request not captured")
+	}
+
+	// BackgroundSession
+	if err := client.BackgroundSession(ctx, "ses_123"); err != nil {
+		t.Fatalf("BackgroundSession failed: %v", err)
+	}
+	if capturedBackgroundReq == nil {
+		t.Fatal("BackgroundSession request not captured")
 	}
 }
 
@@ -1907,5 +1922,146 @@ func TestSearchSessions(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].ID != "ses_archived" {
 		t.Errorf("SearchSessions results = %+v, want [ses_archived]", sessions)
+	}
+}
+
+func TestFormEndpointsAndEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		capturedDir       string
+		capturedReplyBody map[string]any
+		capturedCancelMsg string
+	)
+
+	formJSON := `{
+		"id": "frm_123",
+		"sessionID": "ses_123",
+		"title": "Questions",
+		"metadata": {"kind": "question", "tool": {"messageID": "msg_1", "id": "call_1"}},
+		"fields": [
+			{
+				"key": "q0",
+				"title": "Database",
+				"description": "Which database should we use?",
+				"type": "string",
+				"options": [
+					{"value": "PostgreSQL (Recommended)", "label": "PostgreSQL (Recommended)", "description": "Relational DB"},
+					{"value": "SQLite", "label": "SQLite", "description": "Embedded DB"}
+				],
+				"custom": true
+			},
+			{
+				"key": "q1",
+				"title": "Features",
+				"description": "Select features to enable",
+				"type": "multiselect",
+				"options": [
+					{"value": "Auth", "label": "Auth", "description": "Authentication"},
+					{"value": "Metrics", "label": "Metrics", "description": "Prometheus metrics"}
+				],
+				"custom": true
+			}
+		]
+	}`
+
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/form":
+					capturedDir = req.URL.Query().Get("directory")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":[` + formJSON + `]}`)),
+					}, nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/form":
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":[` + formJSON + `]}`)),
+					}, nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/form/frm_123/reply":
+					if err := json.NewDecoder(req.Body).Decode(&capturedReplyBody); err != nil {
+						t.Fatalf("decode reply body: %v", err)
+					}
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+				case req.Method == http.MethodDelete && req.URL.Path == "/api/session/ses_123/form/frm_123":
+					capturedCancelMsg = req.URL.Query().Get("message")
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+				default:
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       io.NopCloser(strings.NewReader("not found")),
+					}, nil
+				}
+			}),
+		},
+	}
+
+	forms, err := client.ListForms(ctx, "/workspace")
+	if err != nil {
+		t.Fatalf("ListForms failed: %v", err)
+	}
+	if capturedDir != "/workspace" {
+		t.Errorf("capturedDir = %q, want /workspace", capturedDir)
+	}
+	if len(forms) != 1 || forms[0].ID != "frm_123" || len(forms[0].Fields) != 2 {
+		t.Fatalf("unexpected forms: %+v", forms)
+	}
+
+	sForms, err := client.ListSessionForms(ctx, "ses_123")
+	if err != nil {
+		t.Fatalf("ListSessionForms failed: %v", err)
+	}
+	if len(sForms) != 1 || sForms[0].Fields[0].Key != "q0" || sForms[0].Fields[1].Type != "multiselect" {
+		t.Fatalf("unexpected session forms: %+v", sForms)
+	}
+
+	err = client.ReplyForm(ctx, "ses_123", "frm_123", map[string]any{
+		"q0": "PostgreSQL (Recommended)",
+		"q1": []string{"Auth", "Metrics"},
+	})
+	if err != nil {
+		t.Fatalf("ReplyForm failed: %v", err)
+	}
+	ans, ok := capturedReplyBody["answer"].(map[string]any)
+	if !ok || ans["q0"] != "PostgreSQL (Recommended)" {
+		t.Errorf("unexpected ReplyForm body: %+v", capturedReplyBody)
+	}
+
+	err = client.CancelForm(ctx, "ses_123", "frm_123", "dismissed")
+	if err != nil {
+		t.Fatalf("CancelForm failed: %v", err)
+	}
+	if capturedCancelMsg != "dismissed" {
+		t.Errorf("capturedCancelMsg = %q, want dismissed", capturedCancelMsg)
+	}
+
+	var createdEv FormCreatedEvent
+	if err := json.Unmarshal([]byte(`{"form":`+formJSON+`}`), &createdEv); err != nil {
+		t.Fatalf("unmarshal FormCreatedEvent: %v", err)
+	}
+	if createdEv.Form.ID != "frm_123" || createdEv.Form.SessionID != "ses_123" {
+		t.Errorf("unexpected FormCreatedEvent: %+v", createdEv)
+	}
+
+	var repliedEv FormRepliedEvent
+	if err := json.Unmarshal([]byte(`{"id":"frm_123","sessionID":"ses_123","answer":{"q0":"SQLite"}}`), &repliedEv); err != nil {
+		t.Fatalf("unmarshal FormRepliedEvent: %v", err)
+	}
+	if repliedEv.ID != "frm_123" || repliedEv.SessionID != "ses_123" || repliedEv.Answer["q0"] != "SQLite" {
+		t.Errorf("unexpected FormRepliedEvent: %+v", repliedEv)
+	}
+
+	var cancelledEv FormCancelledEvent
+	if err := json.Unmarshal([]byte(`{"id":"frm_123","sessionID":"ses_123"}`), &cancelledEv); err != nil {
+		t.Fatalf("unmarshal FormCancelledEvent: %v", err)
+	}
+	if cancelledEv.ID != "frm_123" || cancelledEv.SessionID != "ses_123" {
+		t.Errorf("unexpected FormCancelledEvent: %+v", cancelledEv)
 	}
 }
