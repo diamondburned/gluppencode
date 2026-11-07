@@ -207,8 +207,16 @@ type Session struct {
 
 // ListSessions lists top-level sessions.
 func (c *Client) ListSessions(ctx context.Context, limit int) ([]Session, error) {
+	return c.SearchSessions(ctx, "", limit)
+}
+
+// SearchSessions searches top-level sessions matching query (GET /api/session?parentID=null&search=...).
+func (c *Client) SearchSessions(ctx context.Context, query string, limit int) ([]Session, error) {
 	v := url.Values{}
 	v.Set("parentID", "null")
+	if q := strings.TrimSpace(query); q != "" {
+		v.Set("search", q)
+	}
 	if limit > 0 {
 		v.Set("limit", strconv.Itoa(limit))
 	}

@@ -1866,3 +1866,46 @@ func TestInboxEventDecoding(t *testing.T) {
 		t.Errorf("unexpected item: %+v", ev.Item)
 	}
 }
+
+func TestSearchSessions(t *testing.T) {
+	t.Parallel()
+
+	var capturedQuery string
+	var capturedParent string
+	var capturedLimit string
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				if req.Method == http.MethodGet && req.URL.Path == "/api/session" {
+					q := req.URL.Query()
+					capturedQuery = q.Get("search")
+					capturedParent = q.Get("parentID")
+					capturedLimit = q.Get("limit")
+					resp := `{"data":[{"id":"ses_archived","title":"Archived feature work","location":{"directory":"/home/user/proj"}}]}`
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(resp)),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusNotFound,
+					Body:       io.NopCloser(strings.NewReader("not found")),
+				}, nil
+			}),
+		},
+	}
+
+	sessions, err := client.SearchSessions(context.Background(), "Archived feature", 50)
+	if err != nil {
+		t.Fatalf("SearchSessions failed: %v", err)
+	}
+	if capturedQuery != "Archived feature" || capturedParent != "null" || capturedLimit != "50" {
+		t.Errorf("query params = (search=%q, parentID=%q, limit=%q), want (Archived feature, null, 50)",
+			capturedQuery, capturedParent, capturedLimit)
+	}
+	if len(sessions) != 1 || sessions[0].ID != "ses_archived" {
+		t.Errorf("SearchSessions results = %+v, want [ses_archived]", sessions)
+	}
+}

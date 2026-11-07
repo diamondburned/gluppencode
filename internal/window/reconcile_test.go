@@ -752,3 +752,62 @@ func TestPendingPromptSteeredInFlight(t *testing.T) {
 		})
 	}
 }
+
+func TestPersistedStateAndProjectOrdering(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "opencode", "gluppencode.json")
+
+	dirA := filepath.Join(t.TempDir(), "proj-alpha")
+	dirB := filepath.Join(t.TempDir(), "proj-beta")
+	dirC := filepath.Join(t.TempDir(), "proj-gamma")
+
+	w := &Window{
+		statePath:         stateFile,
+		archivedSessions:  map[string]bool{"ses_old": true, "ses_false": false},
+		collapsedProjects: map[string]bool{normalizeProjectDir(dirB): true},
+		projectOrder:      []string{normalizeProjectDir(dirA), normalizeProjectDir(dirB)},
+	}
+	w.saveState()
+
+	w2 := &Window{statePath: stateFile}
+	w2.loadState()
+
+	if !w2.archivedSessions["ses_old"] || w2.archivedSessions["ses_false"] {
+		t.Fatalf("unexpected archivedSessions after reload: %+v", w2.archivedSessions)
+	}
+	if !w2.collapsedProjects[normalizeProjectDir(dirB)] {
+		t.Fatalf("expected dirB to remain collapsed after reload: %+v", w2.collapsedProjects)
+	}
+	wantOrder := []string{normalizeProjectDir(dirA), normalizeProjectDir(dirB)}
+	if !slices.Equal(w2.projectOrder, wantOrder) {
+		t.Fatalf("projectOrder = %v, want %v", w2.projectOrder, wantOrder)
+	}
+
+	// Discovering an existing project should not change order; discovering a new one appends it.
+	if w2.ensureProjectOrder(dirB) {
+		t.Fatalf("ensureProjectOrder(dirB) unexpectedly reported change")
+	}
+	if !w2.ensureProjectOrder(dirC) {
+		t.Fatalf("ensureProjectOrder(dirC) expected change")
+	}
+	wantOrder = append(wantOrder, normalizeProjectDir(dirC))
+	if !slices.Equal(w2.projectOrder, wantOrder) {
+		t.Fatalf("projectOrder after ensure = %v, want %v", w2.projectOrder, wantOrder)
+	}
+
+	if w2.compareProjectOrder(dirA, dirC) >= 0 {
+		t.Errorf("expected dirA < dirC in projectOrder")
+	}
+	if w2.compareProjectOrder(dirC, dirB) <= 0 {
+		t.Errorf("expected dirC > dirB in projectOrder")
+	}
+
+	// Drag-and-drop: move dirC to dirA's position (top)
+	moved, ok := moveProjectSlice(w2.projectOrder, dirC, dirA)
+	if !ok {
+		t.Fatalf("moveProjectSlice(dirC -> dirA) returned false")
+	}
+	wantMoved := []string{normalizeProjectDir(dirC), normalizeProjectDir(dirA), normalizeProjectDir(dirB)}
+	if !slices.Equal(moved, wantMoved) {
+		t.Fatalf("moved projectOrder = %v, want %v", moved, wantMoved)
+	}
+}

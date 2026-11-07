@@ -98,9 +98,11 @@ func (c *convTimeline) keepPendingAtBottom() {
 }
 
 type switcherIndicator struct {
-	box     *gtk.Box
-	spinner *adw.Spinner
-	label   *gtk.Label
+	box      *gtk.Box
+	spinner  *adw.Spinner
+	label    *gtk.Label
+	closeBtn *gtk.Button
+	rowPtr   uintptr
 }
 
 type sessionTab struct {
@@ -148,27 +150,33 @@ type Window struct {
 	cancel context.CancelFunc
 	client *opencode.Client
 
-	rootContent          *adw.OverlaySplitView
-	hideSidebarBtn       *gtk.Button
-	newSessionSidebarBtn *gtk.Button
-	searchSessionsBtn    *gtk.Button
-	viewSwitcherSidebar  *adw.ViewSwitcherSidebar
+	rootContent                *adw.OverlaySplitView
+	hideSidebarBtn             *gtk.Button
+	newSessionSidebarBtn       *gtk.MenuButton
+	newSessionSidebarPopover   *gtk.Popover
+	newSessionSidebarListBox   *gtk.ListBox
+	newSessionSidebarFolderBtn *gtk.Button
+	searchSessionsBtn          *gtk.Button
+	viewSwitcherSidebar        *adw.ViewSwitcherSidebar
 
-	bottomSheet           *adw.BottomSheet
-	showSidebarBtn        *gtk.Button
-	newSessionTopBtn      *gtk.Button
-	headerTitleStack      *gtk.Stack
-	windowTitle           *adw.WindowTitle
-	breadcrumbParentBtn   *gtk.Button
-	breadcrumbParentLabel *gtk.Label
-	breadcrumbChildLabel  *gtk.Label
-	horizTabScroll        *gtk.ScrolledWindow
-	horizTabBox           *gtk.Box
-	newWindowBtn          *gtk.Button
-	refreshBtn            *gtk.Button
-	tabModeBtn            *gtk.ToggleButton
-	headerSpinner         *adw.Spinner
-	viewStack             *adw.ViewStack
+	bottomSheet            *adw.BottomSheet
+	showSidebarBtn         *gtk.Button
+	newSessionTopBtn       *gtk.MenuButton
+	newSessionTopPopover   *gtk.Popover
+	newSessionTopListBox   *gtk.ListBox
+	newSessionTopFolderBtn *gtk.Button
+	headerTitleStack       *gtk.Stack
+	windowTitle            *adw.WindowTitle
+	breadcrumbParentBtn    *gtk.Button
+	breadcrumbParentLabel  *gtk.Label
+	breadcrumbChildLabel   *gtk.Label
+	horizTabScroll         *gtk.ScrolledWindow
+	horizTabBox            *gtk.Box
+	newWindowBtn           *gtk.Button
+	refreshBtn             *gtk.Button
+	tabModeBtn             *gtk.ToggleButton
+	headerSpinner          *adw.Spinner
+	viewStack              *adw.ViewStack
 
 	inputView      *gtksource.View
 	inputBuffer    *gtksource.Buffer
@@ -230,9 +238,19 @@ type Window struct {
 	showAllModelsRow   *gtk.ListBoxRow
 	showAllModelsLabel *gtk.Label
 
-	expandedProjects map[string]bool
-	allSessions      []opencode.Session
-	projectSessions  map[string][]opencode.Session
+	expandedProjects  map[string]bool
+	collapsedProjects map[string]bool
+	archivedSessions  map[string]bool
+	projectOrder      []string
+	statePath         string
+	allSessions       []opencode.Session
+	projectSessions   map[string][]opencode.Session
+
+	closeBtnSessID   map[uintptr]string
+	hoveredRow       map[uintptr]bool
+	rowControllers   map[uintptr]bool
+	rowProjectDir    map[uintptr]string
+	headerProjectDir map[uintptr]string
 
 	horizontalTabs bool
 	isMobile       bool
@@ -258,72 +276,86 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	builder := gtk.NewBuilderFromString(windowUI)
 
 	w := &Window{
-		ApplicationWindow:     adwWin,
-		appWin:                win,
-		ctx:                   winCtx,
-		cancel:                cancel,
-		client:                client,
-		rootContent:           builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
-		hideSidebarBtn:        builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
-		newSessionSidebarBtn:  builder.GetObject("newSessionSidebarBtn").Cast().(*gtk.Button),
-		searchSessionsBtn:     builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
-		viewSwitcherSidebar:   builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
-		bottomSheet:           builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
-		showSidebarBtn:        builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
-		newSessionTopBtn:      builder.GetObject("newSessionTopBtn").Cast().(*gtk.Button),
-		headerTitleStack:      builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
-		windowTitle:           builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
-		breadcrumbParentBtn:   builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
-		breadcrumbParentLabel: builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
-		breadcrumbChildLabel:  builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
-		horizTabScroll:        builder.GetObject("horizTabScroll").Cast().(*gtk.ScrolledWindow),
-		horizTabBox:           builder.GetObject("horizTabBox").Cast().(*gtk.Box),
-		newWindowBtn:          builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
-		refreshBtn:            builder.GetObject("refreshBtn").Cast().(*gtk.Button),
-		tabModeBtn:            builder.GetObject("tabModeBtn").Cast().(*gtk.ToggleButton),
-		headerSpinner:         builder.GetObject("headerSpinner").Cast().(*adw.Spinner),
-		viewStack:             builder.GetObject("viewStack").Cast().(*adw.ViewStack),
-		inputView:             builder.GetObject("inputView").Cast().(*gtksource.View),
-		sendBtn:               builder.GetObject("sendBtn").Cast().(*gtk.Button),
-		stopBtn:               builder.GetObject("stopBtn").Cast().(*gtk.Button),
-		attachBtn:             builder.GetObject("attachBtn").Cast().(*gtk.Button),
-		attachmentTray:        builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
-		composerPlaceholder:   builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
-		composerAgentBtn:      builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
-		composerModelBtn:      builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
-		agentPopover:          builder.GetObject("agentPopover").Cast().(*gtk.Popover),
-		modelPopover:          builder.GetObject("modelPopover").Cast().(*gtk.Popover),
-		agentPillLabel:        builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
-		modelStatusLabel:      builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
-		projectStatusBox:      builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
-		projectStatusLabel:    builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
-		branchStatusBox:       builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
-		branchStatusLabel:     builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
-		shellStatusBox:        builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
-		shellStatusLabel:      builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
-		subagentStatusBox:     builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
-		subagentStatusLabel:   builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
-		tokRateStatusLabel:    builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
-		contextStatusLabel:    builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
-		sheetEmptyLabel:       builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
-		shellsSectionBox:      builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
-		shellListBox:          builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
-		subagentsSectionBox:   builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
-		sheetBackToParentBtn:  builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
-		subagentListBox:       builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
-		agentListBox:          builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
-		modelSearchEntry:      builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
-		modelListBox:          builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
-		tabs:                  make(map[string]*sessionTab),
-		childToRoot:           make(map[string]string),
-		modelNames:            make(map[string]string),
-		modelLimits:           make(map[string]int),
-		branchCache:           make(map[string]string),
-		modelLastUsed:         make(map[string]int64),
-		expandedProjects:      make(map[string]bool),
-		projectSessions:       make(map[string][]opencode.Session),
-		activeShells:          make(map[string]opencode.ShellItem),
+		ApplicationWindow:          adwWin,
+		appWin:                     win,
+		ctx:                        winCtx,
+		cancel:                     cancel,
+		client:                     client,
+		rootContent:                builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
+		hideSidebarBtn:             builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
+		newSessionSidebarBtn:       builder.GetObject("newSessionSidebarBtn").Cast().(*gtk.MenuButton),
+		newSessionSidebarPopover:   builder.GetObject("newSessionSidebarPopover").Cast().(*gtk.Popover),
+		newSessionSidebarListBox:   builder.GetObject("newSessionSidebarListBox").Cast().(*gtk.ListBox),
+		newSessionSidebarFolderBtn: builder.GetObject("newSessionSidebarFolderBtn").Cast().(*gtk.Button),
+		searchSessionsBtn:          builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
+		viewSwitcherSidebar:        builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
+		bottomSheet:                builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
+		showSidebarBtn:             builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
+		newSessionTopBtn:           builder.GetObject("newSessionTopBtn").Cast().(*gtk.MenuButton),
+		newSessionTopPopover:       builder.GetObject("newSessionTopPopover").Cast().(*gtk.Popover),
+		newSessionTopListBox:       builder.GetObject("newSessionTopListBox").Cast().(*gtk.ListBox),
+		newSessionTopFolderBtn:     builder.GetObject("newSessionTopFolderBtn").Cast().(*gtk.Button),
+		headerTitleStack:           builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
+		windowTitle:                builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
+		breadcrumbParentBtn:        builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
+		breadcrumbParentLabel:      builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
+		breadcrumbChildLabel:       builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
+		horizTabScroll:             builder.GetObject("horizTabScroll").Cast().(*gtk.ScrolledWindow),
+		horizTabBox:                builder.GetObject("horizTabBox").Cast().(*gtk.Box),
+		newWindowBtn:               builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
+		refreshBtn:                 builder.GetObject("refreshBtn").Cast().(*gtk.Button),
+		tabModeBtn:                 builder.GetObject("tabModeBtn").Cast().(*gtk.ToggleButton),
+		headerSpinner:              builder.GetObject("headerSpinner").Cast().(*adw.Spinner),
+		viewStack:                  builder.GetObject("viewStack").Cast().(*adw.ViewStack),
+		inputView:                  builder.GetObject("inputView").Cast().(*gtksource.View),
+		sendBtn:                    builder.GetObject("sendBtn").Cast().(*gtk.Button),
+		stopBtn:                    builder.GetObject("stopBtn").Cast().(*gtk.Button),
+		attachBtn:                  builder.GetObject("attachBtn").Cast().(*gtk.Button),
+		attachmentTray:             builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
+		composerPlaceholder:        builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
+		composerAgentBtn:           builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
+		composerModelBtn:           builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
+		agentPopover:               builder.GetObject("agentPopover").Cast().(*gtk.Popover),
+		modelPopover:               builder.GetObject("modelPopover").Cast().(*gtk.Popover),
+		agentPillLabel:             builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
+		modelStatusLabel:           builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
+		projectStatusBox:           builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
+		projectStatusLabel:         builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
+		branchStatusBox:            builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
+		branchStatusLabel:          builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
+		shellStatusBox:             builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
+		shellStatusLabel:           builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
+		subagentStatusBox:          builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
+		subagentStatusLabel:        builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
+		tokRateStatusLabel:         builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
+		contextStatusLabel:         builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
+		sheetEmptyLabel:            builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
+		shellsSectionBox:           builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
+		shellListBox:               builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
+		subagentsSectionBox:        builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
+		sheetBackToParentBtn:       builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
+		subagentListBox:            builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
+		agentListBox:               builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
+		modelSearchEntry:           builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
+		modelListBox:               builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
+		tabs:                       make(map[string]*sessionTab),
+		childToRoot:                make(map[string]string),
+		modelNames:                 make(map[string]string),
+		modelLimits:                make(map[string]int),
+		branchCache:                make(map[string]string),
+		modelLastUsed:              make(map[string]int64),
+		expandedProjects:           make(map[string]bool),
+		collapsedProjects:          make(map[string]bool),
+		archivedSessions:           make(map[string]bool),
+		projectSessions:            make(map[string][]opencode.Session),
+		activeShells:               make(map[string]opencode.ShellItem),
+		closeBtnSessID:             make(map[uintptr]string),
+		hoveredRow:                 make(map[uintptr]bool),
+		rowControllers:             make(map[uintptr]bool),
+		rowProjectDir:              make(map[uintptr]string),
+		headerProjectDir:           make(map[uintptr]string),
 	}
+	w.loadState()
 	inputScroll := builder.GetObject("inputScroll").Cast().(*gtk.ScrolledWindow)
 	w.inputBuffer = w.inputView.Buffer().Cast().(*gtksource.Buffer)
 	w.inputBuffer.SetHighlightSyntax(false)
@@ -470,9 +502,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		return false
 	})
 
-	w.newSessionSidebarBtn.ConnectClicked(w.createNewSession)
+	w.setupNewSessionPopover(w.newSessionSidebarPopover, w.newSessionSidebarListBox, w.newSessionSidebarFolderBtn)
+	w.setupNewSessionPopover(w.newSessionTopPopover, w.newSessionTopListBox, w.newSessionTopFolderBtn)
 	w.searchSessionsBtn.ConnectClicked(w.openSessionSearchDialog)
-	w.newSessionTopBtn.ConnectClicked(w.createNewSession)
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
 	w.refreshBtn.ConnectClicked(w.loadAll)
 
@@ -626,6 +658,10 @@ func (w *Window) openNewWindow() {
 }
 
 func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
+	normDir := normalizeProjectDir(sess.Location.Directory)
+	if w.ensureProjectOrder(normDir) {
+		w.saveState()
+	}
 	if tab, ok := w.tabs[sess.ID]; ok {
 		if sess.Title != "" && tab.main.session.Title != sess.Title {
 			tab.main.session.Title = sess.Title
@@ -637,7 +673,6 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		}
 		return tab
 	}
-	normDir := normalizeProjectDir(sess.Location.Directory)
 	insertIdx := len(w.tabOrder)
 	inProject := false
 	for i, id := range w.tabOrder {
@@ -657,6 +692,9 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 			}
 			insertIdx = i + 1
 		} else if inProject {
+			break
+		} else if w.compareProjectOrder(normDir, tDir) < 0 {
+			insertIdx = i
 			break
 		}
 	}
@@ -739,10 +777,131 @@ func (w *Window) syncSectionStarts() {
 }
 
 func (w *Window) selectSession(sess opencode.Session) {
+	normDir := normalizeProjectDir(sess.Location.Directory)
+	stateChanged := false
+	if w.archivedSessions[sess.ID] {
+		delete(w.archivedSessions, sess.ID)
+		stateChanged = true
+	}
+	if w.collapsedProjects[normDir] {
+		delete(w.collapsedProjects, normDir)
+		stateChanged = true
+	}
+	if stateChanged {
+		w.saveState()
+	}
 	w.ensureSessionTab(sess)
 	w.syncProjectSessionVisibility()
 	w.viewStack.SetVisibleChildName(sess.ID)
 	w.onVisibleTabChanged()
+	w.syncSwitcherIndicators()
+}
+
+func (w *Window) archiveSession(sessID string) {
+	if sessID == "" {
+		return
+	}
+	tab, ok := w.tabs[sessID]
+	var rawDir string
+	if ok {
+		rawDir = tab.main.session.Location.Directory
+	} else {
+		for _, s := range w.allSessions {
+			if s.ID == sessID {
+				rawDir = s.Location.Directory
+				break
+			}
+		}
+	}
+	normDir := normalizeProjectDir(rawDir)
+
+	w.archivedSessions[sessID] = true
+	w.saveState()
+
+	if w.projectSessions != nil {
+		filtered := w.projectSessions[normDir][:0]
+		for _, s := range w.projectSessions[normDir] {
+			if s.ID != sessID && !w.archivedSessions[s.ID] {
+				filtered = append(filtered, s)
+			}
+		}
+		w.projectSessions[normDir] = filtered
+
+		// If this project is not expanded and now has fewer than 5 open tabs in w.tabs,
+		// promote the next unarchived session from w.projectSessions[normDir] so up to 5 remain visible.
+		if !w.expandedProjects[normDir] {
+			for _, candidate := range w.projectSessions[normDir] {
+				if _, exists := w.tabs[candidate.ID]; !exists {
+					w.ensureSessionTab(candidate)
+					break
+				}
+			}
+		}
+	}
+
+	if !ok {
+		return
+	}
+
+	wasCurrent := (w.currentRootSessionID() == sessID)
+	var nextID string
+	if wasCurrent {
+		idx := slices.Index(w.tabOrder, sessID)
+		// Prefer another tab in the same project first, then any neighboring tab.
+		for i := idx + 1; i < len(w.tabOrder); i++ {
+			id := w.tabOrder[i]
+			if t := w.tabs[id]; t != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
+				nextID = id
+				break
+			}
+		}
+		if nextID == "" {
+			for i := idx - 1; i >= 0; i-- {
+				id := w.tabOrder[i]
+				if t := w.tabs[id]; t != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
+					nextID = id
+					break
+				}
+			}
+		}
+		if nextID == "" {
+			for i := idx + 1; i < len(w.tabOrder); i++ {
+				if id := w.tabOrder[i]; id != sessID && w.tabs[id] != nil {
+					nextID = id
+					break
+				}
+			}
+		}
+		if nextID == "" {
+			for i := idx - 1; i >= 0; i-- {
+				if id := w.tabOrder[i]; id != sessID && w.tabs[id] != nil {
+					nextID = id
+					break
+				}
+			}
+		}
+	}
+
+	prevPopulating := w.populating
+	w.populating = true
+	tab.main.closeStreams()
+	for _, sub := range tab.subTimelines {
+		sub.closeStreams()
+	}
+	w.viewStack.Remove(tab.stack)
+	delete(w.tabs, sessID)
+	if idx := slices.Index(w.tabOrder, sessID); idx >= 0 {
+		w.tabOrder = slices.Delete(w.tabOrder, idx, idx+1)
+	}
+	w.syncSectionStarts()
+	w.populating = prevPopulating
+
+	w.syncProjectSessionVisibility()
+	if wasCurrent && nextID != "" {
+		w.viewStack.SetVisibleChildName(nextID)
+		w.onVisibleTabChanged()
+	}
+	w.syncSwitcherIndicators()
 }
 
 func (w *Window) openSessionSearchDialog() {
@@ -925,6 +1084,14 @@ func (w *Window) openSessionSearchDialog() {
 			textVBox.Append(subLabel)
 			rowBox.Append(textVBox)
 
+			if w.archivedSessions[m.sess.ID] {
+				archLabel := gtk.NewLabel("Archived")
+				archLabel.AddCSSClass("caption")
+				archLabel.AddCSSClass("glup-search-archived-badge")
+				archLabel.SetVAlign(gtk.AlignCenter)
+				rowBox.Append(archLabel)
+			}
+
 			if tm := formatRelativeTimemark(m.sess.Time.Updated); tm != "" {
 				timeLabel := gtk.NewLabel(tm)
 				timeLabel.AddCSSClass("caption")
@@ -943,7 +1110,41 @@ func (w *Window) openSessionSearchDialog() {
 		currentMatches = matches
 	}
 
-	searchEntry.ConnectSearchChanged(updateList)
+	mergeSessions := func(incoming []opencode.Session) {
+		sessionsLock.Lock()
+		defer sessionsLock.Unlock()
+		byID := make(map[string]int, len(sessionPool))
+		for i, s := range sessionPool {
+			byID[s.ID] = i
+		}
+		for _, s := range incoming {
+			if idx, ok := byID[s.ID]; ok {
+				sessionPool[idx] = s
+			} else {
+				byID[s.ID] = len(sessionPool)
+				sessionPool = append(sessionPool, s)
+			}
+		}
+		w.allSessions = slices.Clone(sessionPool)
+	}
+
+	searchEntry.ConnectSearchChanged(func() {
+		updateList()
+		q := strings.TrimSpace(searchEntry.Text())
+		if q == "" || w.client == nil {
+			return
+		}
+		gtkutil.Async(w.ctx, func() func() {
+			found, err := w.client.SearchSessions(w.ctx, q, 50)
+			if err != nil || len(found) == 0 {
+				return func() {}
+			}
+			return func() {
+				mergeSessions(found)
+				updateList()
+			}
+		})
+	})
 	updateList()
 
 	gtkutil.Async(w.ctx, func() func() {
@@ -952,10 +1153,7 @@ func (w *Window) openSessionSearchDialog() {
 			return func() {}
 		}
 		return func() {
-			sessionsLock.Lock()
-			sessionPool = sessions
-			w.allSessions = sessions
-			sessionsLock.Unlock()
+			mergeSessions(sessions)
 			updateList()
 		}
 	})
@@ -1191,15 +1389,55 @@ func findListBox(w gtk.Widgetter) *gtk.ListBox {
 	return nil
 }
 
-func getOrCreateSwitcherIndicator(hBox *gtk.Box) *switcherIndicator {
+func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow, sessID string) *switcherIndicator {
 	if hBox == nil {
 		return nil
 	}
+	var rowPtr uintptr
+	if row != nil {
+		rowPtr = row.Object.Native()
+		if !w.rowControllers[rowPtr] {
+			w.rowControllers[rowPtr] = true
+			rp := rowPtr
+			motion := gtk.NewEventControllerMotion()
+			motion.ConnectEnter(func(_, _ float64) {
+				w.hoveredRow[rp] = true
+				w.updateSwitcherIndicators()
+			})
+			motion.ConnectLeave(func() {
+				delete(w.hoveredRow, rp)
+				w.updateSwitcherIndicators()
+			})
+			row.AddController(motion)
+
+			dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
+			dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
+				row.AddCSSClass("glup-project-drop-target")
+				return gdk.ActionMove
+			})
+			dropTarget.ConnectLeave(func() {
+				row.RemoveCSSClass("glup-project-drop-target")
+			})
+			dropTarget.ConnectDrop(func(val *glib.Value, _, _ float64) bool {
+				row.RemoveCSSClass("glup-project-drop-target")
+				srcDir := val.String()
+				dstDir := w.rowProjectDir[rp]
+				if srcDir == "" || dstDir == "" || srcDir == dstDir {
+					return false
+				}
+				w.moveProjectInOrder(srcDir, dstDir)
+				return true
+			})
+			row.AddController(dropTarget)
+		}
+	}
+
 	for child := hBox.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
 		childBase := gtk.BaseWidget(child)
 		if childBase != nil && childBase.HasCSSClass("glup-switcher-suffix") {
 			var spinner *adw.Spinner
 			var label *gtk.Label
+			var closeBtn *gtk.Button
 			for inner := childBase.FirstChild(); inner != nil; inner = gtk.BaseWidget(inner).NextSibling() {
 				innerBase := gtk.BaseWidget(inner)
 				if innerBase == nil {
@@ -1211,9 +1449,13 @@ func getOrCreateSwitcherIndicator(hBox *gtk.Box) *switcherIndicator {
 				if lbl, ok := innerBase.Cast().(*gtk.Label); ok {
 					label = lbl
 				}
+				if btn, ok := innerBase.Cast().(*gtk.Button); ok {
+					closeBtn = btn
+				}
 			}
-			if box, ok := childBase.Cast().(*gtk.Box); ok && spinner != nil && label != nil {
-				return &switcherIndicator{box: box, spinner: spinner, label: label}
+			if box, ok := childBase.Cast().(*gtk.Box); ok && spinner != nil && label != nil && closeBtn != nil {
+				w.closeBtnSessID[closeBtn.Object.Native()] = sessID
+				return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: rowPtr}
 			}
 		}
 	}
@@ -1234,9 +1476,25 @@ func getOrCreateSwitcherIndicator(hBox *gtk.Box) *switcherIndicator {
 	label.SetVisible(false)
 	box.Append(label)
 
+	closeBtn := gtk.NewButtonFromIconName("window-close-symbolic")
+	closeBtn.AddCSSClass("flat")
+	closeBtn.AddCSSClass("circular")
+	closeBtn.AddCSSClass("glup-sidebar-close-btn")
+	closeBtn.SetTooltipText("Archive Session")
+	closeBtn.SetVAlign(gtk.AlignCenter)
+	closeBtn.SetVisible(false)
+	btnPtr := closeBtn.Object.Native()
+	w.closeBtnSessID[btnPtr] = sessID
+	closeBtn.ConnectClicked(func() {
+		if id := w.closeBtnSessID[btnPtr]; id != "" {
+			w.archiveSession(id)
+		}
+	})
+	box.Append(closeBtn)
+
 	hBox.SetVAlign(gtk.AlignCenter)
 	hBox.Append(box)
-	return &switcherIndicator{box: box, spinner: spinner, label: label}
+	return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: rowPtr}
 }
 
 func updateRowShowMore(row *gtk.ListBoxRow, hiddenCount int, onExpand func()) {
@@ -1300,23 +1558,34 @@ func updateRowShowMore(row *gtk.ListBoxRow, hiddenCount int, onExpand func()) {
 	vBox.Append(btn)
 }
 
-func newProjectHeaderBox(dir string, includeSeparator bool) *gtk.Box {
+func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.Box {
+	normDir := normalizeProjectDir(rawDir)
 	outerBox := gtk.NewBox(gtk.OrientationVertical, 0)
 	outerBox.AddCSSClass("glup-sidebar-project-header")
-	outerBox.SetMarginStart(14)
-	outerBox.SetMarginEnd(10)
+	outerBox.SetMarginStart(8)
+	outerBox.SetMarginEnd(8)
 	outerBox.SetMarginTop(6)
 	outerBox.SetMarginBottom(2)
 
 	if includeSeparator {
 		sep := gtk.NewSeparator(gtk.OrientationHorizontal)
 		sep.SetMarginTop(4)
-		sep.SetMarginBottom(8)
+		sep.SetMarginBottom(6)
+		sep.SetMarginStart(6)
+		sep.SetMarginEnd(2)
 		outerBox.Append(sep)
 	}
 
-	hBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	hBox := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	hBox.AddCSSClass("glup-sidebar-project-header-box")
+
+	chevron := gtk.NewImageFromIconName("chevron-right-symbolic")
+	chevron.AddCSSClass("glup-sidebar-project-chevron")
+	if !w.collapsedProjects[normDir] {
+		chevron.AddCSSClass("glup-sidebar-project-chevron-expanded")
+	}
+	chevron.SetVAlign(gtk.AlignCenter)
+	hBox.Append(chevron)
 
 	folderIcon := gtk.NewImageFromIconName("folder-symbolic")
 	folderIcon.AddCSSClass("glup-sidebar-folder-icon")
@@ -1326,14 +1595,14 @@ func newProjectHeaderBox(dir string, includeSeparator bool) *gtk.Box {
 	textBox := gtk.NewBox(gtk.OrientationVertical, 1)
 	textBox.SetHExpand(true)
 
-	titleLabel := gtk.NewLabel(projectName(dir))
+	titleLabel := gtk.NewLabel(projectName(rawDir))
 	titleLabel.AddCSSClass("glup-sidebar-project-title")
 	titleLabel.SetXAlign(0)
 	titleLabel.SetEllipsize(pango.EllipsizeMiddle)
 	titleLabel.SetHExpand(true)
 	textBox.Append(titleLabel)
 
-	subtitleLabel := gtk.NewLabel(shortDir(dir))
+	subtitleLabel := gtk.NewLabel(shortDir(rawDir))
 	subtitleLabel.AddCSSClass("glup-sidebar-project-subtitle")
 	subtitleLabel.AddCSSClass("dim-label")
 	subtitleLabel.AddCSSClass("caption")
@@ -1343,11 +1612,71 @@ func newProjectHeaderBox(dir string, includeSeparator bool) *gtk.Box {
 	textBox.Append(subtitleLabel)
 
 	hBox.Append(textBox)
+
+	countLabel := gtk.NewLabel("")
+	countLabel.AddCSSClass("caption")
+	countLabel.AddCSSClass("dim-label")
+	countLabel.AddCSSClass("glup-sidebar-project-count")
+	countLabel.SetVAlign(gtk.AlignCenter)
+	countLabel.SetVisible(false)
+	hBox.Append(countLabel)
+
 	outerBox.Append(hBox)
+
+	ptr := outerBox.Object.Native()
+	w.headerProjectDir[ptr] = normDir
+
+	click := gtk.NewGestureClick()
+	click.SetButton(1)
+	click.ConnectReleased(func(_ int, _, _ float64) {
+		click.SetState(gtk.EventSequenceClaimed)
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.toggleProjectCollapsed(d)
+		}
+	})
+	hBox.AddController(click)
+
+	dragSource := gtk.NewDragSource()
+	dragSource.SetActions(gdk.ActionMove)
+	dragSource.ConnectPrepare(func(_, _ float64) *gdk.ContentProvider {
+		d := w.headerProjectDir[ptr]
+		if d == "" {
+			return nil
+		}
+		return gdk.NewContentProviderForValue(glib.NewValue(d))
+	})
+	dragSource.ConnectDragBegin(func(_ gdk.Dragger) {
+		hBox.AddCSSClass("glup-project-dragging")
+	})
+	dragSource.ConnectDragEnd(func(_ gdk.Dragger, _ bool) {
+		hBox.RemoveCSSClass("glup-project-dragging")
+	})
+	hBox.AddController(dragSource)
+
+	dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
+	dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
+		hBox.AddCSSClass("glup-project-drop-target")
+		return gdk.ActionMove
+	})
+	dropTarget.ConnectLeave(func() {
+		hBox.RemoveCSSClass("glup-project-drop-target")
+	})
+	dropTarget.ConnectDrop(func(val *glib.Value, _, _ float64) bool {
+		hBox.RemoveCSSClass("glup-project-drop-target")
+		srcDir := val.String()
+		dstDir := w.headerProjectDir[ptr]
+		if srcDir == "" || dstDir == "" || srcDir == dstDir {
+			return false
+		}
+		w.moveProjectInOrder(srcDir, dstDir)
+		return true
+	})
+	outerBox.AddController(dropTarget)
+
 	return outerBox
 }
 
-func updateProjectHeaderLabels(root gtk.Widgetter, dir string) {
+func (w *Window) updateProjectHeaderLabels(root gtk.Widgetter, rawDir string) {
 	if root == nil {
 		return
 	}
@@ -1355,12 +1684,21 @@ func updateProjectHeaderLabels(root gtk.Widgetter, dir string) {
 	if base == nil {
 		return
 	}
-	var titleLbl, subLbl *gtk.Label
-	var visit func(w gtk.Widgetter)
-	visit = func(w gtk.Widgetter) {
-		bw := gtk.BaseWidget(w)
+	normDir := normalizeProjectDir(rawDir)
+	w.headerProjectDir[base.Object.Native()] = normDir
+	collapsed := w.collapsedProjects[normDir]
+	total := len(w.projectSessions[normDir])
+
+	var titleLbl, subLbl, countLbl *gtk.Label
+	var chevronImg *gtk.Image
+	var visit func(wid gtk.Widgetter)
+	visit = func(wid gtk.Widgetter) {
+		bw := gtk.BaseWidget(wid)
 		if bw == nil {
 			return
+		}
+		if bw.HasCSSClass("glup-sidebar-project-header") {
+			w.headerProjectDir[bw.Object.Native()] = normDir
 		}
 		if bw.HasCSSClass("glup-sidebar-project-title") {
 			if l, ok := bw.Cast().(*gtk.Label); ok {
@@ -1370,6 +1708,14 @@ func updateProjectHeaderLabels(root gtk.Widgetter, dir string) {
 			if l, ok := bw.Cast().(*gtk.Label); ok {
 				subLbl = l
 			}
+		} else if bw.HasCSSClass("glup-sidebar-project-count") {
+			if l, ok := bw.Cast().(*gtk.Label); ok {
+				countLbl = l
+			}
+		} else if bw.HasCSSClass("glup-sidebar-project-chevron") {
+			if img, ok := bw.Cast().(*gtk.Image); ok {
+				chevronImg = img
+			}
 		}
 		for c := bw.FirstChild(); c != nil; c = gtk.BaseWidget(c).NextSibling() {
 			visit(c)
@@ -1377,14 +1723,29 @@ func updateProjectHeaderLabels(root gtk.Widgetter, dir string) {
 	}
 	visit(base)
 	if titleLbl != nil {
-		titleLbl.SetText(projectName(dir))
+		titleLbl.SetText(projectName(rawDir))
 	}
 	if subLbl != nil {
-		subLbl.SetText(shortDir(dir))
+		subLbl.SetText(shortDir(rawDir))
+	}
+	if chevronImg != nil {
+		if collapsed {
+			chevronImg.RemoveCSSClass("glup-sidebar-project-chevron-expanded")
+		} else {
+			chevronImg.AddCSSClass("glup-sidebar-project-chevron-expanded")
+		}
+	}
+	if countLbl != nil {
+		if collapsed && total > 0 {
+			countLbl.SetText(fmt.Sprintf("%d", total))
+			countLbl.SetVisible(true)
+		} else {
+			countLbl.SetVisible(false)
+		}
 	}
 }
 
-func updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
+func (w *Window) updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
 	header := row.Header()
 	if header == nil {
 		return
@@ -1395,7 +1756,7 @@ func updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
 	}
 
 	headerBase.AddCSSClass("glup-sidebar-project-header")
-	headerBase.SetTooltipText(fmt.Sprintf("%s (%s)", projectName(dir), shortDir(dir)))
+	headerBase.SetTooltipText(fmt.Sprintf("%s (%s) — click to collapse/expand, drag to reorder", projectName(dir), shortDir(dir)))
 
 	if stack, ok := headerBase.Cast().(*gtk.Stack); ok {
 		stack.SetVhomogeneous(false)
@@ -1405,12 +1766,13 @@ func updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
 		}
 		child := stack.ChildByName(childName)
 		if child != nil {
-			updateProjectHeaderLabels(child, dir)
+			w.updateProjectHeaderLabels(child, dir)
 			stack.SetVisibleChildName(childName)
 			return
 		}
 
-		hBox := newProjectHeaderBox(dir, sectionIdx > 0)
+		hBox := w.newProjectHeaderBox(dir, sectionIdx > 0)
+		w.updateProjectHeaderLabels(hBox, dir)
 		stack.AddNamed(hBox, childName)
 		stack.SetVisibleChildName(childName)
 		return
@@ -1424,14 +1786,50 @@ func updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
 			}
 		}
 		if hasSep == (sectionIdx > 0) {
-			updateProjectHeaderLabels(header, dir)
+			w.updateProjectHeaderLabels(header, dir)
 			return
 		}
 	}
 
-	hBox := newProjectHeaderBox(dir, sectionIdx > 0)
-	hBox.SetTooltipText(fmt.Sprintf("%s (%s)", projectName(dir), shortDir(dir)))
+	hBox := w.newProjectHeaderBox(dir, sectionIdx > 0)
+	w.updateProjectHeaderLabels(hBox, dir)
+	hBox.SetTooltipText(fmt.Sprintf("%s (%s) — click to collapse/expand, drag to reorder", projectName(dir), shortDir(dir)))
 	row.SetHeader(hBox)
+}
+
+func (w *Window) toggleProjectCollapsed(normDir string) {
+	if normDir == "" {
+		return
+	}
+	if w.collapsedProjects[normDir] {
+		delete(w.collapsedProjects, normDir)
+	} else {
+		w.collapsedProjects[normDir] = true
+	}
+	w.saveState()
+	w.syncProjectSessionVisibility()
+	w.syncSwitcherIndicators()
+}
+
+func (w *Window) moveProjectInOrder(srcDir, dstDir string) {
+	normSrc := normalizeProjectDir(srcDir)
+	normDst := normalizeProjectDir(dstDir)
+	w.ensureProjectOrder(normSrc, normDst)
+	next, ok := moveProjectSlice(w.projectOrder, normSrc, normDst)
+	if !ok {
+		return
+	}
+	w.projectOrder = next
+	w.saveState()
+
+	prevPopulating := w.populating
+	w.populating = true
+	w.reorderTabsByProject()
+	w.syncSectionStarts()
+	w.populating = prevPopulating
+
+	w.syncProjectSessionVisibility()
+	w.syncSwitcherIndicators()
 }
 
 func (w *Window) syncProjectSessionVisibility() {
@@ -1446,6 +1844,14 @@ func (w *Window) syncProjectSessionVisibility() {
 	}
 
 	for dir, tabs := range projectTabs {
+		if w.collapsedProjects[dir] {
+			// Keep the first tab page visible so AdwViewSwitcherSidebar's ListBox
+			// preserves the section header row, and hide its row body in syncSwitcherIndicators.
+			for i, tab := range tabs {
+				tab.page.SetVisible(i == 0)
+			}
+			continue
+		}
 		expanded := w.expandedProjects[dir]
 		for i, tab := range tabs {
 			if expanded || i < 5 || tab.main.session.ID == currentID {
@@ -1470,7 +1876,7 @@ func (w *Window) reorderTabsByProject() {
 		dirA := normalizeProjectDir(tabA.main.session.Location.Directory)
 		dirB := normalizeProjectDir(tabB.main.session.Location.Directory)
 		if dirA != dirB {
-			return cmp.Compare(dirA, dirB)
+			return w.compareProjectOrder(dirA, dirB)
 		}
 		timeA := tabA.main.session.Time.Updated
 		if timeA == 0 {
@@ -1652,7 +2058,7 @@ func (w *Window) syncSwitcherIndicators() {
 	lastVisibleID := make(map[string]string)
 	hiddenCounts := make(map[string]int)
 	for dir, tabs := range projectTabs {
-		if w.expandedProjects[dir] {
+		if w.expandedProjects[dir] || w.collapsedProjects[dir] {
 			continue
 		}
 		var visibleCount int
@@ -1701,33 +2107,53 @@ func (w *Window) syncSwitcherIndicators() {
 			}
 			if rowIdx < len(visibleTabOrder) {
 				sessID := visibleTabOrder[rowIdx]
-				if sessID == currentID {
-					activeRow = row
-				}
 				row.AddCSSClass("glup-sidebar-conversation-row")
 				if tab, ok := w.tabs[sessID]; ok {
 					rawDir := tab.main.session.Location.Directory
 					dir := normalizeProjectDir(rawDir)
+					w.rowProjectDir[row.Object.Native()] = dir
+					collapsed := w.collapsedProjects[dir]
+
 					if tab.page.StartsSection() {
-						updateRowProjectHeader(row, rawDir, sectionIdx)
+						w.updateRowProjectHeader(row, rawDir, sectionIdx)
 						sectionIdx++
 					} else if hdr := row.Header(); hdr != nil {
 						if hb := gtk.BaseWidget(hdr); hb != nil && hb.HasCSSClass("glup-sidebar-project-header") {
 							row.SetHeader(nil)
 						}
 					}
-					if hBox := findFirstHorizontalBox(row.Child()); hBox != nil {
-						hBox.AddCSSClass("glup-sidebar-conversation-box")
-						tab.sidebarIndicator = getOrCreateSwitcherIndicator(hBox)
-					}
 
-					if lastVisibleID[dir] == sessID {
-						dirKey := dir
-						updateRowShowMore(row, hiddenCounts[dir], func() {
-							w.expandProjectSessions(dirKey)
-						})
-					} else {
+					if collapsed {
 						updateRowShowMore(row, 0, nil)
+						row.AddCSSClass("glup-sidebar-row-collapsed")
+						row.SetActivatable(false)
+						row.SetSelectable(false)
+						if rc := row.Child(); rc != nil {
+							gtk.BaseWidget(rc).SetVisible(false)
+						}
+					} else {
+						row.RemoveCSSClass("glup-sidebar-row-collapsed")
+						row.SetActivatable(true)
+						row.SetSelectable(true)
+						if rc := row.Child(); rc != nil {
+							gtk.BaseWidget(rc).SetVisible(true)
+						}
+						if sessID == currentID {
+							activeRow = row
+						}
+						if hBox := findFirstHorizontalBox(row.Child()); hBox != nil {
+							hBox.AddCSSClass("glup-sidebar-conversation-box")
+							tab.sidebarIndicator = w.getOrCreateSwitcherIndicator(hBox, row, sessID)
+						}
+
+						if lastVisibleID[dir] == sessID {
+							dirKey := dir
+							updateRowShowMore(row, hiddenCounts[dir], func() {
+								w.expandProjectSessions(dirKey)
+							})
+						} else {
+							updateRowShowMore(row, 0, nil)
+						}
 					}
 				}
 			}
@@ -1735,6 +2161,8 @@ func (w *Window) syncSwitcherIndicators() {
 		}
 		if activeRow != nil {
 			lb.SelectRow(activeRow)
+		} else {
+			lb.UnselectAll()
 		}
 	}
 
@@ -1746,12 +2174,24 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 	if ind == nil || tab == nil {
 		return
 	}
+	if ind.closeBtn != nil {
+		w.closeBtnSessID[ind.closeBtn.Object.Native()] = sessID
+	}
 	focused := (sessID == w.currentRootSessionID())
 	active := tab.main.active
+	hovered := ind.rowPtr != 0 && w.hoveredRow[ind.rowPtr]
+	showClose := ind.closeBtn != nil && (hovered || focused)
+	if ind.closeBtn != nil {
+		ind.closeBtn.SetVisible(showClose)
+	}
 
 	switch {
 	case active:
 		ind.spinner.SetVisible(true)
+		ind.label.SetVisible(false)
+		ind.box.SetVisible(true)
+	case showClose:
+		ind.spinner.SetVisible(false)
 		ind.label.SetVisible(false)
 		ind.box.SetVisible(true)
 	case focused:
@@ -1900,27 +2340,26 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	w.populating = true
 
 	var topSessions []opencode.Session
+	var discoveredDirs []string
 	for _, s := range sessions {
 		if s.ParentID != "" {
 			continue
 		}
+		if s.Location.Directory != "" {
+			discoveredDirs = append(discoveredDirs, s.Location.Directory)
+		}
+		if w.archivedSessions[s.ID] && s.ID != prevSelected {
+			continue
+		}
 		topSessions = append(topSessions, s)
 	}
-
-	projectOrder := make(map[string]int)
-	var projects []string
-	for _, s := range topSessions {
-		dir := normalizeProjectDir(s.Location.Directory)
-		if _, exists := projectOrder[dir]; !exists {
-			projectOrder[dir] = len(projects)
-			projects = append(projects, dir)
-		}
+	if w.ensureProjectOrder(discoveredDirs...) {
+		w.saveState()
 	}
+
 	slices.SortStableFunc(topSessions, func(a, b opencode.Session) int {
-		pa := projectOrder[normalizeProjectDir(a.Location.Directory)]
-		pb := projectOrder[normalizeProjectDir(b.Location.Directory)]
-		if pa != pb {
-			return pa - pb
+		if c := w.compareProjectOrder(a.Location.Directory, b.Location.Directory); c != 0 {
+			return c
 		}
 		if a.Time.Updated != b.Time.Updated {
 			if a.Time.Updated > b.Time.Updated {
@@ -3078,10 +3517,139 @@ func (w *Window) switchModel(model opencode.ModelRef) {
 	})
 }
 
+func (w *Window) setupNewSessionPopover(popover *gtk.Popover, listBox *gtk.ListBox, folderBtn *gtk.Button) {
+	var rowDirs []string
+	popover.ConnectShow(func() {
+		for c := listBox.FirstChild(); c != nil; {
+			next := gtk.BaseWidget(c).NextSibling()
+			listBox.Remove(c)
+			c = next
+		}
+		rowDirs = nil
+
+		var dirs []string
+		seen := make(map[string]bool)
+		addDir := func(raw string) {
+			d := normalizeProjectDir(raw)
+			if d != "" && !seen[d] {
+				seen[d] = true
+				dirs = append(dirs, d)
+			}
+		}
+		for _, d := range w.projectOrder {
+			addDir(d)
+		}
+		for _, id := range w.tabOrder {
+			if tab := w.tabs[id]; tab != nil {
+				addDir(tab.main.session.Location.Directory)
+			}
+		}
+		for _, s := range w.allSessions {
+			addDir(s.Location.Directory)
+		}
+		if cwd, err := os.Getwd(); err == nil && cwd != "" {
+			addDir(cwd)
+		}
+
+		currentDir := ""
+		if tab := w.currentTab(); tab != nil {
+			currentDir = normalizeProjectDir(tab.main.session.Location.Directory)
+		}
+
+		for _, dir := range dirs {
+			row := gtk.NewListBoxRow()
+			hBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
+			hBox.SetMarginTop(6)
+			hBox.SetMarginBottom(6)
+			hBox.SetMarginStart(10)
+			hBox.SetMarginEnd(10)
+
+			icon := gtk.NewImageFromIconName("folder-symbolic")
+			icon.AddCSSClass("glup-sidebar-folder-icon")
+			icon.SetVAlign(gtk.AlignCenter)
+			hBox.Append(icon)
+
+			vBox := gtk.NewBox(gtk.OrientationVertical, 1)
+			vBox.SetHExpand(true)
+
+			titleLbl := gtk.NewLabel(projectName(dir))
+			titleLbl.SetXAlign(0)
+			titleLbl.SetEllipsize(pango.EllipsizeMiddle)
+			titleLbl.AddCSSClass("glup-sidebar-project-title")
+			vBox.Append(titleLbl)
+
+			subLbl := gtk.NewLabel(shortDir(dir))
+			subLbl.SetXAlign(0)
+			subLbl.SetEllipsize(pango.EllipsizeMiddle)
+			subLbl.AddCSSClass("caption")
+			subLbl.AddCSSClass("dim-label")
+			vBox.Append(subLbl)
+
+			hBox.Append(vBox)
+
+			if dir == currentDir {
+				check := gtk.NewImageFromIconName("object-select-symbolic")
+				check.SetVAlign(gtk.AlignCenter)
+				hBox.Append(check)
+			}
+
+			row.SetChild(hBox)
+			listBox.Append(row)
+			rowDirs = append(rowDirs, dir)
+		}
+	})
+
+	listBox.ConnectRowActivated(func(row *gtk.ListBoxRow) {
+		if row == nil {
+			return
+		}
+		idx := row.Index()
+		if idx < 0 || idx >= len(rowDirs) {
+			return
+		}
+		dir := rowDirs[idx]
+		popover.Popdown()
+		w.createNewSessionInDir(dir)
+	})
+
+	folderBtn.ConnectClicked(func() {
+		popover.Popdown()
+		w.promptNewProjectFolder()
+	})
+}
+
+func (w *Window) promptNewProjectFolder() {
+	dialog := gtk.NewFileDialog()
+	dialog.SetTitle("Open Project Folder")
+	dialog.SetModal(true)
+	dialog.SelectFolder(w.ctx, &w.ApplicationWindow.Window, func(res gio.AsyncResulter) {
+		file, err := dialog.SelectFolderFinish(res)
+		if err != nil || file == nil {
+			return
+		}
+		path := file.Path()
+		if path == "" {
+			return
+		}
+		w.createNewSessionInDir(path)
+	})
+}
+
 func (w *Window) createNewSession() {
 	cwd, _ := os.Getwd()
 	if tab := w.currentTab(); tab != nil && tab.main.session.Location.Directory != "" {
 		cwd = tab.main.session.Location.Directory
+	}
+	if cwd == "" {
+		cwd, _ = os.UserHomeDir()
+	}
+	w.createNewSessionInDir(cwd)
+}
+
+func (w *Window) createNewSessionInDir(dir string) {
+	cwd := strings.TrimSpace(dir)
+	if cwd == "" {
+		cwd, _ = os.Getwd()
 	}
 	if cwd == "" {
 		cwd, _ = os.UserHomeDir()
@@ -3094,6 +3662,26 @@ func (w *Window) createNewSession() {
 			if err != nil {
 				app.Error(w.ctx, err)
 				return
+			}
+			normDir := normalizeProjectDir(sess.Location.Directory)
+			stateChanged := false
+			if w.archivedSessions[sess.ID] {
+				delete(w.archivedSessions, sess.ID)
+				stateChanged = true
+			}
+			if w.collapsedProjects[normDir] {
+				delete(w.collapsedProjects, normDir)
+				stateChanged = true
+			}
+			if w.ensureProjectOrder(normDir) {
+				stateChanged = true
+			}
+			if stateChanged {
+				w.saveState()
+			}
+			w.allSessions = append([]opencode.Session{*sess}, w.allSessions...)
+			if w.projectSessions != nil {
+				w.projectSessions[normDir] = append([]opencode.Session{*sess}, w.projectSessions[normDir]...)
 			}
 			tab := w.ensureSessionTab(*sess)
 			tab.main.loaded = true
@@ -4165,7 +4753,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 							w.rebuildSubagentList(tab)
 						}
 					}
-				} else if sess.ID != "" {
+				} else if sess.ID != "" && !w.archivedSessions[sess.ID] {
 					w.ensureSessionTab(sess)
 					w.syncProjectSessionVisibility()
 					w.syncSwitcherIndicators()

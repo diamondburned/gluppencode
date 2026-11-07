@@ -36,7 +36,78 @@ sidebar .navigation-sidebar > .header > header.glup-sidebar-project-header,
 }
 
 .glup-sidebar-project-header-box {
+	padding: 4px 6px;
+	border-radius: 6px;
+	transition: background-color 120ms ease;
+}
+
+.glup-sidebar-project-header-box:hover {
+	background-color: color-mix(in srgb, currentColor 7%, transparent);
+}
+
+.glup-sidebar-project-chevron {
+	opacity: 0.55;
+	transition: transform 150ms ease, opacity 120ms ease;
+}
+
+.glup-sidebar-project-chevron-expanded {
+	transform: rotate(90deg);
+}
+
+.glup-sidebar-project-count {
+	font-size: 0.78em;
+	opacity: 0.65;
+	padding: 0 4px;
+}
+
+.glup-project-dragging {
+	opacity: 0.5;
+}
+
+.glup-project-drop-target {
+	background-color: alpha(@accent_bg_color, 0.18);
+	outline: 1px dashed alpha(@accent_color, 0.7);
+	border-radius: 6px;
+}
+
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:hover,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:active,
+sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
+	min-height: 0;
+	margin: 0;
 	padding: 0;
+	border: none;
+	background-color: transparent;
+	box-shadow: none;
+}
+
+.glup-sidebar-close-btn {
+	min-width: 20px;
+	min-height: 20px;
+	padding: 0;
+	margin: 0;
+	border-radius: 5px;
+	opacity: 0.6;
+	transition: opacity 120ms ease, background-color 120ms ease;
+}
+
+.glup-sidebar-close-btn:hover {
+	opacity: 1;
+	background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.glup-new-project-btn {
+	padding: 6px 10px;
+	border-radius: 8px;
+}
+
+.glup-search-archived-badge {
+	font-size: 0.75em;
+	padding: 1px 6px;
+	border-radius: 4px;
+	background-color: color-mix(in srgb, currentColor 10%, transparent);
+	opacity: 0.75;
 }
 
 .glup-sidebar-folder-icon {
