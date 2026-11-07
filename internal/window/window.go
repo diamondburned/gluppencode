@@ -51,6 +51,7 @@ type convTimeline struct {
 	compactionMap  map[string]*CompactionWidget
 	messageWidgets map[string]gtk.Widgetter
 	revertBanner   *RevertBannerWidget
+	thinkingLabel  *gtk.Label
 	pendingPrompts []*pendingPrompt
 	seenMsgIDs     map[string]bool
 	messages       []opencode.Message
@@ -89,6 +90,14 @@ func (c *convTimeline) keepPendingAtBottom() {
 				c.timelineBox.ReorderChildAfter(p.widget, last)
 			}
 		}
+	}
+	if c.thinkingLabel != nil {
+		if c.thinkingLabel.Parent() == nil {
+			c.timelineBox.Append(c.thinkingLabel)
+		} else if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.thinkingLabel) {
+			c.timelineBox.ReorderChildAfter(c.thinkingLabel, last)
+		}
+		c.thinkingLabel.SetVisible(c.active)
 	}
 	if c.revertBanner != nil && c.revertBanner.Visible() && c.revertBanner.Parent() != nil {
 		if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.revertBanner) {
@@ -175,7 +184,6 @@ type Window struct {
 	newWindowBtn           *gtk.Button
 	refreshBtn             *gtk.Button
 	tabModeBtn             *gtk.ToggleButton
-	headerSpinner          *adw.Spinner
 	viewStack              *adw.ViewStack
 
 	inputView      *gtksource.View
@@ -307,7 +315,6 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		newWindowBtn:               builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
 		refreshBtn:                 builder.GetObject("refreshBtn").Cast().(*gtk.Button),
 		tabModeBtn:                 builder.GetObject("tabModeBtn").Cast().(*gtk.ToggleButton),
-		headerSpinner:              builder.GetObject("headerSpinner").Cast().(*adw.Spinner),
 		viewStack:                  builder.GetObject("viewStack").Cast().(*adw.ViewStack),
 		inputView:                  builder.GetObject("inputView").Cast().(*gtksource.View),
 		sendBtn:                    builder.GetObject("sendBtn").Cast().(*gtk.Button),
@@ -1206,10 +1213,19 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	scroll.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
 	scroll.SetChild(clamp)
 
+	thinkingLabel := gtk.NewLabel("Thinking...")
+	thinkingLabel.SetXAlign(0)
+	thinkingLabel.SetHAlign(gtk.AlignStart)
+	thinkingLabel.AddCSSClass("dim-label")
+	thinkingLabel.AddCSSClass("glup-thinking-label")
+	thinkingLabel.SetVisible(false)
+	timelineBox.Append(thinkingLabel)
+
 	conv := &convTimeline{
 		session:        sess,
 		scroll:         scroll,
 		timelineBox:    timelineBox,
+		thinkingLabel:  thinkingLabel,
 		assistantMap:   make(map[string]*AssistantMessageWidget),
 		compactionMap:  make(map[string]*CompactionWidget),
 		messageWidgets: make(map[string]gtk.Widgetter),
@@ -4848,6 +4864,10 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		if !active {
 			conv.runningTools = 0
 		}
+		conv.keepPendingAtBottom()
+		if active {
+			conv.scroll.ScrollToBottom()
+		}
 	}
 	if conv == tab.main {
 		tab.page.SetBadgeNumber(0)
@@ -4862,7 +4882,6 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 }
 
 func (w *Window) updateBusyState(busy bool) {
-	w.headerSpinner.SetVisible(busy)
 	w.stopBtn.SetVisible(busy)
 }
 

@@ -2,6 +2,20 @@
 	padding: 8px 16px 24px 16px;
 }
 
+@keyframes glup-thinking-pulse {
+	0%, 100% {
+		opacity: 0.25;
+	}
+	50% {
+		opacity: 0.9;
+	}
+}
+
+.glup-thinking-label {
+	margin: 8px 0 4px 0;
+	animation: glup-thinking-pulse 1.3s ease-in-out infinite;
+}
+
 .glup-post-entry {
 	padding: 0;
 	margin: 0;

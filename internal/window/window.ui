@@ -302,11 +302,6 @@
                     <property name="tooltip-text">Toggle Horizontal / Vertical Tabs</property>
                   </object>
                 </child>
-                <child type="end">
-                  <object class="AdwSpinner" id="headerSpinner">
-                    <property name="visible">false</property>
-                  </object>
-                </child>
               </object>
             </child>
 
