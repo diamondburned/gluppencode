@@ -215,6 +215,8 @@ type Window struct {
 	subagentsSectionBox  *gtk.Box
 	sheetBackToParentBtn *gtk.Button
 	subagentListBox      *gtk.ListBox
+	contextSectionBox    *gtk.Box
+	contextInfoGrid      *gtk.Grid
 	agentListBox         *gtk.ListBox
 	modelSearchEntry     *gtk.SearchEntry
 	modelListBox         *gtk.ListBox
@@ -335,6 +337,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		subagentsSectionBox:        builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
 		sheetBackToParentBtn:       builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
 		subagentListBox:            builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
+		contextSectionBox:          builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
+		contextInfoGrid:            builder.GetObject("contextInfoGrid").Cast().(*gtk.Grid),
 		agentListBox:               builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
 		modelSearchEntry:           builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
 		modelListBox:               builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
@@ -2896,6 +2900,7 @@ func (w *Window) onStreamDelta(tab *sessionTab, conv *convTimeline, deltaLen int
 func (w *Window) updateBottomBar(tab *sessionTab) {
 	if tab == nil {
 		w.tokRateStatusLabel.SetVisible(false)
+		w.rebuildContextInfo(nil)
 		return
 	}
 	conv := tab.activeConv()
@@ -2999,6 +3004,7 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 	w.contextStatusLabel.SetLabel(ctxText)
 
 	w.rebuildAgentPills()
+	w.rebuildContextInfo(tab)
 }
 
 func (w *Window) getGitBranch(dir string) string {
@@ -3074,8 +3080,181 @@ func (w *Window) updateSheetEmptyState() {
 	if w.sheetEmptyLabel == nil {
 		return
 	}
-	hasContent := w.shellsSectionBox.Visible() || w.subagentsSectionBox.Visible()
+	hasContent := w.shellsSectionBox.Visible() || w.subagentsSectionBox.Visible() ||
+		(w.contextSectionBox != nil && w.contextSectionBox.Visible())
 	w.sheetEmptyLabel.SetVisible(!hasContent)
+}
+
+func formatIntWithCommas(n int) string {
+	s := fmt.Sprintf("%d", n)
+	if len(s) <= 3 {
+		return s
+	}
+	var b strings.Builder
+	pre := len(s) % 3
+	if pre > 0 {
+		b.WriteString(s[:pre])
+	}
+	for i := pre; i < len(s); i += 3 {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteString(s[i : i+3])
+	}
+	return b.String()
+}
+
+func formatSheetTimestamp(ms int64) string {
+	if ms <= 0 {
+		return "—"
+	}
+	return time.UnixMilli(ms).Local().Format("Jan 2, 2006, 3:04 PM")
+}
+
+func (w *Window) rebuildContextInfo(tab *sessionTab) {
+	if w.contextSectionBox == nil || w.contextInfoGrid == nil {
+		return
+	}
+	for c := w.contextInfoGrid.FirstChild(); c != nil; c = w.contextInfoGrid.FirstChild() {
+		w.contextInfoGrid.Remove(c)
+	}
+	if tab == nil {
+		w.contextSectionBox.SetVisible(false)
+		w.updateSheetEmptyState()
+		return
+	}
+	conv := tab.activeConv()
+	if conv == nil {
+		w.contextSectionBox.SetVisible(false)
+		w.updateSheetEmptyState()
+		return
+	}
+
+	sess := conv.session
+	rawDir := tab.main.session.Location.Directory
+	projDisplay := projectName(rawDir)
+	if sd := shortDir(rawDir); sd != "" && sd != projDisplay {
+		projDisplay = fmt.Sprintf("%s (%s)", projDisplay, sd)
+	}
+	if tab.gitBranch != "" {
+		projDisplay = fmt.Sprintf("%s · %s", projDisplay, tab.gitBranch)
+	}
+
+	sessTitle := strings.TrimSpace(sess.Title)
+	if sessTitle == "" {
+		sessTitle = "Untitled Session"
+	}
+
+	providerDisplay := sess.Model.ProviderID
+	if providerDisplay == "" {
+		providerDisplay = "—"
+	}
+	modelKey := sess.Model.String()
+	modelDisplay := w.modelNames[modelKey]
+	if modelDisplay == "" {
+		modelDisplay = w.modelNames[sess.Model.ID]
+	}
+	if modelDisplay == "" {
+		modelDisplay = sess.Model.ID
+	}
+	if modelDisplay == "" {
+		modelDisplay = "Default Model"
+	}
+
+	limit := w.modelLimits[modelKey]
+	if limit == 0 {
+		limit = w.modelLimits[sess.Model.ID]
+	}
+	limitStr := "—"
+	if limit > 0 {
+		limitStr = formatIntWithCommas(limit)
+	}
+
+	var userCount, assistantCount int
+	var totalCost float64
+	var latestTokens opencode.TokenUsage
+	for _, m := range conv.messages {
+		switch m.Type {
+		case "user":
+			userCount++
+		case "assistant":
+			assistantCount++
+		}
+		totalCost += m.Cost
+		if (m.Type == "" || m.Type == "assistant") && (m.Tokens.Input+m.Tokens.Cache.Read+m.Tokens.Output > 0) {
+			latestTokens = m.Tokens
+		}
+	}
+	if sess.Cost > totalCost {
+		totalCost = sess.Cost
+	}
+	tok := latestTokens
+	if tok.Input+tok.Cache.Read+tok.Output+tok.Reasoning == 0 {
+		tok = sess.Tokens
+	}
+	contextTokens := tok.Input + tok.Cache.Read
+	totalTokens := tok.Input + tok.Output + tok.Reasoning + tok.Cache.Read + tok.Cache.Write
+
+	usageStr := "0%"
+	if limit > 0 && contextTokens > 0 {
+		pct := int((float64(contextTokens)/float64(limit))*100 + 0.5)
+		usageStr = fmt.Sprintf("%d%%", pct)
+	} else if contextTokens > 0 {
+		usageStr = formatIntWithCommas(contextTokens)
+	}
+
+	type kvItem struct {
+		label string
+		value string
+	}
+	items := []kvItem{
+		{"Project", projDisplay},
+		{"Agent", formatAgentDisplayName(sess.Agent)},
+		{"Session", sessTitle},
+		{"Messages", formatIntWithCommas(len(conv.messages))},
+		{"Provider", providerDisplay},
+		{"Model", modelDisplay},
+		{"Context Limit", limitStr},
+		{"Total Tokens", formatIntWithCommas(totalTokens)},
+		{"Usage", usageStr},
+		{"Input Tokens", formatIntWithCommas(tok.Input)},
+		{"Output Tokens", formatIntWithCommas(tok.Output)},
+		{"Reasoning Tokens", formatIntWithCommas(tok.Reasoning)},
+		{"Cache Tokens (read/write)", fmt.Sprintf("%s / %s", formatIntWithCommas(tok.Cache.Read), formatIntWithCommas(tok.Cache.Write))},
+		{"User Messages", formatIntWithCommas(userCount)},
+		{"Assistant Messages", formatIntWithCommas(assistantCount)},
+		{"Total Cost", fmt.Sprintf("$%.2f", totalCost)},
+		{"Session Created", formatSheetTimestamp(sess.Time.Created)},
+		{"Last Activity", formatSheetTimestamp(sess.Time.Updated)},
+	}
+
+	for i, item := range items {
+		col := i % 2
+		row := i / 2
+
+		cell := gtk.NewBox(gtk.OrientationVertical, 2)
+		cell.AddCSSClass("glup-context-cell")
+		cell.SetHExpand(true)
+
+		kLbl := gtk.NewLabel(item.label)
+		kLbl.AddCSSClass("glup-context-cell-label")
+		kLbl.SetXAlign(0)
+		kLbl.SetEllipsize(pango.EllipsizeEnd)
+		cell.Append(kLbl)
+
+		vLbl := gtk.NewLabel(item.value)
+		vLbl.AddCSSClass("glup-context-cell-value")
+		vLbl.SetXAlign(0)
+		vLbl.SetEllipsize(pango.EllipsizeMiddle)
+		vLbl.SetSelectable(true)
+		vLbl.SetTooltipText(item.value)
+		cell.Append(vLbl)
+
+		w.contextInfoGrid.Attach(cell, col, row, 1, 1)
+	}
+
+	w.contextSectionBox.SetVisible(true)
+	w.updateSheetEmptyState()
 }
 
 func (w *Window) rebuildShellList() {
@@ -3116,7 +3295,7 @@ func (w *Window) rebuildShellList() {
 			titleText = shellItem.Command
 		}
 		titleLbl := gtk.NewLabel(titleText)
-		titleLbl.AddCSSClass("heading")
+		titleLbl.AddCSSClass("glup-shell-command")
 		titleLbl.SetXAlign(0)
 		titleLbl.SetEllipsize(pango.EllipsizeEnd)
 		vBox.Append(titleLbl)
@@ -3128,6 +3307,7 @@ func (w *Window) rebuildShellList() {
 		subLbl := gtk.NewLabel(subtitleText)
 		subLbl.AddCSSClass("dim-label")
 		subLbl.AddCSSClass("caption")
+		subLbl.AddCSSClass("glup-shell-command")
 		subLbl.SetXAlign(0)
 		subLbl.SetEllipsize(pango.EllipsizeEnd)
 		vBox.Append(subLbl)

@@ -811,3 +811,22 @@ func TestPersistedStateAndProjectOrdering(t *testing.T) {
 		t.Fatalf("moved projectOrder = %v, want %v", moved, wantMoved)
 	}
 }
+
+func TestFormatIntWithCommas(t *testing.T) {
+	tests := []struct {
+		in   int
+		want string
+	}{
+		{0, "0"},
+		{452, "452"},
+		{2191, "2,191"},
+		{124314, "124,314"},
+		{200000, "200,000"},
+		{1000000, "1,000,000"},
+	}
+	for _, tt := range tests {
+		if got := formatIntWithCommas(tt.in); got != tt.want {
+			t.Errorf("formatIntWithCommas(%d) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}

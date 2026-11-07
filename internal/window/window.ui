@@ -790,6 +790,34 @@
                         </child>
                       </object>
                     </child>
+                    <child>
+                      <object class="GtkBox" id="contextSectionBox">
+                        <property name="orientation">vertical</property>
+                        <property name="spacing">8</property>
+                        <property name="visible">false</property>
+                        <child>
+                          <object class="GtkLabel">
+                            <property name="label">Session &amp; Context</property>
+                            <property name="xalign">0</property>
+                            <property name="hexpand">true</property>
+                            <style>
+                              <class name="heading"/>
+                            </style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkGrid" id="contextInfoGrid">
+                            <property name="column-spacing">16</property>
+                            <property name="row-spacing">12</property>
+                            <property name="column-homogeneous">true</property>
+                            <property name="hexpand">true</property>
+                            <style>
+                              <class name="glup-context-grid"/>
+                            </style>
+                          </object>
+                        </child>
+                      </object>
+                    </child>
                   </object>
                 </property>
               </object>
