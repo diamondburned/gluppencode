@@ -502,6 +502,8 @@ type Window struct {
 	tabOrder    []string               // root session IDs in display order
 	childToRoot map[string]string      // child session ID -> root session ID
 
+	sessionTouched map[string]time.Time // root session ID -> last activity or visit; see suspend.go
+	shownRoot      string               // root session last shown by onVisibleTabChanged
 	agents         []opencode.Agent
 	agentRows      []agentRowData
 	models         []opencode.ModelInfo
@@ -4127,7 +4129,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	}
 
 	var topSessions []opencode.Session
-	var discoveredDirs []string
+	var discoveredDirs, awakeDirs []string
 	stateChanged := false
 	for _, s := range sessions {
 		if s.ParentID != "" {
@@ -4138,6 +4140,12 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		}
 		_, isRunning := active[s.ID]
 		isRunning = isRunning || (s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle) || activeRootIDs[s.ID]
+		// Idle, unvisited and archived sessions are suspended: their
+		// locations are not polled for pending forms and permissions.
+		if s.Location.Directory != "" && (isRunning ||
+			(!w.archivedSessions[s.ID] && (s.ID == prevSelected || w.recentlyTouched(s.ID)))) {
+			awakeDirs = append(awakeDirs, s.Location.Directory)
+		}
 		if isRunning && !w.archivedSessions[s.ID] {
 			if !w.visibleSessions[s.ID] {
 				w.visibleSessions[s.ID] = true
@@ -4237,7 +4245,9 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 			w.inputView.GrabFocus()
 		}
 	})
-	w.loadPendingFormsForAllDirs(discoveredDirs)
+	if len(awakeDirs) > 0 {
+		w.loadPendingFormsForAllDirs(awakeDirs)
+	}
 }
 
 func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
@@ -4378,8 +4388,8 @@ func (w *Window) setTakeCharge(active bool) {
 	for _, perm := range pendingPerms {
 		w.replyPermissionTakeCharge(perm)
 	}
-	if w.client != nil {
-		w.loadPendingFormsForAllDirs(w.projectOrder)
+	if dirs := w.awakeTabDirs(); w.client != nil && len(dirs) > 0 {
+		w.loadPendingFormsForAllDirs(dirs)
 	}
 }
 
@@ -4441,7 +4451,7 @@ func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 			return
 		}
 	}
-	tab, conv := w.resolveConv(form.SessionID)
+	tab, conv := w.resolveEventConv(form.SessionID)
 	if tab == nil || conv == nil {
 		return
 	}
@@ -4613,7 +4623,7 @@ func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest) {
 			return
 		}
 	}
-	tab, conv := w.resolveConv(perm.SessionID)
+	tab, conv := w.resolveEventConv(perm.SessionID)
 	if tab == nil || conv == nil {
 		return
 	}
@@ -4752,6 +4762,7 @@ func (w *Window) onVisibleTabChanged() {
 	if w.populating {
 		return
 	}
+	w.noteVisibleRoot()
 	w.syncEmptyGreeterVisibility()
 	tab := w.currentTab()
 	if tab == nil {
@@ -6082,7 +6093,7 @@ func (w *Window) refreshShells() {
 		dirs = append(dirs, d)
 	}
 	for _, tab := range w.tabs {
-		if d := tab.main.session.Location.Directory; d != "" && !seenDirs[d] {
+		if d := tab.main.session.Location.Directory; d != "" && !seenDirs[d] && !w.isTabSuspended(tab) {
 			seenDirs[d] = true
 			dirs = append(dirs, d)
 		}
@@ -8826,6 +8837,9 @@ func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgI
 
 func (w *Window) resyncOnReconnect() {
 	for _, tab := range w.tabs {
+		if w.isTabSuspended(tab) {
+			continue
+		}
 		if tab.main.loaded {
 			w.reconcileTail(tab.main.session.ID)
 		}
@@ -9035,7 +9049,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			w.updateSessionActivityState(d.SessionID, true)
 			w.revealActiveSession(d.SessionID)
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, true)
 			w.setSubagentActive(d.SessionID, true, "")
@@ -9046,7 +9060,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			w.updateSessionActivityState(d.SessionID, false)
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, false)
 			outcome := "succeeded"
@@ -9089,7 +9103,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.inbox.enqueued":
 		var d opencode.InboxEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
 				w.onInboxEnqueued(tab, conv, d)
@@ -9099,7 +9113,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.inbox.delivery.changed":
 		var d opencode.InboxEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			_, conv := w.resolveConv(d.SessionID)
+			_, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil && d.InboxID != "" {
 				for _, p := range conv.pendingPrompts {
 					if p != nil && p.inboxID == d.InboxID {
@@ -9116,7 +9130,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.inbox.cancelled":
 		var d opencode.InboxEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			_, conv := w.resolveConv(d.SessionID)
+			_, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil && d.InboxID != "" {
 				if conv.ignoredCancelIDs[d.InboxID] {
 					delete(conv.ignoredCancelIDs, d.InboxID)
@@ -9144,7 +9158,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			Metadata  map[string]any `json:"metadata,omitempty"`
 		}
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
 				if conv.loaded {
@@ -9191,7 +9205,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.agent.selected":
 		var d opencode.AgentSelectedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil && d.Agent != "" {
 				conv.session.Agent = d.Agent
 				if conv.loaded {
@@ -9206,7 +9220,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.model.selected":
 		var d opencode.ModelSelectedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil && d.Model.ID != "" {
 				conv.session.Model = d.Model
 				w.updateModelLastUsed(d.Model, time.Now().UnixMilli())
@@ -9223,7 +9237,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.step.started":
 		var d opencode.StepStartedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
 				conv.streamStart = time.Now()
@@ -9251,7 +9265,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.step.streamed":
 		var d opencode.StepStreamedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			_, conv := w.resolveConv(d.SessionID)
+			_, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				if conv.streamStart.IsZero() {
 					conv.streamStart = time.Now()
@@ -9263,7 +9277,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.step.ended":
 		var d opencode.StepEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
 				totalTok := d.Tokens.Output + d.Tokens.Reasoning
@@ -9319,7 +9333,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.reasoning.delta":
 		var d opencode.TextDeltaEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				if conv.loaded {
@@ -9332,7 +9346,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.reasoning.ended":
 		var d opencode.TextEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil && conv.loaded {
 				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
 				aw.FinalizeReasoning(d.Ordinal, d.Text)
@@ -9342,7 +9356,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.text.delta":
 		var d opencode.TextDeltaEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				if strings.TrimSpace(d.Delta) != "" {
@@ -9358,7 +9372,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.text.ended":
 		var d opencode.TextEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if strings.TrimSpace(d.Text) != "" {
 				w.markTabNeedsAttention(tab, false)
 			}
@@ -9371,7 +9385,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.input.started":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				conv.runningTools++
 				if d.ID != "" && d.Name != "" {
@@ -9388,7 +9402,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.input.delta":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				name := d.Name
@@ -9406,7 +9420,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.called":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			var name string
 			if conv != nil {
 				if d.ID != "" && d.Name != "" {
@@ -9449,7 +9463,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.progress", "session.tool.updated":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				if d.ID != "" && d.Name != "" {
 					conv.toolNames[d.ID] = d.Name
@@ -9532,7 +9546,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.success":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				if conv.runningTools > 0 {
 					conv.runningTools--
@@ -9614,7 +9628,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.tool.failed":
 		var d opencode.ToolEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				if conv.runningTools > 0 {
 					conv.runningTools--
@@ -9658,7 +9672,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.revert.staged":
 		var d opencode.RevertStagedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				conv.session.Revert = &d.Revert
 				if len(d.Revert.Files) > 0 || d.Revert.Diff != "" {
@@ -9671,7 +9685,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.revert.cleared":
 		var d opencode.RevertClearedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				conv.session.Revert = nil
 				conv.revertFilesRolled = false
@@ -9682,7 +9696,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.revert.committed":
 		var d opencode.RevertCommittedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
+			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				w.commitRevertState(tab, conv)
 			}
