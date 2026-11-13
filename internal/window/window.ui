@@ -12,106 +12,63 @@
     <property name="enable-show-gesture">true</property>
 
     <property name="sidebar">
-      <object class="AdwToolbarView" id="sidebarToolbar">
-        <property name="top-bar-style">flat</property>
-        <child type="top">
-          <object class="AdwHeaderBar" id="sidebarHeader">
-            <property name="show-end-title-buttons">false</property>
-            <property name="title-widget">
-              <object class="GtkLabel">
-                <property name="label">Sessions</property>
+      <object class="GtkOverlay" id="sidebarOverlay">
+        <property name="child">
+          <object class="AdwToolbarView" id="sidebarToolbar">
+            <property name="top-bar-style">flat</property>
+            <child type="top">
+              <object class="AdwHeaderBar" id="sidebarHeader">
+                <property name="show-start-title-buttons">false</property>
+                <property name="show-end-title-buttons">false</property>
                 <style>
-                  <class name="heading"/>
+                  <class name="glup-sidebar-header"/>
                 </style>
-              </object>
-            </property>
-            <child type="start">
-              <object class="GtkButton" id="hideSidebarBtn">
-                <property name="icon-name">sidebar-show-symbolic</property>
-                <property name="tooltip-text">Hide Sidebar</property>
-              </object>
-            </child>
-            <child type="end">
-              <object class="GtkMenuButton" id="newSessionSidebarBtn">
-                <property name="icon-name">list-add-symbolic</property>
-                <property name="tooltip-text">New Session</property>
-                <property name="popover">
-                  <object class="GtkPopover" id="newSessionSidebarPopover">
-                    <property name="has-arrow">false</property>
-                    <property name="child">
-                      <object class="GtkBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">8</property>
-                        <property name="width-request">280</property>
-                        <style>
-                          <class name="glup-popover-content"/>
-                        </style>
-                        <child>
-                          <object class="GtkSearchEntry" id="newSessionSidebarSearchEntry">
-                            <property name="placeholder-text">Search projects…</property>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkScrolledWindow">
-                            <property name="hscrollbar-policy">never</property>
-                            <property name="vscrollbar-policy">automatic</property>
-                            <property name="propagate-natural-height">true</property>
-                            <property name="max-content-height">260</property>
-                            <property name="child">
-                              <object class="GtkListBox" id="newSessionSidebarListBox">
-                                <property name="selection-mode">single</property>
-                                <property name="activate-on-single-click">true</property>
-                                <style>
-                                  <class name="boxed-list"/>
-                                </style>
-                              </object>
-                            </property>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkButton" id="newSessionSidebarFolderBtn">
-                            <style>
-                              <class name="flat"/>
-                              <class name="glup-new-project-btn"/>
-                            </style>
-                            <property name="child">
-                              <object class="GtkBox">
-                                <property name="orientation">horizontal</property>
-                                <property name="spacing">8</property>
-                                <property name="halign">center</property>
-                                <child>
-                                  <object class="GtkImage">
-                                    <property name="icon-name">folder-visiting-symbolic</property>
-                                  </object>
-                                </child>
-                                <child>
-                                  <object class="GtkLabel">
-                                    <property name="label">Open Folder…</property>
-                                  </object>
-                                </child>
-                              </object>
-                            </property>
-                          </object>
-                        </child>
-                      </object>
-                    </property>
+                <property name="title-widget">
+                  <object class="GtkLabel">
+                    <property name="label">Sessions</property>
+                    <property name="ellipsize">end</property>
+                    <style>
+                      <class name="heading"/>
+                    </style>
                   </object>
                 </property>
+                <child type="start">
+                  <object class="GtkButton" id="hideSidebarBtn">
+                    <property name="icon-name">sidebar-show-symbolic</property>
+                    <property name="tooltip-text">Hide Sidebar</property>
+                  </object>
+                </child>
+                <child type="start">
+                  <object class="GtkMenuButton" id="appMenuSidebarBtn">
+                    <property name="icon-name">view-more-symbolic</property>
+                    <property name="tooltip-text">Main Menu</property>
+                  </object>
+                </child>
+                <child type="end">
+                  <object class="GtkButton" id="searchSessionsBtn">
+                    <property name="icon-name">system-search-symbolic</property>
+                    <property name="tooltip-text">Search Sessions &amp; Projects (Ctrl+K)</property>
+                  </object>
+                </child>
               </object>
             </child>
-            <child type="end">
-              <object class="GtkButton" id="searchSessionsBtn">
-                <property name="icon-name">system-search-symbolic</property>
-                <property name="tooltip-text">Search Sessions (Ctrl+K)</property>
+            <property name="content">
+              <object class="AdwViewSwitcherSidebar" id="viewSwitcherSidebar">
+                <property name="vexpand">true</property>
               </object>
-            </child>
-          </object>
-        </child>
-        <property name="content">
-          <object class="AdwViewSwitcherSidebar" id="viewSwitcherSidebar">
-            <property name="vexpand">true</property>
+            </property>
           </object>
         </property>
+        <child type="overlay">
+          <object class="GtkBox" id="sidebarResizeHandle">
+            <property name="halign">end</property>
+            <property name="vexpand">true</property>
+            <property name="width-request">6</property>
+            <style>
+              <class name="glup-sidebar-resizer"/>
+            </style>
+          </object>
+        </child>
       </object>
     </property>
 
@@ -136,72 +93,17 @@
                   </object>
                 </child>
                 <child type="start">
-                  <object class="GtkMenuButton" id="newSessionTopBtn">
-                    <property name="icon-name">list-add-symbolic</property>
-                    <property name="tooltip-text">New Session</property>
+                  <object class="GtkMenuButton" id="appMenuTopBtn">
+                    <property name="icon-name">view-more-symbolic</property>
+                    <property name="tooltip-text">Main Menu</property>
                     <property name="visible">false</property>
-                    <property name="popover">
-                      <object class="GtkPopover" id="newSessionTopPopover">
-                        <property name="has-arrow">false</property>
-                        <property name="child">
-                          <object class="GtkBox">
-                            <property name="orientation">vertical</property>
-                            <property name="spacing">8</property>
-                            <property name="width-request">280</property>
-                            <style>
-                              <class name="glup-popover-content"/>
-                            </style>
-                            <child>
-                              <object class="GtkSearchEntry" id="newSessionTopSearchEntry">
-                                <property name="placeholder-text">Search projects…</property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkScrolledWindow">
-                                <property name="hscrollbar-policy">never</property>
-                                <property name="vscrollbar-policy">automatic</property>
-                                <property name="propagate-natural-height">true</property>
-                                <property name="max-content-height">260</property>
-                                <property name="child">
-                                  <object class="GtkListBox" id="newSessionTopListBox">
-                                    <property name="selection-mode">single</property>
-                                    <property name="activate-on-single-click">true</property>
-                                    <style>
-                                      <class name="boxed-list"/>
-                                    </style>
-                                  </object>
-                                </property>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="newSessionTopFolderBtn">
-                                <style>
-                                  <class name="flat"/>
-                                  <class name="glup-new-project-btn"/>
-                                </style>
-                                <property name="child">
-                                  <object class="GtkBox">
-                                    <property name="orientation">horizontal</property>
-                                    <property name="spacing">8</property>
-                                    <property name="halign">center</property>
-                                    <child>
-                                      <object class="GtkImage">
-                                        <property name="icon-name">folder-visiting-symbolic</property>
-                                      </object>
-                                    </child>
-                                    <child>
-                                      <object class="GtkLabel">
-                                        <property name="label">Open Folder…</property>
-                                      </object>
-                                    </child>
-                                  </object>
-                                </property>
-                              </object>
-                            </child>
-                          </object>
-                        </property>
-                      </object>
-                    </property>
+                  </object>
+                </child>
+                <child type="start">
+                  <object class="GtkButton" id="searchSessionsTopBtn">
+                    <property name="icon-name">system-search-symbolic</property>
+                    <property name="tooltip-text">Search Sessions &amp; Projects (Ctrl+K)</property>
+                    <property name="visible">false</property>
                   </object>
                 </child>
                 <property name="title-widget">
@@ -334,25 +236,49 @@
             </child>
 
             <property name="content">
-              <object class="GtkBox" id="contentMainBox">
-                <property name="orientation">vertical</property>
-                <property name="vexpand">true</property>
-                <property name="hexpand">true</property>
-                <child>
-                  <object class="AdwViewStack" id="viewStack">
+              <!-- The composer floats over the timeline so messages scroll
+                   (dimmed) behind it; see applyComposerInset. -->
+              <object class="GtkOverlay" id="contentOverlay">
+                <property name="child">
+                  <object class="GtkBox" id="contentMainBox">
+                    <property name="orientation">vertical</property>
                     <property name="vexpand">true</property>
                     <property name="hexpand">true</property>
+                    <child>
+                      <object class="GtkOverlay" id="viewStackOverlay">
+                        <property name="vexpand">true</property>
+                        <property name="hexpand">true</property>
+                        <property name="child">
+                          <object class="AdwViewStack" id="viewStack">
+                            <property name="hhomogeneous">false</property>
+                            <property name="vhomogeneous">false</property>
+                            <property name="vexpand">true</property>
+                            <property name="hexpand">true</property>
+                          </object>
+                        </property>
+                      </object>
+                    </child>
+                  </object>
+                </property>
+                <child type="overlay">
+                  <!-- Fade ramp directly above the composer; positioned in Go. -->
+                  <object class="GtkBox" id="timelineBottomFade">
+                    <property name="can-target">false</property>
+                    <style>
+                      <class name="glup-timeline-bottom-fade"/>
+                    </style>
                   </object>
                 </child>
-                <child>
+                <child type="overlay">
                   <object class="GtkBox" id="composerBar">
+                    <property name="valign">end</property>
                     <property name="orientation">vertical</property>
                     <property name="spacing">0</property>
                     <style>
                       <class name="glup-composer-bar"/>
                     </style>
                     <child>
-                      <object class="AdwClamp">
+                      <object class="AdwClamp" id="composerClamp">
                         <property name="maximum-size">920</property>
                         <property name="tightening-threshold">680</property>
                         <property name="child">
@@ -674,6 +600,7 @@
                       <object class="GtkLabel">
                         <property name="label">Ctrl+B to background</property>
                         <property name="valign">center</property>
+                        <property name="ellipsize">end</property>
                       </object>
                     </child>
                   </object>
@@ -701,6 +628,7 @@
                   <object class="GtkLabel" id="shellStatusLabel">
                     <property name="label">0 shells</property>
                     <property name="valign">center</property>
+                    <property name="ellipsize">end</property>
                   </object>
                 </child>
               </object>
@@ -726,6 +654,7 @@
                   <object class="GtkLabel" id="subagentStatusLabel">
                     <property name="label">0 subagents</property>
                     <property name="valign">center</property>
+                    <property name="ellipsize">end</property>
                   </object>
                 </child>
               </object>
@@ -734,6 +663,7 @@
               <object class="GtkLabel" id="tokRateStatusLabel">
                 <property name="label">0.0 tok/s</property>
                 <property name="valign">center</property>
+                <property name="ellipsize">end</property>
                 <property name="visible">false</property>
                 <style>
                   <class name="glup-status-chip"/>
@@ -745,6 +675,7 @@
               <object class="GtkLabel" id="contextStatusLabel">
                 <property name="label">0K</property>
                 <property name="valign">center</property>
+                <property name="ellipsize">end</property>
                 <style>
                   <class name="glup-status-chip"/>
                   <class name="glup-status-context"/>
@@ -773,6 +704,8 @@
                     <child>
                       <object class="GtkLabel" id="sheetEmptyLabel">
                         <property name="label">No active background shells or subagents</property>
+                        <property name="wrap">true</property>
+                        <property name="justify">center</property>
                         <property name="halign">center</property>
                         <property name="valign">center</property>
                         <property name="vexpand">true</property>
@@ -858,6 +791,56 @@
                             <style>
                               <class name="heading"/>
                             </style>
+                          </object>
+                        </child>
+                        <child>
+                          <object class="GtkBox" id="contextSessionIDBox">
+                            <property name="orientation">horizontal</property>
+                            <property name="spacing">8</property>
+                            <property name="hexpand">true</property>
+                            <style>
+                              <class name="glup-context-grid"/>
+                            </style>
+                            <child>
+                              <object class="GtkBox">
+                                <property name="orientation">vertical</property>
+                                <property name="spacing">2</property>
+                                <property name="hexpand">true</property>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="glup-context-cell"/>
+                                </style>
+                                <child>
+                                  <object class="GtkLabel">
+                                    <property name="label">Conversation ID</property>
+                                    <property name="xalign">0</property>
+                                    <style>
+                                      <class name="glup-context-cell-label"/>
+                                    </style>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkLabel" id="contextSessionIDLabel">
+                                    <property name="xalign">0</property>
+                                    <property name="selectable">true</property>
+                                    <property name="ellipsize">middle</property>
+                                    <style>
+                                      <class name="glup-context-cell-value"/>
+                                    </style>
+                                  </object>
+                                </child>
+                              </object>
+                            </child>
+                            <child>
+                              <object class="GtkButton" id="copySessionIDBtn">
+                                <property name="icon-name">edit-copy-symbolic</property>
+                                <property name="tooltip-text">Copy Conversation ID</property>
+                                <property name="valign">center</property>
+                                <style>
+                                  <class name="flat"/>
+                                </style>
+                              </object>
+                            </child>
                           </object>
                         </child>
                         <child>

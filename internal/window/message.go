@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
+	"github.com/diamondburned/gotk4/pkg/gdk/v4"
+	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotkit/gtkutil/cssutil"
@@ -37,6 +40,8 @@ type UserMessageWidget struct {
 	onUndo    func()
 	onSteer   func()
 	onCancel  func()
+	dragID    func() string
+	onDrop    func(srcID string) bool
 	waiting   bool
 	delivery  opencode.InboxDelivery
 }
@@ -54,6 +59,12 @@ func (u *UserMessageWidget) SetOnSteer(fn func()) {
 // SetOnCancel sets the callback invoked when the user clicks the Cancel/withhold button on a waiting card.
 func (u *UserMessageWidget) SetOnCancel(fn func()) {
 	u.onCancel = fn
+}
+
+// SetDragReorder configures drag-and-drop reordering callbacks for a queued user message card.
+func (u *UserMessageWidget) SetDragReorder(dragID func() string, onDrop func(srcID string) bool) {
+	u.dragID = dragID
+	u.onDrop = onDrop
 }
 
 // Waiting reports whether this user message card is currently waiting in the inbox to be delivered.
@@ -209,6 +220,50 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 		}
 	})
 
+	dragSource := gtk.NewDragSource()
+	dragSource.SetActions(gdk.ActionMove)
+	dragSource.ConnectPrepare(func(_, _ float64) *gdk.ContentProvider {
+		if !w.waiting || w.delivery == opencode.DeliverySteer || w.dragID == nil {
+			return nil
+		}
+		id := w.dragID()
+		if id == "" {
+			return nil
+		}
+		return gdk.NewContentProviderForValue(glib.NewValue(id))
+	})
+	dragSource.ConnectDragBegin(func(_ gdk.Dragger) {
+		box.AddCSSClass("glup-user-card-dragging")
+	})
+	dragSource.ConnectDragEnd(func(_ gdk.Dragger, _ bool) {
+		box.RemoveCSSClass("glup-user-card-dragging")
+	})
+	box.AddController(dragSource)
+
+	dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
+	dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
+		if !w.waiting || w.delivery == opencode.DeliverySteer {
+			return 0
+		}
+		box.AddCSSClass("glup-user-card-drop-target")
+		return gdk.ActionMove
+	})
+	dropTarget.ConnectLeave(func() {
+		box.RemoveCSSClass("glup-user-card-drop-target")
+	})
+	dropTarget.ConnectDrop(func(val *glib.Value, _, _ float64) bool {
+		box.RemoveCSSClass("glup-user-card-drop-target")
+		if !w.waiting || w.delivery == opencode.DeliverySteer || w.onDrop == nil {
+			return false
+		}
+		srcID := val.String()
+		if srcID == "" {
+			return false
+		}
+		return w.onDrop(srcID)
+	})
+	box.AddController(dropTarget)
+
 	return w
 }
 
@@ -249,14 +304,39 @@ type ToolWidget struct {
 	hasBgBadge         bool
 	subagentClickWired bool
 	shellID            string
+	shellFile          string
 	liveShellOutput    string
 	childSessionID     string
 	onOpenSubagent     func(string)
+	expanderWired      bool
+	lazyOutputItems    []opencode.ToolContentItem
+	lazyOutputErr      any
+	lazyOutputDirty    bool
+	rawDiffText        string
+	diffMaxLines       func() int
+}
+
+type diffMaxLinesKey struct{}
+
+// WithDiffMaxLines returns a context carrying a callback that returns the max inline diff lines.
+func WithDiffMaxLines(ctx context.Context, fn func() int) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, diffMaxLinesKey{}, fn)
+}
+
+func diffMaxLinesFromContext(ctx context.Context) func() int {
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(diffMaxLinesKey{}).(func() int)
+	return fn
 }
 
 func isNonExpandableTool(name string) bool {
 	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "read", "subagent", "task":
+	case "subagent", "task":
 		return true
 	default:
 		return false
@@ -296,10 +376,6 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 	titleLabel.SetLabel(formatToolTitle(name))
 	setInitialToolIcon(toolIcon, name)
 
-	detailsExpander.NotifyProperty("expanded", func() {
-		detailsBox.SetVisible(detailsExpander.Expanded())
-	})
-
 	tw := &ToolWidget{
 		Box:             root,
 		ctx:             ctx,
@@ -324,6 +400,7 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		toolID:          id,
 		toolName:        name,
 		onOpenSubagent:  onOpenSubagent,
+		diffMaxLines:    diffMaxLinesFromContext(ctx),
 	}
 
 	actionBtn.ConnectClicked(func() {
@@ -348,6 +425,23 @@ func (t *ToolWidget) applyToolKind() {
 			t.detailsBox = nil
 		}
 		t.detailsExpander = nil
+	} else if t.detailsExpander != nil && !t.expanderWired {
+		t.expanderWired = true
+		t.detailsExpander.NotifyProperty("expanded", func() {
+			if t.detailsExpander == nil {
+				return
+			}
+			expanded := t.detailsExpander.Expanded()
+			if t.detailsBox != nil {
+				t.detailsBox.SetVisible(expanded)
+			}
+			if expanded && t.lazyOutputDirty {
+				t.flushLazyOutput()
+			}
+			if strings.EqualFold(t.toolName, "read") && t.imageBox != nil {
+				t.imageBox.SetVisible(expanded && len(t.imageWidgets) > 0)
+			}
+		})
 	}
 	if isSubagentTool(t.toolName) && !t.subagentClickWired && t.headerRow != nil {
 		t.subagentClickWired = true
@@ -474,6 +568,11 @@ func (t *ToolWidget) ShellID() string {
 	return t.shellID
 }
 
+// ShellFile returns the local output file path associated with this shell tool widget, if any.
+func (t *ToolWidget) ShellFile() string {
+	return t.shellFile
+}
+
 // ChildSessionID returns the child subagent session ID associated with this tool widget, if any.
 func (t *ToolWidget) ChildSessionID() string {
 	return t.childSessionID
@@ -490,11 +589,38 @@ func (t *ToolWidget) SetBackgroundStatus(status string) {
 	t.syncStatus()
 }
 
-// SetShellLiveOutput sets the live 7-line monospace tail output buffer for a background shell tool.
+// SetShellLiveOutput sets the live scrollable monospace output buffer for a shell tool.
 func (t *ToolWidget) SetShellLiveOutput(text string) {
+	if t.liveShellOutput == text && t.outputScroll != nil && t.outputScroll.Visible() {
+		return
+	}
+	wasAtBottom := t.liveShellOutput == ""
+	var vadj *gtk.Adjustment
+	if t.outputScroll != nil {
+		vadj = t.outputScroll.VAdjustment()
+		if vadj != nil && (vadj.Upper() <= vadj.PageSize() || vadj.Value() >= vadj.Upper()-vadj.PageSize()-4) {
+			wasAtBottom = true
+		}
+	}
+	prev := t.liveShellOutput
 	t.liveShellOutput = text
-	t.outputBuf.SetText(text)
-	t.outputScroll.SetVisible(true)
+	if t.outputBuf != nil {
+		if prev != "" && strings.HasPrefix(text, prev) {
+			endIter := t.outputBuf.EndIter()
+			t.outputBuf.Insert(endIter, text[len(prev):])
+		} else {
+			t.outputBuf.SetText(text)
+		}
+	}
+	if t.outputScroll != nil {
+		t.outputScroll.SetVisible(true)
+	}
+	if wasAtBottom && vadj != nil {
+		vadj.SetValue(max(0, vadj.Upper()-vadj.PageSize()))
+		glib.IdleAdd(func() {
+			vadj.SetValue(max(0, vadj.Upper()-vadj.PageSize()))
+		})
+	}
 }
 
 // SetMetadata updates tool metadata such as child subagent session IDs or shell IDs.
@@ -750,6 +876,17 @@ func extractShellID(text string) string {
 	return extractPrefixedID(text, "sh_")
 }
 
+func extractShellOutputFile(text string) string {
+	for _, line := range strings.Split(text, "\n") {
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "Output is streaming to:"); ok {
+			if p := strings.TrimSpace(after); p != "" {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
 func extractPrefixedID(text, prefix string) string {
 	idx := strings.Index(text, prefix)
 	if idx == -1 {
@@ -767,17 +904,12 @@ func extractPrefixedID(text, prefix string) string {
 
 var ansiEscapeRe = regexp.MustCompile(`\x1b(?:\[[0-9;?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])`)
 
-// FormatShellTailLines strips ANSI escapes, normalizes carriage returns, and returns a fixed
-// maxLines-line string containing the last maxLines lines of output (padded with empty lines).
-func FormatShellTailLines(raw string, maxLines int) string {
-	if maxLines <= 0 {
-		maxLines = 7
-	}
-	cleaned := ansiEscapeRe.ReplaceAllString(raw, "")
+func cleanShellLines(raw string, maxLineRunes int) []string {
+	cleaned := ansiEscapeRe.ReplaceAllString(strings.ToValidUTF8(raw, "\uFFFD"), "")
 	cleaned = strings.ReplaceAll(cleaned, "\r\n", "\n")
 
 	rawLines := strings.Split(cleaned, "\n")
-	var lines []string
+	lines := make([]string, 0, len(rawLines))
 	for _, line := range rawLines {
 		if strings.Contains(line, "\r") {
 			parts := strings.Split(line, "\r")
@@ -791,8 +923,10 @@ func FormatShellTailLines(raw string, maxLines int) string {
 			line = last
 		}
 		line = strings.ReplaceAll(line, "\t", "    ")
-		if r := []rune(line); len(r) > 140 {
-			line = string(r[:139]) + "…"
+		if maxLineRunes > 0 {
+			if r := []rune(line); len(r) > maxLineRunes {
+				line = string(r[:maxLineRunes-1]) + "…"
+			}
 		}
 		lines = append(lines, line)
 	}
@@ -803,6 +937,22 @@ func FormatShellTailLines(raw string, maxLines int) string {
 	if len(lines) == 0 {
 		lines = []string{"Waiting for output…"}
 	}
+	return lines
+}
+
+// FormatShellOutput strips ANSI escapes and normalizes carriage returns while preserving
+// all lines and full line lengths for scrollable inline tool output.
+func FormatShellOutput(raw string) string {
+	return strings.Join(cleanShellLines(raw, 0), "\n")
+}
+
+// FormatShellTailLines strips ANSI escapes, normalizes carriage returns, and returns a fixed
+// maxLines-line string containing the last maxLines lines of output (padded with empty lines).
+func FormatShellTailLines(raw string, maxLines int) string {
+	if maxLines <= 0 {
+		maxLines = 7
+	}
+	lines := cleanShellLines(raw, 140)
 	if len(lines) > maxLines {
 		lines = lines[len(lines)-maxLines:]
 	}
@@ -812,7 +962,16 @@ func FormatShellTailLines(raw string, maxLines int) string {
 	return strings.Join(lines, "\n")
 }
 
+// SetDiffMaxLines updates the diff truncation limit and re-renders any inline diff.
+func (t *ToolWidget) SetDiffMaxLines(maxLines int) {
+	t.diffMaxLines = func() int { return maxLines }
+	if t.rawDiffText != "" {
+		t.renderInlineDiff(t.rawDiffText)
+	}
+}
+
 func (t *ToolWidget) renderInlineDiff(diffText string) {
+	t.rawDiffText = diffText
 	for _, lbl := range t.diffWidgets {
 		t.diffBox.Remove(lbl)
 	}
@@ -824,7 +983,12 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 	}
 
 	lines := strings.Split(diffText, "\n")
-	const maxLines = 80
+	maxLines := defaultDiffTruncationLines
+	if t.diffMaxLines != nil {
+		if m := t.diffMaxLines(); m > 0 {
+			maxLines = m
+		}
+	}
 	truncated := 0
 	if len(lines) > maxLines {
 		truncated = len(lines) - maxLines
@@ -837,6 +1001,7 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 		lbl.SetSelectable(true)
 		lbl.SetWrap(true)
 		lbl.SetWrapMode(pango.WrapWordChar)
+		lbl.SetWidthChars(1)
 		switch {
 		case strings.HasPrefix(line, "--- ") || strings.HasPrefix(line, "+++ ") || strings.HasPrefix(line, "@@"):
 			lbl.AddCSSClass("glup-diff-line-hdr")
@@ -961,7 +1126,36 @@ func (t *ToolWidget) AppendInputDelta(delta string) {
 }
 
 // SetOutput renders the tool's output content items, images, and errors.
+// For read tools, output text and images are stored lazily and only populated when expanded.
 func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
+	if strings.EqualFold(t.toolName, "read") && t.detailsExpander != nil && !t.detailsExpander.Expanded() {
+		if t.imageBox != nil {
+			t.imageBox.SetVisible(false)
+		}
+		t.lazyOutputItems = slices.Clone(items)
+		t.lazyOutputErr = errVal
+		t.lazyOutputDirty = true
+		return
+	}
+	t.lazyOutputItems = nil
+	t.lazyOutputErr = nil
+	t.lazyOutputDirty = false
+	t.renderOutput(items, errVal)
+}
+
+func (t *ToolWidget) flushLazyOutput() {
+	if !t.lazyOutputDirty {
+		return
+	}
+	items := t.lazyOutputItems
+	errVal := t.lazyOutputErr
+	t.lazyOutputItems = nil
+	t.lazyOutputErr = nil
+	t.lazyOutputDirty = false
+	t.renderOutput(items, errVal)
+}
+
+func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) {
 	for _, img := range t.imageWidgets {
 		t.imageBox.Remove(img)
 	}
@@ -983,7 +1177,11 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 			}
 		}
 	}
-	t.imageBox.SetVisible(hasImage)
+	if strings.EqualFold(t.toolName, "read") && t.detailsExpander != nil {
+		t.imageBox.SetVisible(hasImage && t.detailsExpander.Expanded())
+	} else {
+		t.imageBox.SetVisible(hasImage)
+	}
 
 	if isSubagentTool(t.toolName) {
 		if t.childSessionID == "" {
@@ -994,9 +1192,6 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 				}
 			}
 		}
-		return
-	}
-	if strings.EqualFold(t.toolName, "read") {
 		return
 	}
 
@@ -1021,7 +1216,7 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 		}
 		sb.WriteString(fmt.Sprintf("Error: %v", errVal))
 	}
-	out := strings.TrimSpace(sb.String())
+	out := strings.ToValidUTF8(strings.TrimSpace(sb.String()), "\uFFFD")
 	if t.liveShellOutput != "" && errVal == nil {
 		t.outputBuf.SetText(t.liveShellOutput)
 		t.outputScroll.SetVisible(true)
@@ -1034,9 +1229,16 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 		}
 	}
 
-	if t.shellID == "" && (t.toolName == "shell" || t.toolName == "bash") {
-		if shID := extractShellID(out); shID != "" {
-			t.shellID = shID
+	if t.toolName == "shell" || t.toolName == "bash" {
+		if t.shellID == "" {
+			if shID := extractShellID(out); shID != "" {
+				t.shellID = shID
+			}
+		}
+		if t.shellFile == "" {
+			if f := extractShellOutputFile(out); f != "" {
+				t.shellFile = f
+			}
 		}
 	}
 }
@@ -1046,7 +1248,9 @@ type AssistantMessageWidget struct {
 	*gtk.Box
 	ctx context.Context
 
-	partsBox *gtk.Box
+	partsBox          *gtk.Box
+	turnDurationLabel *gtk.Label
+	turnDurationText  string
 
 	reasoningViews map[int]*mdstream.View
 	textViews      map[int]*mdstream.View
@@ -1062,19 +1266,41 @@ func NewAssistantMessageWidget(ctx context.Context, agent, model string, onOpenS
 	builder := gtk.NewBuilderFromString(messageUI)
 	root := builder.GetObject("rootContent").Cast().(*gtk.Box)
 	partsBox := builder.GetObject("partsBox").Cast().(*gtk.Box)
+	turnDurationLabel := builder.GetObject("turnDurationLabel").Cast().(*gtk.Label)
 
 	w := &AssistantMessageWidget{
-		Box:            root,
-		ctx:            ctx,
-		partsBox:       partsBox,
-		reasoningViews: make(map[int]*mdstream.View),
-		textViews:      make(map[int]*mdstream.View),
-		tools:          make(map[string]*ToolWidget),
-		agent:          agent,
-		model:          model,
-		onOpenSubagent: onOpenSubagent,
+		Box:               root,
+		ctx:               ctx,
+		partsBox:          partsBox,
+		turnDurationLabel: turnDurationLabel,
+		reasoningViews:    make(map[int]*mdstream.View),
+		textViews:         make(map[int]*mdstream.View),
+		tools:             make(map[string]*ToolWidget),
+		agent:             agent,
+		model:             model,
+		onOpenSubagent:    onOpenSubagent,
 	}
 	return w
+}
+
+// SetTurnDuration sets or clears the end-of-turn duration notice on this assistant message.
+func (w *AssistantMessageWidget) SetTurnDuration(text string) {
+	if w == nil {
+		return
+	}
+	w.turnDurationText = text
+	if w.turnDurationLabel != nil {
+		w.turnDurationLabel.SetLabel(text)
+		w.turnDurationLabel.SetVisible(text != "")
+	}
+}
+
+// TurnDuration returns the currently displayed end-of-turn duration text.
+func (w *AssistantMessageWidget) TurnDuration() string {
+	if w == nil {
+		return ""
+	}
+	return w.turnDurationText
 }
 
 // SetMeta updates the agent and model metadata on the assistant message.
@@ -1364,6 +1590,7 @@ func NewSyntheticSubagentWidget(_ context.Context, msg opencode.Message, onOpenS
 	titleLbl.AddCSSClass("glup-tool-title")
 	titleLbl.SetXAlign(0)
 	titleLbl.SetVAlign(gtk.AlignCenter)
+	titleLbl.SetEllipsize(pango.EllipsizeEnd)
 
 	descLbl := gtk.NewLabel(desc)
 	descLbl.SetHExpand(true)
@@ -1439,26 +1666,24 @@ func NewSyntheticSubagentWidget(_ context.Context, msg opencode.Message, onOpenS
 	if isShell && expander != nil {
 		body := stripSubagentTags(msg.Text)
 		if body != "" {
-			bodyBox := gtk.NewBox(gtk.OrientationVertical, 4)
-			bodyBox.AddCSSClass("glup-tool-body")
-			bodyBox.SetMarginTop(4)
-			bodyBox.SetVisible(false)
 			tv := gtk.NewTextView()
 			tv.SetEditable(false)
 			tv.SetCursorVisible(false)
 			tv.SetMonospace(true)
 			tv.SetWrapMode(gtk.WrapWordChar)
+			tv.AddCSSClass("glup-tool-body")
 			tv.Buffer().SetText(body)
 			scroll := gtk.NewScrolledWindow()
 			scroll.SetHExpand(true)
+			scroll.SetMarginTop(4)
 			scroll.SetMaxContentHeight(200)
 			scroll.SetPropagateNaturalHeight(true)
+			scroll.SetVisible(false)
 			scroll.SetChild(tv)
-			bodyBox.Append(scroll)
 			expander.NotifyProperty("expanded", func() {
-				bodyBox.SetVisible(expander.Expanded())
+				scroll.SetVisible(expander.Expanded())
 			})
-			root.Append(bodyBox)
+			root.Append(scroll)
 		}
 	}
 
@@ -1567,6 +1792,7 @@ func NewSystemNoticeWidget(ctx context.Context, msg opencode.Message) *SystemNot
 	titleLbl.AddCSSClass("glup-tool-title")
 	titleLbl.SetXAlign(0)
 	titleLbl.SetVAlign(gtk.AlignCenter)
+	titleLbl.SetEllipsize(pango.EllipsizeEnd)
 	summaryRow.Append(titleLbl)
 
 	if subtitleText != "" {
@@ -1581,7 +1807,6 @@ func NewSystemNoticeWidget(ctx context.Context, msg opencode.Message) *SystemNot
 
 	body := strings.TrimSpace(msg.Text)
 	if body == "" || body == titleText {
-		summaryRow.SetMarginStart(4)
 		root.Append(summaryRow)
 		return &SystemNoticeWidget{Box: root}
 	}
@@ -1593,28 +1818,26 @@ func NewSystemNoticeWidget(ctx context.Context, msg opencode.Message) *SystemNot
 	expander.SetLabelWidget(summaryRow)
 	root.Append(expander)
 
-	bodyBox := gtk.NewBox(gtk.OrientationVertical, 4)
-	bodyBox.AddCSSClass("glup-tool-body")
-	bodyBox.SetMarginTop(4)
-	bodyBox.SetVisible(false)
-
 	tv := gtk.NewTextView()
 	tv.SetEditable(false)
 	tv.SetCursorVisible(false)
 	tv.SetMonospace(true)
 	tv.SetWrapMode(gtk.WrapWordChar)
+	tv.AddCSSClass("glup-tool-body")
 	tv.Buffer().SetText(body)
 
 	scroll := gtk.NewScrolledWindow()
+	scroll.SetHExpand(true)
+	scroll.SetMarginTop(4)
 	scroll.SetMaxContentHeight(220)
 	scroll.SetPropagateNaturalHeight(true)
+	scroll.SetVisible(false)
 	scroll.SetChild(tv)
-	bodyBox.Append(scroll)
 
 	expander.NotifyProperty("expanded", func() {
-		bodyBox.SetVisible(expander.Expanded())
+		scroll.SetVisible(expander.Expanded())
 	})
-	root.Append(bodyBox)
+	root.Append(scroll)
 
 	return &SystemNoticeWidget{
 		Box:      root,
@@ -1641,6 +1864,8 @@ func NewAgentSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
 
 	lbl := gtk.NewLabel(text)
 	lbl.SetXAlign(0)
+	lbl.SetWrap(true)
+	lbl.SetWrapMode(pango.WrapWordChar)
 	root.Append(lbl)
 
 	return &AgentSwitchedWidget{Box: root}
@@ -1660,6 +1885,8 @@ func NewModelSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
 
 	lbl := gtk.NewLabel(text)
 	lbl.SetXAlign(0)
+	lbl.SetWrap(true)
+	lbl.SetWrapMode(pango.WrapWordChar)
 	root.Append(lbl)
 
 	return &AgentSwitchedWidget{Box: root}
@@ -1675,6 +1902,8 @@ func NewLocationSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
 
 	lbl := gtk.NewLabel(text)
 	lbl.SetXAlign(0)
+	lbl.SetWrap(true)
+	lbl.SetWrapMode(pango.WrapWordChar)
 	root.Append(lbl)
 
 	return &AgentSwitchedWidget{Box: root}
@@ -1686,6 +1915,8 @@ type RevertBannerWidget struct {
 	ctx          context.Context
 	titleLabel   *gtk.Label
 	diffBadge    *gtk.Label
+	filesBox     *gtk.Box
+	fileWidgets  []gtk.Widgetter
 	diffExpander *gtk.Expander
 	diffView     *gtk.TextView
 	redoBtn      *gtk.Button
@@ -1734,7 +1965,12 @@ func NewRevertBannerWidget(ctx context.Context, onRedo func()) *RevertBannerWidg
 
 	root.Append(row)
 
-	diffExpander := gtk.NewExpander("Reverted Changes")
+	filesBox := gtk.NewBox(gtk.OrientationVertical, 4)
+	filesBox.AddCSSClass("glup-revert-files-box")
+	filesBox.SetVisible(false)
+	root.Append(filesBox)
+
+	diffExpander := gtk.NewExpander("View Diff")
 	diffExpander.AddCSSClass("glup-revert-diff-expander")
 	diffExpander.SetVisible(false)
 
@@ -1756,15 +1992,16 @@ func NewRevertBannerWidget(ctx context.Context, onRedo func()) *RevertBannerWidg
 		ctx:          ctx,
 		titleLabel:   titleLabel,
 		diffBadge:    diffBadge,
+		filesBox:     filesBox,
 		diffExpander: diffExpander,
 		diffView:     diffView,
 		redoBtn:      redoBtn,
 	}
 }
 
-// Update updates the banner title, diff badge, and diff content for staged reverts.
-func (b *RevertBannerWidget) Update(revertedCount int, diff string) {
-	count := revertedCount
+// Update updates the banner title, rolled-back files list, diff badge, and diff content for staged reverts.
+func (b *RevertBannerWidget) Update(revertedUserCount int, revert *opencode.SessionRevert, fallbackFiles []opencode.FileDiff) {
+	count := revertedUserCount
 	if count <= 0 {
 		count = 1
 	}
@@ -1774,19 +2011,87 @@ func (b *RevertBannerWidget) Update(revertedCount int, diff string) {
 		b.titleLabel.SetText(fmt.Sprintf("%d reverted messages", count))
 	}
 
-	trimmedDiff := strings.TrimSpace(diff)
-	if trimmedDiff != "" {
-		added, deleted := opencode.CountDiffChanges(trimmedDiff)
-		if added > 0 || deleted > 0 {
-			b.diffBadge.SetText(fmt.Sprintf("+%d -%d", added, deleted))
-			b.diffBadge.SetVisible(true)
-		} else {
-			b.diffBadge.SetVisible(false)
+	for _, w := range b.fileWidgets {
+		b.filesBox.Remove(w)
+	}
+	b.fileWidgets = nil
+
+	var files []opencode.FileDiff
+	var rawDiff string
+	if revert != nil {
+		files = revert.Files
+		rawDiff = revert.Diff
+	}
+	if len(files) == 0 && len(fallbackFiles) > 0 {
+		files = fallbackFiles
+	}
+
+	var totalAdded, totalDeleted int
+	var patchBuilder strings.Builder
+	for _, fd := range files {
+		totalAdded += fd.Additions
+		totalDeleted += fd.Deletions
+		if fd.Patch != "" {
+			if patchBuilder.Len() > 0 {
+				patchBuilder.WriteString("\n\n")
+			}
+			if !strings.HasPrefix(fd.Patch, "--- ") && fd.File != "" {
+				fmt.Fprintf(&patchBuilder, "--- a/%s\n+++ b/%s\n", fd.File, fd.File)
+			}
+			patchBuilder.WriteString(strings.TrimSpace(fd.Patch))
 		}
+		if fd.File != "" {
+			fileRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
+			fileRow.AddCSSClass("glup-revert-file-row")
+
+			fileIcon := gtk.NewImageFromIconName("text-x-generic-symbolic")
+			fileIcon.AddCSSClass("dim-label")
+			fileRow.Append(fileIcon)
+
+			fileLbl := gtk.NewLabel(fd.File)
+			fileLbl.SetXAlign(0)
+			fileLbl.SetSelectable(true)
+			fileLbl.SetEllipsize(pango.EllipsizeMiddle)
+			fileLbl.AddCSSClass("glup-revert-file-path")
+			fileRow.Append(fileLbl)
+
+			if fd.Status != "" {
+				statusLbl := gtk.NewLabel(fd.Status)
+				statusLbl.AddCSSClass("dim-label")
+				statusLbl.AddCSSClass("caption")
+				fileRow.Append(statusLbl)
+			}
+			if fd.Additions > 0 || fd.Deletions > 0 {
+				statLbl := gtk.NewLabel(fmt.Sprintf("+%d -%d", fd.Additions, fd.Deletions))
+				statLbl.AddCSSClass("glup-revert-banner-diff")
+				fileRow.Append(statLbl)
+			}
+
+			b.filesBox.Append(fileRow)
+			b.fileWidgets = append(b.fileWidgets, fileRow)
+		}
+	}
+	b.filesBox.SetVisible(len(b.fileWidgets) > 0)
+
+	trimmedDiff := strings.TrimSpace(rawDiff)
+	if trimmedDiff == "" {
+		trimmedDiff = strings.TrimSpace(patchBuilder.String())
+	}
+
+	if totalAdded == 0 && totalDeleted == 0 && trimmedDiff != "" {
+		totalAdded, totalDeleted = opencode.CountDiffChanges(trimmedDiff)
+	}
+	if totalAdded > 0 || totalDeleted > 0 {
+		b.diffBadge.SetText(fmt.Sprintf("+%d -%d", totalAdded, totalDeleted))
+		b.diffBadge.SetVisible(true)
+	} else {
+		b.diffBadge.SetVisible(false)
+	}
+
+	if trimmedDiff != "" {
 		b.diffView.Buffer().SetText(trimmedDiff)
 		b.diffExpander.SetVisible(true)
 	} else {
-		b.diffBadge.SetVisible(false)
 		b.diffExpander.SetVisible(false)
 	}
 }
@@ -2271,4 +2576,260 @@ func (qw *QuestionFormWidget) CollectAnswers() (map[string]any, bool) {
 		out[fs.field.Key] = ans
 	}
 	return out, true
+}
+
+// PermissionPromptWidget renders an interactive OpenCode V2 permission request card.
+type PermissionPromptWidget struct {
+	*gtk.Box
+	RequestID  string
+	pillLabel  *gtk.Label
+	titleLabel *gtk.Label
+	metaLabel  *gtk.Label
+	cmdBox     *gtk.Box
+	cmdLabel   *gtk.Label
+	footerLbl  *gtk.Label
+	denyBtn    *gtk.Button
+	onceBtn    *gtk.Button
+	alwaysBtn  *gtk.Button
+	busy       bool
+	onDecision func(opencode.PermissionDecision)
+}
+
+func formatPermissionBadgeAndTitle(req opencode.PermissionRequest) (badge, title string) {
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	switch action {
+	case "bash", "shell":
+		badge = "Permission Required · Shell Command"
+		title = "Allow Shell tool to execute command?"
+	case "edit", "write", "patch", "apply_patch", "multiedit":
+		badge = "Permission Required · File Modification"
+		title = fmt.Sprintf("Allow %s tool to modify files?", formatToolTitle(action))
+	case "read":
+		badge = "Permission Required · File Read"
+		title = "Allow Read tool to access files?"
+	case "external_directory":
+		badge = "Permission Required · External Directory"
+		title = "Allow access to external directory?"
+	case "webfetch", "websearch", "google_search":
+		badge = "Permission Required · Network Access"
+		title = fmt.Sprintf("Allow %s tool to access network?", formatToolTitle(action))
+	default:
+		if action != "" {
+			badge = "Permission Required · " + formatToolTitle(action)
+			title = fmt.Sprintf("Allow %s?", formatToolTitle(action))
+		} else {
+			badge = "Permission Required"
+			title = "Allow tool execution?"
+		}
+	}
+	if msg := strings.TrimSpace(req.Message); msg != "" {
+		title = msg
+	}
+	return badge, title
+}
+
+func formatPermissionResourceText(req opencode.PermissionRequest) string {
+	action := strings.ToLower(strings.TrimSpace(req.Action))
+	isShell := action == "bash" || action == "shell"
+	if len(req.Resources) > 0 {
+		var lines []string
+		for _, r := range req.Resources {
+			r = strings.TrimSpace(r)
+			if r == "" {
+				continue
+			}
+			if isShell && !strings.HasPrefix(r, "$ ") {
+				lines = append(lines, "$ "+r)
+			} else {
+				lines = append(lines, r)
+			}
+		}
+		if len(lines) > 0 {
+			return strings.Join(lines, "\n")
+		}
+	}
+	if req.Metadata != nil {
+		for _, k := range []string{"command", "cmd", "filePath", "path", "file", "directory", "url"} {
+			if v, ok := req.Metadata[k].(string); ok && strings.TrimSpace(v) != "" {
+				v = strings.TrimSpace(v)
+				if isShell && (k == "command" || k == "cmd") && !strings.HasPrefix(v, "$ ") {
+					return "$ " + v
+				}
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+// NewPermissionPromptWidget creates an interactive card for approving or rejecting a PermissionRequest.
+func NewPermissionPromptWidget(
+	req opencode.PermissionRequest,
+	directory string,
+	onDecision func(opencode.PermissionDecision),
+) *PermissionPromptWidget {
+	root := gtk.NewBox(gtk.OrientationVertical, 8)
+	root.AddCSSClass("glup-permission-card")
+
+	hdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	hdr.SetVAlign(gtk.AlignCenter)
+
+	leftHdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	leftHdr.SetVAlign(gtk.AlignCenter)
+	leftHdr.SetHExpand(true)
+
+	pill := gtk.NewBox(gtk.OrientationHorizontal, 5)
+	pill.SetVAlign(gtk.AlignCenter)
+	pill.AddCSSClass("glup-permission-pill")
+
+	shieldIcon := gtk.NewImageFromIconName("shield-symbolic")
+	shieldIcon.SetPixelSize(14)
+	pill.Append(shieldIcon)
+
+	badgeText, titleText := formatPermissionBadgeAndTitle(req)
+	pillLabel := gtk.NewLabel(badgeText)
+	pillLabel.SetXAlign(0)
+	pill.Append(pillLabel)
+	leftHdr.Append(pill)
+
+	titleLabel := gtk.NewLabel(titleText)
+	titleLabel.AddCSSClass("glup-permission-title")
+	titleLabel.SetXAlign(0)
+	titleLabel.SetWrap(true)
+	titleLabel.SetWrapMode(pango.WrapWordChar)
+	titleLabel.SetHExpand(true)
+	leftHdr.Append(titleLabel)
+	hdr.Append(leftHdr)
+
+	metaText := ""
+	if dir := strings.TrimSpace(directory); dir != "" {
+		metaText = "directory: " + shortDir(dir)
+	}
+	metaLabel := gtk.NewLabel(metaText)
+	metaLabel.AddCSSClass("glup-permission-meta")
+	metaLabel.AddCSSClass("dim-label")
+	metaLabel.SetXAlign(1)
+	metaLabel.SetEllipsize(pango.EllipsizeMiddle)
+	metaLabel.SetMaxWidthChars(36)
+	metaLabel.SetVisible(metaText != "")
+	hdr.Append(metaLabel)
+
+	root.Append(hdr)
+
+	cmdBox := gtk.NewBox(gtk.OrientationVertical, 4)
+	cmdBox.AddCSSClass("glup-perm-cmd-box")
+	resText := formatPermissionResourceText(req)
+	cmdLabel := gtk.NewLabel(resText)
+	cmdLabel.SetXAlign(0)
+	cmdLabel.SetSelectable(true)
+	cmdLabel.SetWrap(true)
+	cmdLabel.SetWrapMode(pango.WrapWordChar)
+	cmdLabel.AddCSSClass("glup-perm-cmd-text")
+	cmdBox.Append(cmdLabel)
+	cmdBox.SetVisible(resText != "")
+	root.Append(cmdBox)
+
+	footer := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	footer.SetVAlign(gtk.AlignCenter)
+	footer.AddCSSClass("glup-permission-footer")
+
+	footerText := "Review before granting access."
+	if len(req.Save) > 0 {
+		footerText = fmt.Sprintf("Always Allow saves: %s", strings.Join(req.Save, ", "))
+	}
+	footerLbl := gtk.NewLabel(footerText)
+	footerLbl.AddCSSClass("dim-label")
+	footerLbl.AddCSSClass("caption")
+	footerLbl.SetXAlign(0)
+	footerLbl.SetHExpand(true)
+	footerLbl.SetWrap(true)
+	footerLbl.SetWrapMode(pango.WrapWordChar)
+	footer.Append(footerLbl)
+
+	btnRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	btnRow.SetVAlign(gtk.AlignCenter)
+
+	denyBtn := gtk.NewButtonWithLabel("Deny")
+	denyBtn.AddCSSClass("destructive-action")
+	btnRow.Append(denyBtn)
+
+	onceBtn := gtk.NewButtonWithLabel("Allow Once")
+	btnRow.Append(onceBtn)
+
+	alwaysBtn := gtk.NewButtonWithLabel("Always Allow")
+	alwaysBtn.AddCSSClass("suggested-action")
+	btnRow.Append(alwaysBtn)
+
+	footer.Append(btnRow)
+	root.Append(footer)
+
+	pw := &PermissionPromptWidget{
+		Box:        root,
+		RequestID:  req.ID,
+		pillLabel:  pillLabel,
+		titleLabel: titleLabel,
+		metaLabel:  metaLabel,
+		cmdBox:     cmdBox,
+		cmdLabel:   cmdLabel,
+		footerLbl:  footerLbl,
+		denyBtn:    denyBtn,
+		onceBtn:    onceBtn,
+		alwaysBtn:  alwaysBtn,
+		onDecision: onDecision,
+	}
+
+	denyBtn.ConnectClicked(func() {
+		pw.TriggerDecision(opencode.PermissionReject)
+	})
+	onceBtn.ConnectClicked(func() {
+		pw.TriggerDecision(opencode.PermissionOnce)
+	})
+	alwaysBtn.ConnectClicked(func() {
+		pw.TriggerDecision(opencode.PermissionAlways)
+	})
+
+	return pw
+}
+
+// Update refreshes the permission prompt card contents in place.
+func (pw *PermissionPromptWidget) Update(req opencode.PermissionRequest, directory string) {
+	badgeText, titleText := formatPermissionBadgeAndTitle(req)
+	pw.pillLabel.SetText(badgeText)
+	pw.titleLabel.SetText(titleText)
+
+	metaText := ""
+	if dir := strings.TrimSpace(directory); dir != "" {
+		metaText = "directory: " + shortDir(dir)
+	}
+	pw.metaLabel.SetText(metaText)
+	pw.metaLabel.SetVisible(metaText != "")
+
+	resText := formatPermissionResourceText(req)
+	pw.cmdLabel.SetText(resText)
+	pw.cmdBox.SetVisible(resText != "")
+
+	footerText := "Review before granting access."
+	if len(req.Save) > 0 {
+		footerText = fmt.Sprintf("Always Allow saves: %s", strings.Join(req.Save, ", "))
+	}
+	pw.footerLbl.SetText(footerText)
+}
+
+// SetBusy disables or enables the permission card controls while a reply is in flight.
+func (pw *PermissionPromptWidget) SetBusy(busy bool) {
+	pw.busy = busy
+	pw.denyBtn.SetSensitive(!busy)
+	pw.onceBtn.SetSensitive(!busy)
+	pw.alwaysBtn.SetSensitive(!busy)
+}
+
+// TriggerDecision invokes the decision callback and sets the widget busy.
+func (pw *PermissionPromptWidget) TriggerDecision(decision opencode.PermissionDecision) {
+	if pw.busy {
+		return
+	}
+	pw.SetBusy(true)
+	if pw.onDecision != nil {
+		pw.onDecision(decision)
+	}
 }

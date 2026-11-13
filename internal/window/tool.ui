@@ -39,6 +39,7 @@
                   <object class="GtkLabel" id="titleLabel">
                     <property name="xalign">0</property>
                     <property name="valign">center</property>
+                    <property name="ellipsize">end</property>
                     <style>
                       <class name="glup-tool-title"/>
                     </style>

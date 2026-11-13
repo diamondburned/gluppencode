@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -28,6 +30,7 @@ import (
 	"github.com/diamondburned/gotkit/app"
 	"github.com/diamondburned/gotkit/gtkutil"
 	"libdb.so/gluppencode/internal/autoscroll"
+	"libdb.so/gluppencode/internal/mdstream"
 	"libdb.so/gluppencode/internal/opencode"
 )
 
@@ -38,23 +41,44 @@ type pendingPrompt struct {
 	inboxID   string
 	text      string
 	files     []opencode.FileAttachment
+	opts      opencode.PromptOptions
 	delivery  opencode.InboxDelivery
+	rewriting bool
 	cancelled bool
+	attached  bool
 	widget    *UserMessageWidget
+}
+
+func (p *pendingPrompt) dragKey() string {
+	if p == nil {
+		return ""
+	}
+	if p.inboxID != "" {
+		return p.inboxID
+	}
+	return fmt.Sprintf("ptr:%p", p)
 }
 
 type convTimeline struct {
 	session            opencode.Session
 	scroll             *autoscroll.Window
+	clamp              *adw.Clamp
 	timelineBox        *gtk.Box
+	greeter            *GreeterWidget
 	assistantMap       map[string]*AssistantMessageWidget
 	compactionMap      map[string]*CompactionWidget
 	messageWidgets     map[string]gtk.Widgetter
+	slashBubbles       []*UserMessageWidget
 	revertBanner       *RevertBannerWidget
+	revertFilesRolled  bool
 	thinkingLabel      *gtk.Label
+	thinkingAttached   bool
 	pendingPrompts     []*pendingPrompt
+	ignoredCancelIDs   map[string]bool
 	pendingForms       []opencode.FormInfo
 	formWidgets        map[string]*QuestionFormWidget
+	pendingPermissions []opencode.PermissionRequest
+	permissionWidgets  map[string]*PermissionPromptWidget
 	seenMsgIDs         map[string]bool
 	messages           []opencode.Message
 	nextCursor         string
@@ -198,10 +222,17 @@ func (c *convTimeline) markSyntheticTargetCompleted(msg opencode.Message) {
 			}
 		}
 		if shID != "" {
+			var formatted string
+			if body := stripSubagentTags(msg.Text); body != "" {
+				formatted = FormatShellOutput(body)
+			}
 			for _, aw := range c.assistantMap {
 				for _, tw := range aw.tools {
 					if tw.ShellID() == shID {
 						tw.SetBackgroundStatus("completed")
+						if formatted != "" {
+							tw.SetShellLiveOutput(formatted)
+						}
 					}
 				}
 			}
@@ -233,42 +264,52 @@ func (c *convTimeline) closeStreams() {
 	}
 }
 
-// steeredInFlight reports whether the user steered p before its inbox ID was known,
-// so the server still holds it under the queued delivery it was sent with.
+// steeredInFlight reports whether the user steered p before its inbox ID was known
+// (or while a reorder was re-admitting it), so the server still holds it as queued.
 func (p *pendingPrompt) steeredInFlight(serverDelivery opencode.InboxDelivery) bool {
-	return p.inboxID == "" && p.delivery == opencode.DeliverySteer && serverDelivery == opencode.DeliveryQueue
+	return (p.inboxID == "" || p.rewriting) && p.delivery == opencode.DeliverySteer && serverDelivery == opencode.DeliveryQueue
 }
 
 func (c *convTimeline) keepPendingAtBottom() {
 	if c == nil || c.timelineBox == nil {
 		return
 	}
+	c.updateGreeterVisibility()
 	for _, p := range c.pendingPrompts {
-		if p != nil && p.widget != nil && p.widget.Parent() != nil {
-			if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(p.widget) {
-				c.timelineBox.ReorderChildAfter(p.widget, last)
-			}
+		if p != nil && p.widget != nil && p.attached && p.delivery != opencode.DeliveryQueue {
+			c.timelineBox.Remove(p.widget)
+			c.timelineBox.Append(p.widget)
 		}
 	}
 	for _, f := range c.pendingForms {
-		if qw := c.formWidgets[f.ID]; qw != nil && qw.Parent() != nil {
-			if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(qw) {
-				c.timelineBox.ReorderChildAfter(qw, last)
-			}
+		if qw := c.formWidgets[f.ID]; qw != nil {
+			c.timelineBox.Remove(qw)
+			c.timelineBox.Append(qw)
+		}
+	}
+	for _, perm := range c.pendingPermissions {
+		if pw := c.permissionWidgets[perm.ID]; pw != nil {
+			c.timelineBox.Remove(pw)
+			c.timelineBox.Append(pw)
 		}
 	}
 	if c.thinkingLabel != nil {
-		if c.thinkingLabel.Parent() == nil {
-			c.timelineBox.Append(c.thinkingLabel)
-		} else if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.thinkingLabel) {
-			c.timelineBox.ReorderChildAfter(c.thinkingLabel, last)
+		if c.thinkingAttached {
+			c.timelineBox.Remove(c.thinkingLabel)
 		}
-		c.thinkingLabel.SetVisible(c.active && len(c.pendingForms) == 0)
+		c.timelineBox.Append(c.thinkingLabel)
+		c.thinkingAttached = true
+		c.thinkingLabel.SetVisible(c.active && len(c.pendingForms) == 0 && len(c.pendingPermissions) == 0)
 	}
-	if c.revertBanner != nil && c.revertBanner.Visible() && c.revertBanner.Parent() != nil {
-		if last := c.timelineBox.LastChild(); last != nil && gtk.BaseWidget(last) != gtk.BaseWidget(c.revertBanner) {
-			c.timelineBox.ReorderChildAfter(c.revertBanner, last)
+	for _, p := range c.pendingPrompts {
+		if p != nil && p.widget != nil && p.attached && p.delivery == opencode.DeliveryQueue {
+			c.timelineBox.Remove(p.widget)
+			c.timelineBox.Append(p.widget)
 		}
+	}
+	if c.revertBanner != nil && c.revertBanner.Visible() {
+		c.timelineBox.Remove(c.revertBanner)
+		c.timelineBox.Append(c.revertBanner)
 	}
 }
 
@@ -364,36 +405,44 @@ type Window struct {
 	cancel context.CancelFunc
 	client *opencode.Client
 
-	rootContent                  *adw.OverlaySplitView
-	hideSidebarBtn               *gtk.Button
-	newSessionSidebarBtn         *gtk.MenuButton
-	newSessionSidebarPopover     *gtk.Popover
-	newSessionSidebarSearchEntry *gtk.SearchEntry
-	newSessionSidebarListBox     *gtk.ListBox
-	newSessionSidebarFolderBtn   *gtk.Button
-	searchSessionsBtn            *gtk.Button
-	viewSwitcherSidebar          *adw.ViewSwitcherSidebar
+	rootContent         *adw.OverlaySplitView
+	windowStack         *gtk.Stack
+	offlineView         *adw.ToolbarView
+	offlineStatus       *adw.StatusPage
+	offlineErrorLabel   *gtk.Label
+	offlineRetryBtn     *gtk.Button
+	offline             bool
+	offlineErr          string
+	sidebarToolbar      *adw.ToolbarView
+	sidebarResizeHandle *gtk.Box
+	hideSidebarBtn      *gtk.Button
+	appMenuSidebarBtn   *gtk.MenuButton
+	searchSessionsBtn   *gtk.Button
+	viewSwitcherSidebar *adw.ViewSwitcherSidebar
 
-	bottomSheet              *adw.BottomSheet
-	showSidebarBtn           *gtk.Button
-	newSessionTopBtn         *gtk.MenuButton
-	newSessionTopPopover     *gtk.Popover
-	newSessionTopSearchEntry *gtk.SearchEntry
-	newSessionTopListBox     *gtk.ListBox
-	newSessionTopFolderBtn   *gtk.Button
-	headerTitleStack         *gtk.Stack
-	windowTitleBtn           *gtk.MenuButton
-	windowTitle              *adw.WindowTitle
-	renameSessionPopover     *gtk.Popover
-	renameSessionEntry       *gtk.Entry
-	renameSessionSaveBtn     *gtk.Button
-	breadcrumbParentBtn      *gtk.Button
-	breadcrumbParentLabel    *gtk.Label
-	breadcrumbChildLabel     *gtk.Label
-	newWindowBtn             *gtk.Button
-	refreshBtn               *gtk.Button
-	takeChargeBtn            *gtk.ToggleButton
-	viewStack                *adw.ViewStack
+	bottomSheet           *adw.BottomSheet
+	showSidebarBtn        *gtk.Button
+	appMenuTopBtn         *gtk.MenuButton
+	searchSessionsTopBtn  *gtk.Button
+	headerTitleStack      *gtk.Stack
+	windowTitleBtn        *gtk.MenuButton
+	windowTitle           *adw.WindowTitle
+	renameSessionPopover  *gtk.Popover
+	renameSessionEntry    *gtk.Entry
+	renameSessionSaveBtn  *gtk.Button
+	breadcrumbParentBtn   *gtk.Button
+	breadcrumbParentLabel *gtk.Label
+	breadcrumbChildLabel  *gtk.Label
+	newWindowBtn          *gtk.Button
+	refreshBtn            *gtk.Button
+	takeChargeBtn         *gtk.ToggleButton
+	contentMainBox        *gtk.Box
+	emptyGreeter          *GreeterWidget
+	viewStackOverlay      *gtk.Overlay
+	composerInset         int
+	composerInsetCSS      *gtk.CSSProvider
+	viewStack             *adw.ViewStack
+	composerClamp         *adw.Clamp
 
 	inputView      *gtksource.View
 	inputBuffer    *gtksource.Buffer
@@ -427,34 +476,40 @@ type Window struct {
 	tokRateStatusLabel  *gtk.Label
 	contextStatusLabel  *gtk.Label
 
-	sheetEmptyLabel      *gtk.Label
-	shellsSectionBox     *gtk.Box
-	shellListBox         *gtk.ListBox
-	subagentsSectionBox  *gtk.Box
-	sheetBackToParentBtn *gtk.Button
-	subagentListBox      *gtk.ListBox
-	contextSectionBox    *gtk.Box
-	contextInfoGrid      *gtk.Grid
-	agentListBox         *gtk.ListBox
-	modelSearchEntry     *gtk.SearchEntry
-	modelListBox         *gtk.ListBox
+	sheetEmptyLabel       *gtk.Label
+	shellsSectionBox      *gtk.Box
+	shellListBox          *gtk.ListBox
+	subagentsSectionBox   *gtk.Box
+	sheetBackToParentBtn  *gtk.Button
+	subagentListBox       *gtk.ListBox
+	contextSectionBox     *gtk.Box
+	contextSessionIDBox   *gtk.Box
+	contextSessionIDLabel *gtk.Label
+	copySessionIDBtn      *gtk.Button
+	contextInfoGrid       *gtk.Grid
+	contextInfoCells      []*gtk.Box
+	agentListBox          *gtk.ListBox
+	modelSearchEntry      *gtk.SearchEntry
+	modelListBox          *gtk.ListBox
 
 	activeShells      map[string]opencode.ShellItem
+	shellsLoaded      bool // a refreshShells listing has succeeded for every directory
 	shellOutputs      map[string]string
 	shellOutputLabels map[string]*gtk.Label
 	shellPollRunning  bool
 
-	tabs         map[string]*sessionTab // keyed by root session ID
-	tabOrder     []string               // root session IDs in display order
-	childToRoot  map[string]string      // child session ID -> root session ID
-	agents       []opencode.Agent
-	agentRows    []agentRowData
-	models       []opencode.ModelInfo
-	modelNames   map[string]string
-	modelRows    []modelRowData
-	subagentRows []subagentRowData
-	modelLimits  map[string]int
-	branchCache  map[string]string
+	tabs        map[string]*sessionTab // keyed by root session ID
+	tabOrder    []string               // root session IDs in display order
+	childToRoot map[string]string      // child session ID -> root session ID
+
+	agents         []opencode.Agent
+	agentRows      []agentRowData
+	models         []opencode.ModelInfo
+	modelNames     map[string]string
+	modelRows      []modelRowData
+	subagentRows   []subagentRowData
+	modelLimits    map[string]int
+	branchCache    map[string]string
 
 	modelLastUsed      map[string]int64
 	showAllModels      bool
@@ -463,6 +518,7 @@ type Window struct {
 
 	expandedProjects  map[string]bool
 	collapsedProjects map[string]bool
+	visibleSessions   map[string]bool
 	archivedSessions  map[string]bool
 	projectOrder      []string
 	statePath         string
@@ -474,22 +530,54 @@ type Window struct {
 	rowControllers   map[uintptr]bool
 	rowProjectDir    map[uintptr]string
 	headerProjectDir map[uintptr]string
+	headerWidgets    map[uintptr]*projectHeaderWidgets
+	fileOpener       func(string)
+	clipboardSetter  func(string)
 
 	takeCharge         bool
 	takeChargeInFlight map[string]bool
 
+	resolvedSessionTitles map[string]string
+	resolvingSessions     map[string][]func(string)
+
+	inputHistory       []string
+	historyIndex       int
+	historyBrowsing    bool
+	historyDraft       string
+	settingHistoryText bool
+
+	sidebarWidth          int
+	sidebarDragStartWidth int
+	resizingSidebar       bool
+	resizerHovered        bool
+
+	greeterProfile    *GreeterProfile
+	greeterRefreshing bool
+	prefs             Preferences
+
 	populating bool
 }
+
+var userCSSOnce sync.Once
 
 // NewWindow creates a new main window from window.ui.
 func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	gtksource.Init()
 	if disp := gdk.DisplayGetDefault(); disp != nil {
 		gtk.IconThemeGetForDisplay(disp).AddResourcePath("/so/libdb/gluppencode/icons")
+		userCSSOnce.Do(func() {
+			prov := gtk.NewCSSProvider()
+			prov.LoadFromString(styleCSS)
+			gtk.StyleContextAddProviderForDisplay(disp, prov, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+			userProv := gtk.NewCSSProvider()
+			userProv.LoadFromString("headerbar.glup-sidebar-header > windowhandle > box { padding-right: 7px; }")
+			gtk.StyleContextAddProviderForDisplay(disp, userProv, gtk.STYLE_PROVIDER_PRIORITY_USER)
+		})
 	}
 	a := app.FromContext(ctx)
 	adwWin := adw.NewApplicationWindow(a.Application)
-	adwWin.SetTitle("Gluppencode")
+	adwWin.SetTitle("gluppencode")
 	adwWin.SetSizeRequest(720, 560)
 	adwWin.SetDefaultSize(1180, 780)
 
@@ -500,119 +588,132 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	builder := gtk.NewBuilderFromString(windowUI)
 
 	w := &Window{
-		ApplicationWindow:            adwWin,
-		appWin:                       win,
-		ctx:                          winCtx,
-		cancel:                       cancel,
-		client:                       client,
-		rootContent:                  builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
-		hideSidebarBtn:               builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
-		newSessionSidebarBtn:         builder.GetObject("newSessionSidebarBtn").Cast().(*gtk.MenuButton),
-		newSessionSidebarPopover:     builder.GetObject("newSessionSidebarPopover").Cast().(*gtk.Popover),
-		newSessionSidebarSearchEntry: builder.GetObject("newSessionSidebarSearchEntry").Cast().(*gtk.SearchEntry),
-		newSessionSidebarListBox:     builder.GetObject("newSessionSidebarListBox").Cast().(*gtk.ListBox),
-		newSessionSidebarFolderBtn:   builder.GetObject("newSessionSidebarFolderBtn").Cast().(*gtk.Button),
-		searchSessionsBtn:            builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
-		viewSwitcherSidebar:          builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
-		bottomSheet:                  builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
-		showSidebarBtn:               builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
-		newSessionTopBtn:             builder.GetObject("newSessionTopBtn").Cast().(*gtk.MenuButton),
-		newSessionTopPopover:         builder.GetObject("newSessionTopPopover").Cast().(*gtk.Popover),
-		newSessionTopSearchEntry:     builder.GetObject("newSessionTopSearchEntry").Cast().(*gtk.SearchEntry),
-		newSessionTopListBox:         builder.GetObject("newSessionTopListBox").Cast().(*gtk.ListBox),
-		newSessionTopFolderBtn:       builder.GetObject("newSessionTopFolderBtn").Cast().(*gtk.Button),
-		headerTitleStack:             builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
-		windowTitleBtn:               builder.GetObject("windowTitleBtn").Cast().(*gtk.MenuButton),
-		windowTitle:                  builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
-		renameSessionPopover:         builder.GetObject("renameSessionPopover").Cast().(*gtk.Popover),
-		renameSessionEntry:           builder.GetObject("renameSessionEntry").Cast().(*gtk.Entry),
-		renameSessionSaveBtn:         builder.GetObject("renameSessionSaveBtn").Cast().(*gtk.Button),
-		breadcrumbParentBtn:          builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
-		breadcrumbParentLabel:        builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
-		breadcrumbChildLabel:         builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
-		newWindowBtn:                 builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
-		refreshBtn:                   builder.GetObject("refreshBtn").Cast().(*gtk.Button),
-		takeChargeBtn:                builder.GetObject("takeChargeBtn").Cast().(*gtk.ToggleButton),
-		viewStack:                    builder.GetObject("viewStack").Cast().(*adw.ViewStack),
-		inputView:                    builder.GetObject("inputView").Cast().(*gtksource.View),
-		sendBtn:                      builder.GetObject("sendBtn").Cast().(*gtk.Button),
-		stopBtn:                      builder.GetObject("stopBtn").Cast().(*gtk.Button),
-		attachBtn:                    builder.GetObject("attachBtn").Cast().(*gtk.Button),
-		attachmentTray:               builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
-		composerPlaceholder:          builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
-		composerAgentBtn:             builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
-		composerModelBtn:             builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
-		agentPopover:                 builder.GetObject("agentPopover").Cast().(*gtk.Popover),
-		modelPopover:                 builder.GetObject("modelPopover").Cast().(*gtk.Popover),
-		agentPillLabel:               builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
-		modelStatusLabel:             builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
-		projectStatusBox:             builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
-		projectStatusLabel:           builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
-		branchStatusBox:              builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
-		branchStatusLabel:            builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
-		backgroundStatusBtn:          builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
-		shellStatusBox:               builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
-		shellStatusLabel:             builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
-		subagentStatusBox:            builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
-		subagentStatusLabel:          builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
-		tokRateStatusLabel:           builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
-		contextStatusLabel:           builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
-		sheetEmptyLabel:              builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
-		shellsSectionBox:             builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
-		shellListBox:                 builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
-		subagentsSectionBox:          builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
-		sheetBackToParentBtn:         builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
-		subagentListBox:              builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
-		contextSectionBox:            builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
-		contextInfoGrid:              builder.GetObject("contextInfoGrid").Cast().(*gtk.Grid),
-		agentListBox:                 builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
-		modelSearchEntry:             builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
-		modelListBox:                 builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
-		tabs:                         make(map[string]*sessionTab),
-		childToRoot:                  make(map[string]string),
-		modelNames:                   make(map[string]string),
-		modelLimits:                  make(map[string]int),
-		branchCache:                  make(map[string]string),
-		modelLastUsed:                make(map[string]int64),
-		expandedProjects:             make(map[string]bool),
-		collapsedProjects:            make(map[string]bool),
-		archivedSessions:             make(map[string]bool),
-		projectSessions:              make(map[string][]opencode.Session),
-		activeShells:                 make(map[string]opencode.ShellItem),
-		shellOutputs:                 make(map[string]string),
-		shellOutputLabels:            make(map[string]*gtk.Label),
-		closeBtnSessID:               make(map[uintptr]string),
-		hoveredRow:                   make(map[uintptr]bool),
-		rowControllers:               make(map[uintptr]bool),
-		rowProjectDir:                make(map[uintptr]string),
-		headerProjectDir:             make(map[uintptr]string),
-		takeChargeInFlight:           make(map[string]bool),
+		ApplicationWindow:     adwWin,
+		appWin:                win,
+		ctx:                   winCtx,
+		cancel:                cancel,
+		client:                client,
+		rootContent:           builder.GetObject("rootContent").Cast().(*adw.OverlaySplitView),
+		sidebarToolbar:        builder.GetObject("sidebarToolbar").Cast().(*adw.ToolbarView),
+		sidebarResizeHandle:   builder.GetObject("sidebarResizeHandle").Cast().(*gtk.Box),
+		hideSidebarBtn:        builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
+		appMenuSidebarBtn:     builder.GetObject("appMenuSidebarBtn").Cast().(*gtk.MenuButton),
+		searchSessionsBtn:     builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
+		viewSwitcherSidebar:   builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
+		bottomSheet:           builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
+		showSidebarBtn:        builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
+		appMenuTopBtn:         builder.GetObject("appMenuTopBtn").Cast().(*gtk.MenuButton),
+		searchSessionsTopBtn:  builder.GetObject("searchSessionsTopBtn").Cast().(*gtk.Button),
+		headerTitleStack:      builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
+		windowTitleBtn:        builder.GetObject("windowTitleBtn").Cast().(*gtk.MenuButton),
+		windowTitle:           builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
+		renameSessionPopover:  builder.GetObject("renameSessionPopover").Cast().(*gtk.Popover),
+		renameSessionEntry:    builder.GetObject("renameSessionEntry").Cast().(*gtk.Entry),
+		renameSessionSaveBtn:  builder.GetObject("renameSessionSaveBtn").Cast().(*gtk.Button),
+		breadcrumbParentBtn:   builder.GetObject("breadcrumbParentBtn").Cast().(*gtk.Button),
+		breadcrumbParentLabel: builder.GetObject("breadcrumbParentLabel").Cast().(*gtk.Label),
+		breadcrumbChildLabel:  builder.GetObject("breadcrumbChildLabel").Cast().(*gtk.Label),
+		newWindowBtn:          builder.GetObject("newWindowBtn").Cast().(*gtk.Button),
+		refreshBtn:            builder.GetObject("refreshBtn").Cast().(*gtk.Button),
+		takeChargeBtn:         builder.GetObject("takeChargeBtn").Cast().(*gtk.ToggleButton),
+		contentMainBox:        builder.GetObject("contentMainBox").Cast().(*gtk.Box),
+		viewStackOverlay:      builder.GetObject("viewStackOverlay").Cast().(*gtk.Overlay),
+		viewStack:             builder.GetObject("viewStack").Cast().(*adw.ViewStack),
+		composerClamp:         builder.GetObject("composerClamp").Cast().(*adw.Clamp),
+		inputView:             builder.GetObject("inputView").Cast().(*gtksource.View),
+		sendBtn:               builder.GetObject("sendBtn").Cast().(*gtk.Button),
+		stopBtn:               builder.GetObject("stopBtn").Cast().(*gtk.Button),
+		attachBtn:             builder.GetObject("attachBtn").Cast().(*gtk.Button),
+		attachmentTray:        builder.GetObject("attachmentTray").Cast().(*adw.WrapBox),
+		composerPlaceholder:   builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
+		composerAgentBtn:      builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
+		composerModelBtn:      builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
+		agentPopover:          builder.GetObject("agentPopover").Cast().(*gtk.Popover),
+		modelPopover:          builder.GetObject("modelPopover").Cast().(*gtk.Popover),
+		agentPillLabel:        builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
+		modelStatusLabel:      builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
+		projectStatusBox:      builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
+		projectStatusLabel:    builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
+		branchStatusBox:       builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
+		branchStatusLabel:     builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
+		backgroundStatusBtn:   builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
+		shellStatusBox:        builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
+		shellStatusLabel:      builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
+		subagentStatusBox:     builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
+		subagentStatusLabel:   builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
+		tokRateStatusLabel:    builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
+		contextStatusLabel:    builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
+		sheetEmptyLabel:       builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
+		shellsSectionBox:      builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
+		shellListBox:          builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
+		subagentsSectionBox:   builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
+		sheetBackToParentBtn:  builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
+		subagentListBox:       builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
+		contextSectionBox:     builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
+		contextSessionIDBox:   builder.GetObject("contextSessionIDBox").Cast().(*gtk.Box),
+		contextSessionIDLabel: builder.GetObject("contextSessionIDLabel").Cast().(*gtk.Label),
+		copySessionIDBtn:      builder.GetObject("copySessionIDBtn").Cast().(*gtk.Button),
+		contextInfoGrid:       builder.GetObject("contextInfoGrid").Cast().(*gtk.Grid),
+		agentListBox:          builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
+		modelSearchEntry:      builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
+		modelListBox:          builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
+		tabs:                  make(map[string]*sessionTab),
+		childToRoot:           make(map[string]string),
+		modelNames:            make(map[string]string),
+		modelLimits:           make(map[string]int),
+		branchCache:           make(map[string]string),
+		modelLastUsed:         make(map[string]int64),
+		expandedProjects:      make(map[string]bool),
+		collapsedProjects:     make(map[string]bool),
+		visibleSessions:       make(map[string]bool),
+		archivedSessions:      make(map[string]bool),
+		statePath:             defaultStateFilePath(),
+		projectSessions:       make(map[string][]opencode.Session),
+		activeShells:          make(map[string]opencode.ShellItem),
+		shellOutputs:          make(map[string]string),
+		shellOutputLabels:     make(map[string]*gtk.Label),
+		closeBtnSessID:        make(map[uintptr]string),
+		hoveredRow:            make(map[uintptr]bool),
+		rowControllers:        make(map[uintptr]bool),
+		rowProjectDir:         make(map[uintptr]string),
+		headerProjectDir:      make(map[uintptr]string),
+		headerWidgets:         make(map[uintptr]*projectHeaderWidgets),
+		takeChargeInFlight:    make(map[string]bool),
+		resolvedSessionTitles: make(map[string]string),
+		resolvingSessions:     make(map[string][]func(string)),
 	}
+	w.ctx = mdstream.WithAsyncSessionResolver(w.ctx, w.resolveSessionTitleAsync)
+	w.ctx = mdstream.WithLinkHandler(w.ctx, w.handleMarkdownLink)
+	w.ctx = WithDiffMaxLines(w.ctx, w.effectiveDiffTruncationLines)
+	w.copySessionIDBtn.ConnectClicked(func() {
+		if w.contextSessionIDLabel == nil {
+			return
+		}
+		id := strings.TrimSpace(w.contextSessionIDLabel.Text())
+		if id != "" {
+			if d := gdk.DisplayGetDefault(); d != nil {
+				d.Clipboard().SetText(id)
+			}
+		}
+	})
 	w.loadState()
+	w.emptyGreeter = NewGreeterWidget(w.effectiveGreeterProfile(), w.populateComposerSuggestion)
+	w.contentMainBox.Prepend(w.emptyGreeter)
+	w.syncEmptyGreeterVisibility()
+	w.setupComposerFade(
+		builder.GetObject("contentOverlay").Cast().(*gtk.Overlay),
+		builder.GetObject("composerBar").Cast().(*gtk.Box),
+		builder.GetObject("timelineBottomFade").Cast().(*gtk.Box),
+	)
 	inputScroll := builder.GetObject("inputScroll").Cast().(*gtk.ScrolledWindow)
 	w.inputBuffer = w.inputView.Buffer().Cast().(*gtksource.Buffer)
 	w.inputBuffer.SetHighlightSyntax(false)
 	w.inputBuffer.SetHighlightMatchingBrackets(false)
 
-	syncInputBufferScheme := func() {
-		styleMgr := adw.StyleManagerGetDefault()
-		schemeMgr := gtksource.StyleSchemeManagerGetDefault()
-		var scheme *gtksource.StyleScheme
-		if styleMgr.Dark() {
-			scheme = schemeMgr.Scheme("Adwaita-dark")
-			if scheme == nil {
-				scheme = schemeMgr.Scheme("classic-dark")
-			}
-		} else {
-			scheme = schemeMgr.Scheme("Adwaita")
-			if scheme == nil {
-				scheme = schemeMgr.Scheme("classic")
-			}
-		}
-		w.inputBuffer.SetStyleScheme(scheme)
-	}
-	syncInputBufferScheme()
-	adw.StyleManagerGetDefault().NotifyProperty("dark", syncInputBufferScheme)
+	w.applyAllPreferences()
+	adw.StyleManagerGetDefault().NotifyProperty("dark", func() {
+		w.applySyntaxTheme()
+	})
 
 	w.inputBuffer.ConnectChanged(func() {
 		w.composerPlaceholder.SetVisible(w.inputBuffer.CharCount() == 0)
@@ -621,7 +722,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		} else {
 			inputScroll.SetPolicy(gtk.PolicyNever, gtk.PolicyExternal)
 		}
-		w.syncComposerCompletionPopup()
+		if !w.settingHistoryText {
+			w.syncComposerCompletionPopup()
+		}
 	})
 	w.agentPopover.ConnectMap(func() {
 		w.rebuildAgentPills()
@@ -645,6 +748,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	statusBarBox := builder.GetObject("statusBarBox").Cast().(*gtk.Box)
 	statusClick := gtk.NewGestureClick()
 	statusClick.ConnectReleased(func(_ int, _, _ float64) {
+		w.rebuildShellList()
+		w.ensureShellOutputPoller()
 		w.bottomSheet.SetOpen(true)
 	})
 	statusBarBox.AddController(statusClick)
@@ -698,6 +803,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.rootContent.NotifyProperty("collapsed", func() {
 		w.syncNavigationChrome()
 	})
+	w.setupSidebarResize()
 
 	// Mobile adaptive breakpoint: collapse sidebar into overlay on narrow screens.
 	bp := adw.NewBreakpoint(adw.BreakpointConditionParse("max-width: 680sp"))
@@ -715,8 +821,6 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		return false
 	})
 
-	w.setupNewSessionPopover(w.newSessionSidebarPopover, w.newSessionSidebarSearchEntry, w.newSessionSidebarListBox, w.newSessionSidebarFolderBtn)
-	w.setupNewSessionPopover(w.newSessionTopPopover, w.newSessionTopSearchEntry, w.newSessionTopListBox, w.newSessionTopFolderBtn)
 	w.renameSessionPopover.ConnectShow(func() {
 		if tab := w.currentTab(); tab != nil {
 			w.renameSessionEntry.SetText(tab.main.session.Title)
@@ -726,15 +830,22 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.renameSessionEntry.ConnectActivate(w.submitRenameSession)
 	w.renameSessionSaveBtn.ConnectClicked(w.submitRenameSession)
 	w.searchSessionsBtn.ConnectClicked(w.openSessionSearchDialog)
+	w.searchSessionsTopBtn.ConnectClicked(w.openSessionSearchDialog)
+	w.setupAppMenuButton(w.appMenuSidebarBtn)
+	w.setupAppMenuButton(w.appMenuTopBtn)
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
 	w.refreshBtn.ConnectClicked(w.loadAll)
 	w.takeChargeBtn.ConnectToggled(func() {
 		w.setTakeCharge(w.takeChargeBtn.Active())
 	})
 
-	// Window-level shortcuts: Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background.
+	// Window-level shortcuts: Ctrl+, for Preferences, Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background.
 	winKeyCtrl := gtk.NewEventControllerKey()
 	winKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
+		if keyval == gdk.KEY_comma && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
+			w.openPreferencesDialog()
+			return true
+		}
 		if (keyval == gdk.KEY_N || keyval == gdk.KEY_n) && state.Has(gdk.ControlMask) && state.Has(gdk.ShiftMask) {
 			w.openNewWindow()
 			return true
@@ -752,18 +863,25 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	adwWin.AddController(winKeyCtrl)
 
-	// Composer Enter / Ctrl+Enter / Shift+Enter handling, Ctrl+B to background, and Ctrl+V clipboard image pasting.
+	// Composer Enter / Ctrl+Enter / Shift+Enter handling, Up/Down history navigation, Ctrl+B to background, and Ctrl+V clipboard image pasting.
 	steerKeyCtrl := gtk.NewEventControllerKey()
 	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
-			w.sendPromptWithDelivery(opencode.DeliverySteer)
+			if w.prefs.CtrlEnterToSend {
+				w.sendPromptWithDelivery(opencode.DeliveryQueue)
+			} else {
+				w.sendPromptWithDelivery(opencode.DeliverySteer)
+			}
 			return true
 		}
 		if (keyval == gdk.KEY_B || keyval == gdk.KEY_b) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
 			if w.backgroundCurrentSession() {
 				return true
 			}
+		}
+		if w.handleInputHistoryKey(keyval, state) {
+			return true
 		}
 		return false
 	})
@@ -773,10 +891,21 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && !state.Has(gdk.ShiftMask) {
 			if state.Has(gdk.ControlMask) {
-				w.sendPromptWithDelivery(opencode.DeliverySteer)
-			} else {
-				w.sendPromptWithDelivery(opencode.DeliveryQueue)
+				if w.prefs.CtrlEnterToSend {
+					w.sendPromptWithDelivery(opencode.DeliveryQueue)
+				} else {
+					w.sendPromptWithDelivery(opencode.DeliverySteer)
+				}
+				return true
 			}
+			if w.prefs.CtrlEnterToSend {
+				return false
+			}
+			w.sendPromptWithDelivery(opencode.DeliveryQueue)
+			return true
+		}
+		if keyval == gdk.KEY_comma && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
+			w.openPreferencesDialog()
 			return true
 		}
 		if (keyval == gdk.KEY_v || keyval == gdk.KEY_V) && state.Has(gdk.ControlMask) {
@@ -868,7 +997,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 	})
 
-	adwWin.SetContent(w.rootContent)
+	w.initOfflineScreen()
+	adwWin.SetContent(w.windowStack)
 	w.syncNavigationChrome()
 
 	// 30s ticker to update tab relative timemarks.
@@ -891,12 +1021,182 @@ func (w *Window) openNewWindow() {
 	newWin.Present()
 }
 
+func (w *Window) initOfflineScreen() {
+	if w.offlineView != nil {
+		return
+	}
+	w.offlineView = adw.NewToolbarView()
+	w.offlineView.SetTopBarStyle(adw.ToolbarFlat)
+
+	header := adw.NewHeaderBar()
+	header.SetTitleWidget(adw.NewWindowTitle("Gluppencode", "Offline"))
+	w.offlineView.AddTopBar(header)
+
+	w.offlineStatus = adw.NewStatusPage()
+	w.offlineStatus.SetIconName("cloud-off-symbolic")
+	w.offlineStatus.SetTitle("OpenCode Instance Offline")
+	w.offlineStatus.SetDescription("Could not connect to the OpenCode server. Make sure the OpenCode service is running and try again.")
+	w.offlineStatus.SetVExpand(true)
+	w.offlineStatus.SetHExpand(true)
+
+	childBox := gtk.NewBox(gtk.OrientationVertical, 16)
+	childBox.SetHAlign(gtk.AlignCenter)
+
+	w.offlineErrorLabel = gtk.NewLabel("")
+	w.offlineErrorLabel.SetWrap(true)
+	w.offlineErrorLabel.SetWrapMode(pango.WrapWordChar)
+	w.offlineErrorLabel.SetMaxWidthChars(64)
+	w.offlineErrorLabel.SetJustify(gtk.JustifyCenter)
+	w.offlineErrorLabel.SetSelectable(true)
+	w.offlineErrorLabel.SetVisible(false)
+	w.offlineErrorLabel.AddCSSClass("glup-offline-error")
+	childBox.Append(w.offlineErrorLabel)
+
+	w.offlineRetryBtn = gtk.NewButtonWithLabel("Retry Connection")
+	w.offlineRetryBtn.SetHAlign(gtk.AlignCenter)
+	w.offlineRetryBtn.AddCSSClass("suggested-action")
+	w.offlineRetryBtn.AddCSSClass("pill")
+	w.offlineRetryBtn.ConnectClicked(func() {
+		w.retryConnection()
+	})
+	childBox.Append(w.offlineRetryBtn)
+
+	w.offlineStatus.SetChild(childBox)
+	w.offlineView.SetContent(w.offlineStatus)
+
+	if w.windowStack == nil {
+		w.windowStack = gtk.NewStack()
+		w.windowStack.SetTransitionType(gtk.StackTransitionTypeCrossfade)
+		w.windowStack.SetHhomogeneous(false)
+		w.windowStack.SetVhomogeneous(false)
+		w.windowStack.SetVExpand(true)
+		w.windowStack.SetHExpand(true)
+	}
+	if w.rootContent != nil {
+		w.windowStack.AddNamed(w.rootContent, "main")
+	}
+	w.windowStack.AddNamed(w.offlineView, "offline")
+	if w.rootContent != nil {
+		w.windowStack.SetVisibleChildName("main")
+	}
+}
+
+func (w *Window) setOfflineError(err error) {
+	if err == nil {
+		w.offline = false
+		w.offlineErr = ""
+		if w.windowStack != nil && w.rootContent != nil {
+			w.windowStack.SetVisibleChildName("main")
+		}
+		return
+	}
+	w.initOfflineScreen()
+	w.offline = true
+	w.offlineErr = strings.TrimSpace(err.Error())
+
+	serverURL := "http://127.0.0.1:4096"
+	if w.client != nil {
+		if u := strings.TrimSpace(w.client.ServerURL()); u != "" {
+			serverURL = u
+		}
+	}
+	if w.offlineStatus != nil {
+		w.offlineStatus.SetDescription(fmt.Sprintf(
+			"Could not connect to the OpenCode server at %s. Make sure the OpenCode service is running and try again.",
+			serverURL,
+		))
+	}
+	if w.offlineErrorLabel != nil {
+		w.offlineErrorLabel.SetLabel(w.offlineErr)
+		w.offlineErrorLabel.SetVisible(w.offlineErr != "")
+	}
+	if w.windowStack != nil && w.offlineView != nil {
+		w.windowStack.SetVisibleChildName("offline")
+	}
+}
+
+func (w *Window) retryConnection() {
+	if w.client != nil {
+		w.client.Rediscover(w.ctx)
+	}
+	w.loadAll()
+}
+
+// setupComposerFade positions the fade ramp directly above the floating
+// composer and keeps the timelines padded by the composer's live height (the
+// inset), so the last message can scroll clear of the fade.
+func (w *Window) setupComposerFade(overlay *gtk.Overlay, composerBar, fade *gtk.Box) {
+	w.composerInsetCSS = gtk.NewCSSProvider()
+	if disp := gdk.DisplayGetDefault(); disp != nil {
+		gtk.StyleContextAddProviderForDisplay(disp, w.composerInsetCSS, gtk.STYLE_PROVIDER_PRIORITY_APPLICATION+1)
+	}
+
+	fadeNative := gtk.BaseWidget(fade).Object.Native()
+	overlay.ConnectGetChildPosition(func(child gtk.Widgetter) (*gdk.Rectangle, bool) {
+		if gtk.BaseWidget(child).Object.Native() != fadeNative {
+			rect := gdk.NewRectangle(0, 0, 0, 0)
+			return &rect, false // default placement
+		}
+		width, height := overlay.Width(), overlay.Height()
+		inset := 0
+		if composerBar.Visible() {
+			_, inset, _, _ = composerBar.Measure(gtk.OrientationVertical, width)
+		}
+		_, ramp, _, _ := fade.Measure(gtk.OrientationVertical, width)
+		if inset != w.composerInset {
+			w.composerInset = inset
+			// Restyling during allocation would re-queue a resize mid-layout.
+			glib.IdleAdd(w.applyComposerInset)
+		}
+		rect := gdk.NewRectangle(0, height-inset-ramp, width, ramp)
+		return &rect, true
+	})
+}
+
+func (w *Window) applyComposerInset() {
+	// Clearance above the composer for the last message. It sits in the
+	// lightest part of the 40px fade ramp, so it's barely dimmed.
+	const clearance = 24
+	inset := w.composerInset
+	w.composerInsetCSS.LoadFromString(fmt.Sprintf(`
+.glup-timeline-box { padding-bottom: %dpx; }
+scrolledwindow.glup-timeline-scroll > scrollbar.vertical { margin-bottom: %dpx; }
+`, inset+clearance, inset))
+	if w.emptyGreeter != nil {
+		w.emptyGreeter.SetMarginBottom(inset)
+	}
+}
+
+func (w *Window) syncEmptyGreeterVisibility() {
+	hasTab := w.currentTab() != nil
+	if w.emptyGreeter != nil {
+		w.emptyGreeter.SetVisible(!hasTab)
+	}
+	if w.viewStackOverlay != nil {
+		w.viewStackOverlay.SetVisible(hasTab)
+	}
+	if w.viewStack != nil {
+		w.viewStack.SetVisible(hasTab)
+	}
+}
+
 func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 	if sess.Time.Updated == 0 {
 		sess.Time.Updated = cmp.Or(sess.Time.Created, time.Now().UnixMilli())
 	}
 	normDir := normalizeProjectDir(sess.Location.Directory)
+	if w.visibleSessions == nil {
+		w.visibleSessions = make(map[string]bool)
+	}
+	stateChanged := false
+	if sess.ID != "" && !w.visibleSessions[sess.ID] {
+		w.visibleSessions[sess.ID] = true
+		stateChanged = true
+	}
 	if w.ensureProjectOrder(normDir) {
+		stateChanged = true
+	}
+	if stateChanged {
 		w.saveState()
 	}
 	if tab, ok := w.tabs[sess.ID]; ok {
@@ -950,26 +1250,7 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		w.tabOrder = append(w.tabOrder, sess.ID)
 	} else {
 		w.tabOrder = slices.Insert(w.tabOrder, insertIdx, sess.ID)
-		for _, tailID := range w.tabOrder[insertIdx+1:] {
-			tailTab, ok := w.tabs[tailID]
-			if !ok || tailTab.stack == nil {
-				continue
-			}
-			var needsAttention bool
-			if tailTab.page != nil {
-				needsAttention = tailTab.page.NeedsAttention()
-			}
-			title := strings.TrimSpace(tailTab.main.session.Title)
-			if title == "" {
-				title = "Untitled"
-			}
-			w.viewStack.Remove(tailTab.stack)
-			page := w.viewStack.AddTitled(tailTab.stack, tailID, title)
-			page.SetBadgeNumber(0)
-			page.SetNeedsAttention(needsAttention)
-			tailTab.page = page
-			tailTab.sidebarIndicator = nil
-		}
+		w.reattachViewStackFrom(insertIdx + 1)
 	}
 	w.syncSectionStarts()
 	if prevVisID != "" && w.tabs[prevVisID] != nil {
@@ -1024,9 +1305,48 @@ func (w *Window) syncSectionStarts() {
 	}
 }
 
+func (w *Window) revealActiveSession(sessionID string) {
+	if sessionID == "" || w.archivedSessions[sessionID] {
+		return
+	}
+	if _, ok := w.tabs[sessionID]; ok {
+		return
+	}
+	if _, ok := w.childToRoot[sessionID]; ok {
+		return
+	}
+	for _, s := range w.allSessions {
+		if s.ID == sessionID && s.ParentID == "" {
+			if w.visibleSessions == nil {
+				w.visibleSessions = make(map[string]bool)
+			}
+			if !w.visibleSessions[s.ID] {
+				w.visibleSessions[s.ID] = true
+				w.saveState()
+			}
+			wasEmpty := len(w.tabs) == 0
+			w.ensureSessionTab(s)
+			w.syncProjectSessionVisibility()
+			if wasEmpty && w.viewStack != nil {
+				w.viewStack.SetVisibleChildName(s.ID)
+				w.onVisibleTabChanged()
+			}
+			w.syncSwitcherIndicators()
+			return
+		}
+	}
+}
+
 func (w *Window) selectSession(sess opencode.Session) {
 	normDir := normalizeProjectDir(sess.Location.Directory)
 	stateChanged := false
+	if w.visibleSessions == nil {
+		w.visibleSessions = make(map[string]bool)
+	}
+	if !w.visibleSessions[sess.ID] {
+		w.visibleSessions[sess.ID] = true
+		stateChanged = true
+	}
 	if w.archivedSessions[sess.ID] {
 		delete(w.archivedSessions, sess.ID)
 		stateChanged = true
@@ -1063,7 +1383,11 @@ func (w *Window) archiveSession(sessID string) {
 	}
 	normDir := normalizeProjectDir(rawDir)
 
+	if w.archivedSessions == nil {
+		w.archivedSessions = make(map[string]bool)
+	}
 	w.archivedSessions[sessID] = true
+	delete(w.visibleSessions, sessID)
 	w.saveState()
 
 	if w.projectSessions != nil {
@@ -1075,13 +1399,23 @@ func (w *Window) archiveSession(sessID string) {
 		}
 		w.projectSessions[normDir] = filtered
 
-		// If this project is not expanded and now has fewer than 5 open tabs in w.tabs,
-		// promote the next unarchived session from w.projectSessions[normDir] so up to 5 remain visible.
+		// If this project is not expanded and now has fewer than maxVisibleSessions open tabs in w.tabs,
+		// promote the next unarchived session from w.projectSessions[normDir] so up to maxVisibleSessions remain visible.
 		if !w.expandedProjects[normDir] {
+			maxVis := w.effectiveMaxVisibleSessions()
+			openCount := 0
+			for _, id := range w.tabOrder {
+				if id != sessID && w.tabs[id] != nil && normalizeProjectDir(w.tabs[id].main.session.Location.Directory) == normDir {
+					openCount++
+				}
+			}
 			for _, candidate := range w.projectSessions[normDir] {
+				if openCount >= maxVis {
+					break
+				}
 				if _, exists := w.tabs[candidate.ID]; !exists {
 					w.ensureSessionTab(candidate)
-					break
+					openCount++
 				}
 			}
 		}
@@ -1145,9 +1479,13 @@ func (w *Window) archiveSession(sessID string) {
 	w.populating = prevPopulating
 
 	w.syncProjectSessionVisibility()
-	if wasCurrent && nextID != "" {
-		w.viewStack.SetVisibleChildName(nextID)
+	if wasCurrent {
+		if nextID != "" {
+			w.viewStack.SetVisibleChildName(nextID)
+		}
 		w.onVisibleTabChanged()
+	} else {
+		w.updateWindowManagerTitle()
 	}
 	w.syncSwitcherIndicators()
 }
@@ -1182,6 +1520,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 	}
 	for id := range toArchive {
 		w.archivedSessions[id] = true
+		delete(w.visibleSessions, id)
 	}
 	delete(w.collapsedProjects, normDir)
 	delete(w.expandedProjects, normDir)
@@ -1239,14 +1578,313 @@ func (w *Window) clearProjectSessions(rawDir string) {
 			w.viewStack.SetVisibleChildName(nextID)
 		}
 		w.onVisibleTabChanged()
+	} else {
+		w.updateWindowManagerTitle()
 	}
 	w.syncSwitcherIndicators()
 }
 
+func sessionUpdatedTime(sess opencode.Session) int64 {
+	return cmp.Or(sess.Time.Updated, sess.Time.Created)
+}
+
+type sessionSearchMatch struct {
+	sess      opencode.Session
+	dir       string
+	isProject bool
+	row       *gtk.ListBoxRow
+	spinner   *adw.Spinner
+	active    bool
+	score     int
+	updatedAt int64
+}
+
+func (w *Window) isSessionActiveForSearch(sess opencode.Session, pool []opencode.Session, activeMap map[string]opencode.ActiveStatus) bool {
+	if sess.ID == "" {
+		return false
+	}
+	if tab, ok := w.tabs[sess.ID]; ok && w.isTabWorking(tab) {
+		return true
+	}
+	if sess.Time.Busy > 0 && sess.Time.Busy > sess.Time.Idle {
+		return true
+	}
+	if _, ok := activeMap[sess.ID]; ok {
+		return true
+	}
+	for _, s := range pool {
+		if s.ParentID == sess.ID {
+			if s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle {
+				return true
+			}
+			if _, ok := activeMap[s.ID]; ok {
+				return true
+			}
+		}
+	}
+	for _, sh := range w.activeShells {
+		if sh.Status != "" && sh.Status != "running" {
+			continue
+		}
+		if sh.SessionID == sess.ID || w.childToRoot[sh.SessionID] == sess.ID {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) knownProjectDirs(pool []opencode.Session) []string {
+	var allDirs []string
+	seen := make(map[string]bool)
+	addDir := func(raw string) {
+		d := normalizeProjectDir(raw)
+		if d != "" && !seen[d] {
+			seen[d] = true
+			allDirs = append(allDirs, d)
+		}
+	}
+	for _, d := range w.projectOrder {
+		addDir(d)
+	}
+	for _, id := range w.tabOrder {
+		if tab := w.tabs[id]; tab != nil && tab.main != nil {
+			addDir(tab.main.session.Location.Directory)
+		}
+	}
+	for _, s := range pool {
+		addDir(s.Location.Directory)
+	}
+	for _, s := range w.allSessions {
+		addDir(s.Location.Directory)
+	}
+	return allDirs
+}
+
+func matchFilesystemDirs(rawQuery, baseDir string) []string {
+	q := strings.TrimSpace(rawQuery)
+	if q == "" {
+		return nil
+	}
+	looksLikePath := strings.HasPrefix(q, "/") ||
+		strings.HasPrefix(q, "~/") ||
+		q == "~" ||
+		strings.HasPrefix(q, "./") ||
+		strings.HasPrefix(q, "../") ||
+		strings.Contains(q, "/")
+	if !looksLikePath {
+		return nil
+	}
+
+	expanded := q
+	if expanded == "~" || strings.HasPrefix(expanded, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			if expanded == "~" {
+				expanded = home + "/"
+			} else {
+				expanded = filepath.Join(home, expanded[2:])
+				if strings.HasSuffix(q, "/") {
+					expanded += "/"
+				}
+			}
+		}
+	} else if !filepath.IsAbs(expanded) {
+		base := strings.TrimSpace(baseDir)
+		if base == "" {
+			base, _ = os.Getwd()
+		}
+		if base != "" {
+			hasTrailingSlash := strings.HasSuffix(expanded, "/")
+			expanded = filepath.Join(base, expanded)
+			if hasTrailingSlash {
+				expanded += "/"
+			}
+		}
+	}
+
+	var dirs []string
+	seen := make(map[string]bool)
+	addDir := func(d string) {
+		norm := normalizeProjectDir(d)
+		if norm != "" && !seen[norm] {
+			seen[norm] = true
+			dirs = append(dirs, norm)
+		}
+	}
+
+	cleaned := filepath.Clean(expanded)
+	if info, err := os.Stat(cleaned); err == nil && info.IsDir() {
+		addDir(cleaned)
+	}
+
+	scanDir := filepath.Dir(expanded)
+	prefix := strings.ToLower(filepath.Base(expanded))
+	if strings.HasSuffix(expanded, "/") {
+		scanDir = filepath.Clean(expanded)
+		prefix = ""
+	}
+
+	entries, err := os.ReadDir(scanDir)
+	if err != nil {
+		return dirs
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") && !strings.HasPrefix(prefix, ".") {
+			continue
+		}
+		if prefix != "" {
+			if _, ok := fuzzyMatchScore(prefix, name); !ok {
+				continue
+			}
+		}
+		fullPath := filepath.Join(scanDir, name)
+		if entry.IsDir() {
+			addDir(fullPath)
+		} else if entry.Type()&os.ModeSymlink != 0 {
+			if info, err := os.Stat(fullPath); err == nil && info.IsDir() {
+				addDir(fullPath)
+			}
+		}
+		if len(dirs) >= 16 {
+			break
+		}
+	}
+	return dirs
+}
+
+func (w *Window) matchAndSortSearchItems(pool []opencode.Session, query string, activeMap map[string]opencode.ActiveStatus) []sessionSearchMatch {
+	trimmedQuery := strings.TrimSpace(query)
+	sessions := w.matchAndSortSessionsWithActive(pool, query, activeMap)
+
+	latestByDir := make(map[string]int64)
+	for _, s := range pool {
+		d := normalizeProjectDir(s.Location.Directory)
+		if d == "" {
+			continue
+		}
+		if t := sessionUpdatedTime(s); t > latestByDir[d] {
+			latestByDir[d] = t
+		}
+	}
+
+	seenDirs := make(map[string]bool)
+	var candidateDirs []string
+	for _, d := range w.knownProjectDirs(pool) {
+		if !seenDirs[d] {
+			seenDirs[d] = true
+			candidateDirs = append(candidateDirs, d)
+		}
+	}
+	if trimmedQuery != "" {
+		baseDir := w.activeBaseDirectory(w.currentTab(), nil)
+		for _, d := range matchFilesystemDirs(trimmedQuery, baseDir) {
+			if !seenDirs[d] {
+				seenDirs[d] = true
+				candidateDirs = append(candidateDirs, d)
+			}
+		}
+	}
+
+	var projects []sessionSearchMatch
+	for _, dir := range candidateDirs {
+		score := 1
+		if trimmedQuery != "" {
+			candidate := fmt.Sprintf("%s %s %s", projectName(dir), shortDir(dir), dir)
+			var ok bool
+			score, ok = fuzzyMatchScore(trimmedQuery, candidate)
+			if !ok {
+				// If the user typed a filesystem path that resolved directly to dir, keep it with a high score.
+				resolved := resolveTargetDirectory(w.activeBaseDirectory(w.currentTab(), nil), trimmedQuery)
+				if resolved != "" && strings.HasPrefix(strings.ToLower(dir), strings.ToLower(resolved)) {
+					score = 2200
+					ok = true
+				}
+			}
+			if !ok {
+				continue
+			}
+		}
+		projects = append(projects, sessionSearchMatch{
+			dir:       dir,
+			isProject: true,
+			score:     score,
+			updatedAt: latestByDir[dir],
+		})
+	}
+
+	if trimmedQuery == "" {
+		return append(sessions, projects...)
+	}
+
+	combined := make([]sessionSearchMatch, 0, len(projects)+len(sessions))
+	combined = append(combined, projects...)
+	combined = append(combined, sessions...)
+	slices.SortStableFunc(combined, func(a, b sessionSearchMatch) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score)
+		}
+		if a.isProject != b.isProject {
+			if a.isProject {
+				return -1
+			}
+			return 1
+		}
+		return cmp.Compare(b.updatedAt, a.updatedAt)
+	})
+	return combined
+}
+
+func (w *Window) matchAndSortSessions(pool []opencode.Session, query string) []sessionSearchMatch {
+	return w.matchAndSortSessionsWithActive(pool, query, nil)
+}
+
+func (w *Window) matchAndSortSessionsWithActive(pool []opencode.Session, query string, activeMap map[string]opencode.ActiveStatus) []sessionSearchMatch {
+	trimmedQuery := strings.TrimSpace(query)
+	var matches []sessionSearchMatch
+	for _, sess := range pool {
+		if sess.ParentID != "" {
+			continue
+		}
+		if tab, ok := w.tabs[sess.ID]; ok && tab != nil && tab.main != nil {
+			if tUp := sessionUpdatedTime(tab.main.session); tUp > sessionUpdatedTime(sess) {
+				sess.Time.Updated = tUp
+			}
+			if tab.main.session.Title != "" {
+				sess.Title = tab.main.session.Title
+			}
+		}
+		score := 1
+		if trimmedQuery != "" {
+			title := sess.Title
+			dir := sess.Location.Directory
+			candidate := fmt.Sprintf("%s %s %s %s", title, projectName(dir), shortDir(dir), dir)
+			var ok bool
+			score, ok = fuzzyMatchScore(trimmedQuery, candidate)
+			if !ok {
+				continue
+			}
+		}
+		matches = append(matches, sessionSearchMatch{
+			sess:      sess,
+			active:    w.isSessionActiveForSearch(sess, pool, activeMap),
+			score:     score,
+			updatedAt: sessionUpdatedTime(sess),
+		})
+	}
+
+	slices.SortStableFunc(matches, func(a, b sessionSearchMatch) int {
+		if a.score != b.score {
+			return cmp.Compare(b.score, a.score)
+		}
+		return cmp.Compare(sessionUpdatedTime(b.sess), sessionUpdatedTime(a.sess))
+	})
+	return matches
+}
+
 func (w *Window) openSessionSearchDialog() {
 	searchWin := adw.NewWindow()
-	searchWin.SetTitle("Search Sessions")
-	searchWin.SetDefaultSize(540, 440)
+	searchWin.SetTitle("Search Sessions & Projects")
+	searchWin.SetDefaultSize(560, 480)
 	searchWin.SetTransientFor(&w.ApplicationWindow.Window)
 	searchWin.SetModal(true)
 
@@ -1255,7 +1893,7 @@ func (w *Window) openSessionSearchDialog() {
 
 	header := adw.NewHeaderBar()
 	header.SetShowEndTitleButtons(true)
-	titleWidget := adw.NewWindowTitle("Search Sessions", "")
+	titleWidget := adw.NewWindowTitle("Search Sessions & Projects", "")
 	header.SetTitleWidget(titleWidget)
 	toolbar.AddTopBar(header)
 
@@ -1267,7 +1905,7 @@ func (w *Window) openSessionSearchDialog() {
 	toolbar.SetContent(contentBox)
 
 	searchEntry := gtk.NewSearchEntry()
-	searchEntry.SetPlaceholderText("Search sessions by title or project…")
+	searchEntry.SetPlaceholderText("Search sessions, projects, or paths (e.g. ~/Projects)…")
 	contentBox.Append(searchEntry)
 
 	scrolled := gtk.NewScrolledWindow()
@@ -1280,24 +1918,44 @@ func (w *Window) openSessionSearchDialog() {
 	listBox.AddCSSClass("glup-search-list")
 	listBox.SetSelectionMode(gtk.SelectionSingle)
 	listBox.SetActivateOnSingleClick(true)
-	emptySearchLabel := gtk.NewLabel("No matching sessions")
+	emptySearchLabel := gtk.NewLabel("No matching sessions or projects")
 	emptySearchLabel.AddCSSClass("dim-label")
 	emptySearchLabel.SetMarginTop(24)
 	emptySearchLabel.SetMarginBottom(24)
 	listBox.SetPlaceholder(emptySearchLabel)
 	scrolled.SetChild(listBox)
 
+	folderBtn := gtk.NewButton()
+	folderBtn.AddCSSClass("flat")
+	folderBtn.AddCSSClass("glup-new-project-btn")
+	folderBtnBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	folderBtnBox.SetHAlign(gtk.AlignCenter)
+	folderBtnIcon := gtk.NewImageFromIconName("folder-visiting-symbolic")
+	folderBtnLabel := gtk.NewLabel("Open Folder…")
+	folderBtnBox.Append(folderBtnIcon)
+	folderBtnBox.Append(folderBtnLabel)
+	folderBtn.SetChild(folderBtnBox)
+	folderBtn.ConnectClicked(func() {
+		searchWin.Close()
+		w.promptNewProjectFolder()
+	})
+	contentBox.Append(folderBtn)
+
 	var sessionsLock sync.Mutex
 	sessionPool := make([]opencode.Session, len(w.allSessions))
 	copy(sessionPool, w.allSessions)
+	var activeMap map[string]opencode.ActiveStatus
 
-	type matchRow struct {
-		sess  opencode.Session
-		row   *gtk.ListBoxRow
-		score int
+	var currentMatches []sessionSearchMatch
+
+	activateMatch := func(m sessionSearchMatch) {
+		searchWin.Close()
+		if m.isProject {
+			w.createNewSessionInDir(m.dir)
+		} else {
+			w.selectSession(m.sess)
+		}
 	}
-
-	var currentMatches []matchRow
 
 	activateSelected := func() {
 		sel := listBox.SelectedRow()
@@ -1307,8 +1965,7 @@ func (w *Window) openSessionSearchDialog() {
 		if sel != nil {
 			for _, m := range currentMatches {
 				if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
-					searchWin.Close()
-					w.selectSession(m.sess)
+					activateMatch(m)
 					return
 				}
 			}
@@ -1326,6 +1983,28 @@ func (w *Window) openSessionSearchDialog() {
 			activateSelected()
 			return true
 		}
+		if keyval == gdk.KEY_Down || keyval == gdk.KEY_Up {
+			if len(currentMatches) == 0 {
+				return false
+			}
+			selIdx := 0
+			if sel := listBox.SelectedRow(); sel != nil {
+				for i, m := range currentMatches {
+					if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
+						selIdx = i
+						break
+					}
+				}
+			}
+			if keyval == gdk.KEY_Down && selIdx+1 < len(currentMatches) {
+				listBox.SelectRow(currentMatches[selIdx+1].row)
+				return true
+			}
+			if keyval == gdk.KEY_Up && selIdx > 0 {
+				listBox.SelectRow(currentMatches[selIdx-1].row)
+				return true
+			}
+		}
 		return false
 	})
 	searchWin.AddController(escCtrl)
@@ -1340,8 +2019,7 @@ func (w *Window) openSessionSearchDialog() {
 		}
 		for _, m := range currentMatches {
 			if m.row != nil && m.row.Object.Native() == row.Object.Native() {
-				searchWin.Close()
-				w.selectSession(m.sess)
+				activateMatch(m)
 				return
 			}
 		}
@@ -1351,45 +2029,19 @@ func (w *Window) openSessionSearchDialog() {
 		sessionsLock.Lock()
 		pool := make([]opencode.Session, len(sessionPool))
 		copy(pool, sessionPool)
+		act := activeMap
 		sessionsLock.Unlock()
 
 		query := searchEntry.Text()
 
-		for c := listBox.FirstChild(); c != nil; {
-			next := gtk.BaseWidget(c).NextSibling()
-			listBox.Remove(c)
-			c = next
+		for _, prev := range currentMatches {
+			if prev.row != nil {
+				listBox.Remove(prev.row)
+			}
 		}
 		currentMatches = nil
 
-		var matches []matchRow
-		for _, sess := range pool {
-			if sess.ParentID != "" {
-				continue
-			}
-			title := sess.Title
-			dir := sess.Location.Directory
-			candidate := fmt.Sprintf("%s %s %s", title, projectName(dir), shortDir(dir))
-			score, ok := fuzzyMatchScore(query, candidate)
-			if !ok {
-				continue
-			}
-			finalScore := score*1000 + int((sess.Time.Updated/1000)%10000)
-			matches = append(matches, matchRow{sess: sess, score: finalScore})
-		}
-
-		slices.SortStableFunc(matches, func(a, b matchRow) int {
-			if a.score != b.score {
-				return b.score - a.score
-			}
-			if a.sess.Time.Updated != b.sess.Time.Updated {
-				if a.sess.Time.Updated > b.sess.Time.Updated {
-					return -1
-				}
-				return 1
-			}
-			return 0
-		})
+		matches := w.matchAndSortSearchItems(pool, query, act)
 
 		for i, m := range matches {
 			row := gtk.NewListBoxRow()
@@ -1400,43 +2052,82 @@ func (w *Window) openSessionSearchDialog() {
 			rowBox.SetMarginStart(12)
 			rowBox.SetMarginEnd(12)
 
-			textVBox := gtk.NewBox(gtk.OrientationVertical, 2)
-			textVBox.SetHExpand(true)
+			if m.isProject {
+				folderIcon := gtk.NewImageFromIconName("folder-symbolic")
+				folderIcon.AddCSSClass("glup-sidebar-folder-icon")
+				folderIcon.SetVAlign(gtk.AlignCenter)
+				rowBox.Append(folderIcon)
 
-			titleText := strings.TrimSpace(m.sess.Title)
-			if titleText == "" {
-				titleText = "Untitled Session"
-			}
-			titleLabel := gtk.NewLabel(titleText)
-			titleLabel.SetXAlign(0)
-			titleLabel.SetEllipsize(pango.EllipsizeEnd)
+				textVBox := gtk.NewBox(gtk.OrientationVertical, 2)
+				textVBox.SetHExpand(true)
 
-			dir := m.sess.Location.Directory
-			subText := fmt.Sprintf("%s · %s", projectName(dir), shortDir(dir))
-			subLabel := gtk.NewLabel(subText)
-			subLabel.SetXAlign(0)
-			subLabel.SetEllipsize(pango.EllipsizeMiddle)
-			subLabel.AddCSSClass("caption")
-			subLabel.AddCSSClass("dim-label")
+				titleLabel := gtk.NewLabel(projectName(m.dir))
+				titleLabel.SetXAlign(0)
+				titleLabel.SetEllipsize(pango.EllipsizeMiddle)
+				titleLabel.AddCSSClass("glup-sidebar-project-title")
 
-			textVBox.Append(titleLabel)
-			textVBox.Append(subLabel)
-			rowBox.Append(textVBox)
+				subLabel := gtk.NewLabel(shortDir(m.dir))
+				subLabel.SetXAlign(0)
+				subLabel.SetEllipsize(pango.EllipsizeMiddle)
+				subLabel.AddCSSClass("caption")
+				subLabel.AddCSSClass("dim-label")
 
-			if w.archivedSessions[m.sess.ID] {
-				archLabel := gtk.NewLabel("Archived")
-				archLabel.AddCSSClass("caption")
-				archLabel.AddCSSClass("glup-search-archived-badge")
-				archLabel.SetVAlign(gtk.AlignCenter)
-				rowBox.Append(archLabel)
-			}
+				textVBox.Append(titleLabel)
+				textVBox.Append(subLabel)
+				rowBox.Append(textVBox)
 
-			if tm := formatRelativeTimemark(m.sess.Time.Updated); tm != "" {
-				timeLabel := gtk.NewLabel(tm)
-				timeLabel.AddCSSClass("caption")
-				timeLabel.AddCSSClass("dim-label")
-				timeLabel.SetVAlign(gtk.AlignCenter)
-				rowBox.Append(timeLabel)
+				newBadge := gtk.NewLabel("New Session")
+				newBadge.AddCSSClass("caption")
+				newBadge.AddCSSClass("glup-search-archived-badge")
+				newBadge.SetVAlign(gtk.AlignCenter)
+				rowBox.Append(newBadge)
+			} else {
+				if m.active {
+					spinner := adw.NewSpinner()
+					spinner.AddCSSClass("glup-switcher-prefix")
+					spinner.SetVAlign(gtk.AlignCenter)
+					rowBox.Append(spinner)
+					matches[i].spinner = spinner
+				}
+
+				textVBox := gtk.NewBox(gtk.OrientationVertical, 2)
+				textVBox.SetHExpand(true)
+
+				titleText := strings.TrimSpace(m.sess.Title)
+				if titleText == "" {
+					titleText = "Untitled Session"
+				}
+				titleLabel := gtk.NewLabel(titleText)
+				titleLabel.SetXAlign(0)
+				titleLabel.SetEllipsize(pango.EllipsizeEnd)
+
+				dir := m.sess.Location.Directory
+				subText := fmt.Sprintf("%s · %s", projectName(dir), shortDir(dir))
+				subLabel := gtk.NewLabel(subText)
+				subLabel.SetXAlign(0)
+				subLabel.SetEllipsize(pango.EllipsizeMiddle)
+				subLabel.AddCSSClass("caption")
+				subLabel.AddCSSClass("dim-label")
+
+				textVBox.Append(titleLabel)
+				textVBox.Append(subLabel)
+				rowBox.Append(textVBox)
+
+				if w.archivedSessions[m.sess.ID] {
+					archLabel := gtk.NewLabel("Archived")
+					archLabel.AddCSSClass("caption")
+					archLabel.AddCSSClass("glup-search-archived-badge")
+					archLabel.SetVAlign(gtk.AlignCenter)
+					rowBox.Append(archLabel)
+				}
+
+				if tm := formatRelativeTimemark(sessionUpdatedTime(m.sess)); tm != "" {
+					timeLabel := gtk.NewLabel(tm)
+					timeLabel.AddCSSClass("caption")
+					timeLabel.AddCSSClass("dim-label")
+					timeLabel.SetVAlign(gtk.AlignCenter)
+					rowBox.Append(timeLabel)
+				}
 			}
 
 			row.SetChild(rowBox)
@@ -1487,12 +2178,33 @@ func (w *Window) openSessionSearchDialog() {
 	updateList()
 
 	gtkutil.Async(w.ctx, func() func() {
-		sessions, err := w.client.ListSessions(w.ctx, 200)
-		if err != nil || len(sessions) == 0 {
+		var (
+			sessions []opencode.Session
+			active   map[string]opencode.ActiveStatus
+			wg       sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			sessions, _ = w.client.ListSessions(w.ctx, 200)
+		}()
+		go func() {
+			defer wg.Done()
+			active, _ = w.client.ActiveSessions(w.ctx)
+		}()
+		wg.Wait()
+		if len(sessions) == 0 && len(active) == 0 {
 			return func() {}
 		}
 		return func() {
-			mergeSessions(sessions)
+			if len(active) > 0 {
+				sessionsLock.Lock()
+				activeMap = active
+				sessionsLock.Unlock()
+			}
+			if len(sessions) > 0 {
+				mergeSessions(sessions)
+			}
 			updateList()
 		}
 	})
@@ -1526,12 +2238,190 @@ func (w *Window) openSubagentByID(tab *sessionTab, childID string) {
 	})
 }
 
+func (w *Window) lookupCachedSessionTitle(sessionID string) string {
+	if w == nil || sessionID == "" {
+		return ""
+	}
+	if tab, ok := w.tabs[sessionID]; ok && tab.main != nil {
+		if t := strings.TrimSpace(tab.main.session.Title); t != "" {
+			return t
+		}
+	}
+	for _, tab := range w.tabs {
+		if sub, ok := tab.subTimelines[sessionID]; ok && sub != nil {
+			if t := strings.TrimSpace(sub.session.Title); t != "" {
+				return t
+			}
+		}
+		for _, sub := range tab.subagents {
+			if sub.ID == sessionID {
+				if t := strings.TrimSpace(sub.Title); t != "" {
+					return t
+				}
+			}
+		}
+	}
+	for _, s := range w.allSessions {
+		if s.ID == sessionID {
+			if t := strings.TrimSpace(s.Title); t != "" {
+				return t
+			}
+		}
+	}
+	for _, list := range w.projectSessions {
+		for _, s := range list {
+			if s.ID == sessionID {
+				if t := strings.TrimSpace(s.Title); t != "" {
+					return t
+				}
+			}
+		}
+	}
+	if w.resolvedSessionTitles != nil {
+		if t := strings.TrimSpace(w.resolvedSessionTitles[sessionID]); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+func (w *Window) resolveSessionTitleAsync(sessionID string, onResolved func(title string)) string {
+	if w == nil || sessionID == "" {
+		return ""
+	}
+	if title := w.lookupCachedSessionTitle(sessionID); title != "" {
+		return title
+	}
+	if w.client == nil || onResolved == nil {
+		return ""
+	}
+	if w.resolvedSessionTitles != nil {
+		if _, tried := w.resolvedSessionTitles[sessionID]; tried {
+			return ""
+		}
+	}
+	if w.resolvingSessions == nil {
+		w.resolvingSessions = make(map[string][]func(string))
+	}
+	w.resolvingSessions[sessionID] = append(w.resolvingSessions[sessionID], onResolved)
+	if len(w.resolvingSessions[sessionID]) > 1 {
+		return ""
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		sess, err := w.client.GetSession(w.ctx, sessionID)
+		return func() {
+			callbacks := w.resolvingSessions[sessionID]
+			delete(w.resolvingSessions, sessionID)
+			if w.resolvedSessionTitles == nil {
+				w.resolvedSessionTitles = make(map[string]string)
+			}
+			var title string
+			if err == nil && sess != nil {
+				title = strings.TrimSpace(sess.Title)
+			}
+			w.resolvedSessionTitles[sessionID] = title
+			if title != "" {
+				for _, cb := range callbacks {
+					if cb != nil {
+						cb(title)
+					}
+				}
+			}
+		}
+	})
+	return ""
+}
+
+func (w *Window) handleMarkdownLink(uri string) bool {
+	if strings.HasPrefix(uri, mdstream.SessionLinkPrefix) {
+		sessionID := strings.TrimPrefix(uri, mdstream.SessionLinkPrefix)
+		w.openSessionByID(sessionID)
+		return true
+	}
+	return false
+}
+
+func (w *Window) openSessionByID(sessionID string) {
+	if w == nil || sessionID == "" {
+		return
+	}
+	if tab, ok := w.tabs[sessionID]; ok && tab.main != nil {
+		w.closeSubagent(tab)
+		w.selectSession(tab.main.session)
+		return
+	}
+	if rootID, ok := w.childToRoot[sessionID]; ok {
+		if tab, ok := w.tabs[rootID]; ok && tab.main != nil {
+			w.selectSession(tab.main.session)
+			w.openSubagentByID(tab, sessionID)
+			return
+		}
+	}
+	for _, tab := range w.tabs {
+		for _, sub := range tab.subagents {
+			if sub.ID == sessionID {
+				w.selectSession(tab.main.session)
+				w.openSubagent(tab, sub)
+				return
+			}
+		}
+	}
+	for _, s := range w.allSessions {
+		if s.ID == sessionID {
+			if s.ParentID == "" {
+				w.selectSession(s)
+				return
+			}
+			if parentTab, ok := w.tabs[s.ParentID]; ok && parentTab.main != nil {
+				w.selectSession(parentTab.main.session)
+				w.openSubagent(parentTab, s)
+				return
+			}
+		}
+	}
+	if w.client == nil {
+		return
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		sess, err := w.client.GetSession(w.ctx, sessionID)
+		var parentSess *opencode.Session
+		if err == nil && sess != nil && sess.ParentID != "" {
+			parentSess, _ = w.client.GetSession(w.ctx, sess.ParentID)
+		}
+		return func() {
+			if err != nil || sess == nil {
+				slog.Error("failed to open session by ID", "sessionID", sessionID, "err", err)
+				return
+			}
+			if w.resolvedSessionTitles != nil && strings.TrimSpace(sess.Title) != "" {
+				w.resolvedSessionTitles[sess.ID] = strings.TrimSpace(sess.Title)
+			}
+			if sess.ParentID != "" {
+				if parentSess != nil {
+					w.selectSession(*parentSess)
+				}
+				if parentTab, ok := w.tabs[sess.ParentID]; ok {
+					w.openSubagent(parentTab, *sess)
+					return
+				}
+			}
+			w.selectSession(*sess)
+		}
+	})
+}
+
 func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	timelineBox := gtk.NewBox(gtk.OrientationVertical, 0)
 	timelineBox.AddCSSClass("glup-timeline-box")
 
+	greeter := NewGreeterWidget(w.effectiveGreeterProfile(), func(prompt string) {
+		w.populateComposerSuggestion(prompt)
+	})
+	greeter.SetVisible(false) // shown by updateGreeterVisibility once loaded and empty
+	timelineBox.Append(greeter)
+
 	clamp := adw.NewClamp()
-	clamp.SetMaximumSize(920)
+	clamp.SetMaximumSize(w.effectiveChatWidth())
 	clamp.SetTighteningThreshold(680)
 	clamp.SetChild(timelineBox)
 
@@ -1539,6 +2429,7 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	scroll.SetVExpand(true)
 	scroll.SetHExpand(true)
 	scroll.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
+	scroll.AddCSSClass("glup-timeline-scroll")
 	scroll.SetChild(clamp)
 
 	thinkingLabel := gtk.NewLabel("Thinking...")
@@ -1552,12 +2443,17 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	conv := &convTimeline{
 		session:            sess,
 		scroll:             scroll,
+		clamp:              clamp,
 		timelineBox:        timelineBox,
+		greeter:            greeter,
 		thinkingLabel:      thinkingLabel,
+		thinkingAttached:   true,
 		assistantMap:       make(map[string]*AssistantMessageWidget),
 		compactionMap:      make(map[string]*CompactionWidget),
 		messageWidgets:     make(map[string]gtk.Widgetter),
 		formWidgets:        make(map[string]*QuestionFormWidget),
+		permissionWidgets:  make(map[string]*PermissionPromptWidget),
+		ignoredCancelIDs:   make(map[string]bool),
 		seenMsgIDs:         make(map[string]bool),
 		blockingTools:      make(map[string]time.Time),
 		blockingShellTools: make(map[string]bool),
@@ -1604,10 +2500,111 @@ func (w *Window) syncNavigationChrome() {
 		if w.showSidebarBtn != nil {
 			w.showSidebarBtn.SetVisible(!sidebarVisible)
 		}
-		if w.newSessionTopBtn != nil {
-			w.newSessionTopBtn.SetVisible(!sidebarVisible)
+		if w.appMenuTopBtn != nil {
+			w.appMenuTopBtn.SetVisible(!sidebarVisible)
+		}
+		if w.searchSessionsTopBtn != nil {
+			w.searchSessionsTopBtn.SetVisible(!sidebarVisible)
+		}
+		if w.sidebarResizeHandle != nil {
+			w.sidebarResizeHandle.SetVisible(!w.rootContent.Collapsed())
+		}
+		w.applySidebarWidth()
+	}
+}
+
+func (w *Window) applySidebarWidth() {
+	if w.rootContent == nil {
+		return
+	}
+	if w.rootContent.Collapsed() {
+		w.rootContent.SetSidebarWidthUnit(adw.LengthUnitSp)
+		w.rootContent.SetMinSidebarWidth(220)
+		w.rootContent.SetMaxSidebarWidth(300)
+		w.rootContent.SetSidebarWidthFraction(0.25)
+		return
+	}
+	width := cmp.Or(clampSidebarWidth(w.sidebarWidth), defaultSidebarWidth)
+	w.rootContent.SetSidebarWidthUnit(adw.LengthUnitPx)
+	w.rootContent.SetMinSidebarWidth(float64(width))
+	w.rootContent.SetMaxSidebarWidth(float64(width))
+}
+
+func (w *Window) setDesktopSidebarWidth(width int) {
+	clamped := clampSidebarWidth(width)
+	if clamped <= 0 {
+		return
+	}
+	if w.rootContent != nil {
+		if totalW := w.rootContent.Width(); totalW > minSidebarWidth*2 {
+			if maxW := totalW / 2; clamped > maxW && maxW >= minSidebarWidth {
+				clamped = maxW
+			}
 		}
 	}
+	if clamped == w.sidebarWidth {
+		return
+	}
+	w.sidebarWidth = clamped
+	w.applySidebarWidth()
+}
+
+func (w *Window) setupSidebarResize() {
+	if w.sidebarResizeHandle == nil || w.rootContent == nil {
+		return
+	}
+	w.sidebarResizeHandle.SetCursorFromName("ew-resize")
+
+	motion := gtk.NewEventControllerMotion()
+	motion.ConnectEnter(func(_, _ float64) {
+		w.resizerHovered = true
+	})
+	motion.ConnectLeave(func() {
+		w.resizerHovered = false
+	})
+	w.sidebarResizeHandle.AddController(motion)
+
+	drag := gtk.NewGestureDrag()
+	drag.SetButton(1)
+	drag.SetPropagationPhase(gtk.PhaseCapture)
+	drag.ConnectDragBegin(func(startX, _ float64) {
+		if w.rootContent.Collapsed() || !w.rootContent.ShowSidebar() {
+			drag.SetState(gtk.EventSequenceDenied)
+			w.resizingSidebar = false
+			return
+		}
+		curW := 0
+		if w.sidebarToolbar != nil {
+			curW = w.sidebarToolbar.Width()
+		}
+		if !w.resizerHovered && (curW <= 0 || math.Abs(startX-float64(curW)) > 8) {
+			drag.SetState(gtk.EventSequenceDenied)
+			w.resizingSidebar = false
+			return
+		}
+		if curW <= 0 {
+			curW = cmp.Or(w.sidebarWidth, defaultSidebarWidth)
+		}
+		w.resizingSidebar = true
+		w.sidebarDragStartWidth = curW
+		w.sidebarResizeHandle.AddCSSClass("dragging")
+		drag.SetState(gtk.EventSequenceClaimed)
+	})
+	drag.ConnectDragUpdate(func(offsetX, _ float64) {
+		if !w.resizingSidebar {
+			return
+		}
+		w.setDesktopSidebarWidth(w.sidebarDragStartWidth + int(math.Round(offsetX)))
+	})
+	drag.ConnectDragEnd(func(_, _ float64) {
+		if !w.resizingSidebar {
+			return
+		}
+		w.resizingSidebar = false
+		w.sidebarResizeHandle.RemoveCSSClass("dragging")
+		w.saveState()
+	})
+	w.rootContent.AddController(drag)
 }
 
 func (w *Window) applySessionRename(sessionID, newTitle string) {
@@ -1988,7 +2985,146 @@ func updateRowShowMore(row *gtk.ListBoxRow, hiddenCount int, onExpand func()) {
 	vBox.Append(btn)
 }
 
+type projectHeaderWidgets struct {
+	outerBox      *gtk.Box
+	hBox          *gtk.Box
+	titleLabel    *gtk.Label
+	subtitleLabel *gtk.Label
+	countLabel    *gtk.Label
+	chevron       *gtk.Image
+	newBtn        *gtk.Button
+	popover       *gtk.Popover
+	newSessBtn    *gtk.Button
+	openFilesBtn  *gtk.Button
+	copyPathBtn   *gtk.Button
+	toggleBtn     *gtk.Button
+	toggleLbl     *gtk.Label
+	archiveBtn    *gtk.Button
+	onNewSession  func()
+	onOpenFiles   func()
+	onCopyPath    func()
+	onToggle      func()
+	onArchive     func()
+}
+
+func (hw *projectHeaderWidgets) openMenuAt(x, y float64) {
+	if hw == nil || hw.popover == nil {
+		return
+	}
+	if x > 0 || y > 0 {
+		rect := gdk.NewRectangle(int(x), int(y), 1, 1)
+		hw.popover.SetPointingTo(&rect)
+	} else {
+		hw.popover.SetPointingTo(nil)
+	}
+	if hw.hBox != nil && hw.hBox.Root() != nil {
+		hw.popover.Popup()
+	}
+}
+
+func (w *Window) setupAppMenuButton(menuBtn *gtk.MenuButton) {
+	if menuBtn == nil {
+		return
+	}
+	menuBox := gtk.NewBox(gtk.OrientationVertical, 2)
+	menuBox.AddCSSClass("glup-popover-content")
+	menuBox.AddCSSClass("glup-project-menu")
+
+	popover := gtk.NewPopover()
+	popover.SetHasArrow(false)
+	popover.SetAutohide(true)
+	popover.SetChild(menuBox)
+
+	prefsBtn, _ := newProjectHeaderMenuButton("settings-symbolic", "Preferences")
+	prefsBtn.ConnectClicked(func() {
+		popover.Popdown()
+		w.openPreferencesDialog()
+	})
+	menuBox.Append(prefsBtn)
+
+	aboutBtn, _ := newProjectHeaderMenuButton("help-about-symbolic", "About Gluppencode")
+	aboutBtn.ConnectClicked(func() {
+		popover.Popdown()
+		w.openAboutDialog()
+	})
+	menuBox.Append(aboutBtn)
+
+	menuBtn.SetPopover(popover)
+}
+
+func (w *Window) openAboutDialog() {
+	if w.ApplicationWindow == nil {
+		return
+	}
+	about := adw.NewAboutDialog()
+	about.SetApplicationName("Gluppencode")
+	about.SetApplicationIcon("so.libdb.gluppencode")
+	about.SetDeveloperName("diamondburned")
+	about.SetVersion("1.0")
+	about.SetComments("A GTK4 and libadwaita desktop frontend for OpenCode")
+	about.SetWebsite("https://github.com/diamondburned/gluppencode")
+	about.SetIssueURL("https://github.com/diamondburned/gluppencode/issues")
+	about.Present(w.ApplicationWindow)
+}
+
+func newProjectHeaderMenuButton(iconName, labelText string) (*gtk.Button, *gtk.Label) {
+	btn := gtk.NewButton()
+	btn.AddCSSClass("flat")
+	btn.AddCSSClass("glup-project-menu-item")
+
+	row := gtk.NewBox(gtk.OrientationHorizontal, 8)
+	row.SetVAlign(gtk.AlignCenter)
+
+	icon := gtk.NewImageFromIconName(iconName)
+	icon.SetPixelSize(16)
+	row.Append(icon)
+
+	lbl := gtk.NewLabel(labelText)
+	lbl.SetXAlign(0)
+	lbl.SetHExpand(true)
+	row.Append(lbl)
+
+	btn.SetChild(row)
+	return btn, lbl
+}
+
+func (w *Window) openProjectInFiles(rawDir string) {
+	dir := normalizeProjectDir(rawDir)
+	if dir == "" {
+		return
+	}
+	if w.fileOpener != nil {
+		w.fileOpener(dir)
+		return
+	}
+	var parent *gtk.Window
+	if w.ApplicationWindow != nil {
+		parent = &w.Window
+	}
+	launcher := gtk.NewFileLauncher(gio.NewFileForPath(dir))
+	launcher.Launch(w.ctx, parent, nil)
+}
+
+func (w *Window) copyTextToClipboard(text string) {
+	if text == "" {
+		return
+	}
+	if w.clipboardSetter != nil {
+		w.clipboardSetter(text)
+		return
+	}
+	if d := gdk.DisplayGetDefault(); d != nil {
+		d.Clipboard().SetText(text)
+	}
+}
+
 func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.Box {
+	if w.headerProjectDir == nil {
+		w.headerProjectDir = make(map[uintptr]string)
+	}
+	if w.headerWidgets == nil {
+		w.headerWidgets = make(map[uintptr]*projectHeaderWidgets)
+	}
 	normDir := normalizeProjectDir(rawDir)
 	outerBox := gtk.NewBox(gtk.OrientationVertical, 0)
 	outerBox.AddCSSClass("glup-sidebar-project-header")
@@ -2058,28 +3194,131 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 	ptr := outerBox.Object.Native()
 	w.headerProjectDir[ptr] = normDir
 
-	clearBtn := gtk.NewButtonFromIconName("window-close-symbolic")
-	clearBtn.AddCSSClass("flat")
-	clearBtn.AddCSSClass("circular")
-	clearBtn.AddCSSClass("glup-sidebar-close-btn")
-	clearBtn.AddCSSClass("glup-sidebar-project-close-btn")
-	clearBtn.SetTooltipText("Hide Project")
-	clearBtn.SetVAlign(gtk.AlignCenter)
-	clearBtn.ConnectClicked(func() {
+	onNewSession := func() {
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.createNewSessionInDir(d)
+		}
+	}
+	newBtn := gtk.NewButtonFromIconName("list-add-symbolic")
+	newBtn.AddCSSClass("flat")
+	newBtn.AddCSSClass("circular")
+	newBtn.AddCSSClass("glup-sidebar-close-btn")
+	newBtn.AddCSSClass("glup-sidebar-project-add-btn")
+	newBtn.SetTooltipText("New Session in Project")
+	newBtn.SetVAlign(gtk.AlignCenter)
+	newBtn.ConnectClicked(onNewSession)
+	hBox.Append(newBtn)
+
+	menuBox := gtk.NewBox(gtk.OrientationVertical, 2)
+	menuBox.AddCSSClass("glup-popover-content")
+	menuBox.AddCSSClass("glup-project-menu")
+
+	popover := gtk.NewPopover()
+	popover.SetHasArrow(true)
+	popover.SetAutohide(true)
+	popover.SetPosition(gtk.PosBottom)
+	popover.SetChild(menuBox)
+	popover.SetParent(outerBox)
+	outerBox.ConnectDestroy(func() {
+		popover.Unparent()
+	})
+
+	newSessBtn, _ := newProjectHeaderMenuButton("list-add-symbolic", "New Session")
+	newSessBtn.ConnectClicked(func() {
+		popover.Popdown()
+		onNewSession()
+	})
+	menuBox.Append(newSessBtn)
+
+	onOpenFiles := func() {
+		popover.Popdown()
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.openProjectInFiles(d)
+		}
+	}
+	openFilesBtn, _ := newProjectHeaderMenuButton("folder-visiting-symbolic", "Open in Files")
+	openFilesBtn.ConnectClicked(onOpenFiles)
+	menuBox.Append(openFilesBtn)
+
+	onCopyPath := func() {
+		popover.Popdown()
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.copyTextToClipboard(d)
+		}
+	}
+	copyPathBtn, _ := newProjectHeaderMenuButton("edit-copy-symbolic", "Copy Path")
+	copyPathBtn.ConnectClicked(onCopyPath)
+	menuBox.Append(copyPathBtn)
+
+	toggleText := "Collapse Project"
+	if w.collapsedProjects[normDir] {
+		toggleText = "Expand Project"
+	}
+	onToggle := func() {
+		popover.Popdown()
+		if d := w.headerProjectDir[ptr]; d != "" {
+			w.toggleProjectCollapsed(d)
+		}
+	}
+	toggleBtn, toggleLbl := newProjectHeaderMenuButton("chevron-right-symbolic", toggleText)
+	toggleBtn.ConnectClicked(onToggle)
+	menuBox.Append(toggleBtn)
+
+	menuSep := gtk.NewSeparator(gtk.OrientationHorizontal)
+	menuSep.SetMarginTop(3)
+	menuSep.SetMarginBottom(3)
+	menuBox.Append(menuSep)
+
+	onArchive := func() {
+		popover.Popdown()
 		if d := w.headerProjectDir[ptr]; d != "" {
 			w.clearProjectSessions(d)
 		}
-	})
-	hBox.Append(clearBtn)
+	}
+	archiveBtn, _ := newProjectHeaderMenuButton("window-close-symbolic", "Archive Project")
+	archiveBtn.AddCSSClass("glup-project-menu-item-danger")
+	archiveBtn.ConnectClicked(onArchive)
+	menuBox.Append(archiveBtn)
+
+	hw := &projectHeaderWidgets{
+		outerBox:      outerBox,
+		hBox:          hBox,
+		titleLabel:    titleLabel,
+		subtitleLabel: subtitleLabel,
+		countLabel:    countLabel,
+		chevron:       chevron,
+		newBtn:        newBtn,
+		popover:       popover,
+		newSessBtn:    newSessBtn,
+		openFilesBtn:  openFilesBtn,
+		copyPathBtn:   copyPathBtn,
+		toggleBtn:     toggleBtn,
+		toggleLbl:     toggleLbl,
+		archiveBtn:    archiveBtn,
+		onNewSession:  onNewSession,
+		onOpenFiles:   onOpenFiles,
+		onCopyPath:    onCopyPath,
+		onToggle:      onToggle,
+		onArchive:     onArchive,
+	}
+	w.headerWidgets[ptr] = hw
 
 	outerBox.Append(hBox)
 
+	var suppressNextRelease bool
 	click := gtk.NewGestureClick()
 	click.SetButton(1)
+	click.ConnectPressed(func(_ int, _, _ float64) {
+		suppressNextRelease = false
+	})
 	click.ConnectReleased(func(_ int, x, y float64) {
+		if suppressNextRelease {
+			suppressNextRelease = false
+			return
+		}
 		if picked := hBox.Pick(x, y, gtk.PickDefault); picked != nil {
 			for p := gtk.Widgetter(picked); p != nil; p = gtk.BaseWidget(p).Parent() {
-				if gtk.BaseWidget(p).Object.Native() == clearBtn.Object.Native() {
+				if gtk.BaseWidget(p).Object.Native() == newBtn.Object.Native() {
 					return
 				}
 				if gtk.BaseWidget(p).Object.Native() == hBox.Object.Native() {
@@ -2093,6 +3332,23 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 		}
 	})
 	hBox.AddController(click)
+
+	rightClick := gtk.NewGestureClick()
+	rightClick.SetButton(3)
+	rightClick.ConnectPressed(func(_ int, x, y float64) {
+		rightClick.SetState(gtk.EventSequenceClaimed)
+		hw.openMenuAt(x, y)
+	})
+	hBox.AddController(rightClick)
+
+	longPress := gtk.NewGestureLongPress()
+	longPress.SetTouchOnly(false)
+	longPress.ConnectPressed(func(x, y float64) {
+		suppressNextRelease = true
+		longPress.SetState(gtk.EventSequenceClaimed)
+		hw.openMenuAt(x, y)
+	})
+	hBox.AddController(longPress)
 
 	dragSource := gtk.NewDragSource()
 	dragSource.SetActions(gdk.ActionMove)
@@ -2142,10 +3398,33 @@ func (w *Window) updateProjectHeaderLabels(root gtk.Widgetter, rawDir string) {
 	if base == nil {
 		return
 	}
+	if w.headerProjectDir == nil {
+		w.headerProjectDir = make(map[uintptr]string)
+	}
 	normDir := normalizeProjectDir(rawDir)
-	w.headerProjectDir[base.Object.Native()] = normDir
+	ptr := base.Object.Native()
+	w.headerProjectDir[ptr] = normDir
 	collapsed := w.collapsedProjects[normDir]
 	total := len(w.projectSessions[normDir])
+
+	if hw, ok := w.headerWidgets[ptr]; ok && hw != nil {
+		hw.titleLabel.SetText(projectName(rawDir))
+		hw.subtitleLabel.SetText(shortDir(rawDir))
+		if collapsed {
+			hw.chevron.RemoveCSSClass("glup-sidebar-project-chevron-expanded")
+			hw.toggleLbl.SetText("Expand Project")
+		} else {
+			hw.chevron.AddCSSClass("glup-sidebar-project-chevron-expanded")
+			hw.toggleLbl.SetText("Collapse Project")
+		}
+		if collapsed && total > 0 {
+			hw.countLabel.SetText(fmt.Sprintf("%d", total))
+			hw.countLabel.SetVisible(true)
+		} else {
+			hw.countLabel.SetVisible(false)
+		}
+		return
+	}
 
 	var titleLbl, subLbl, countLbl *gtk.Label
 	var chevronImg *gtk.Image
@@ -2214,9 +3493,11 @@ func (w *Window) updateRowProjectHeader(row *gtk.ListBoxRow, dir string, section
 	}
 
 	headerBase.AddCSSClass("glup-sidebar-project-header")
-	headerBase.SetTooltipText(fmt.Sprintf("%s (%s) — click to collapse/expand, drag to reorder", projectName(dir), shortDir(dir)))
+	tooltip := fmt.Sprintf("%s (%s) — click to collapse/expand, right-click or hold for options, drag to reorder", projectName(dir), shortDir(dir))
+	headerBase.SetTooltipText(tooltip)
 
 	if stack, ok := headerBase.Cast().(*gtk.Stack); ok {
+		stack.SetHhomogeneous(false)
 		stack.SetVhomogeneous(false)
 		childName := "glup_header"
 		if sectionIdx > 0 {
@@ -2251,7 +3532,7 @@ func (w *Window) updateRowProjectHeader(row *gtk.ListBoxRow, dir string, section
 
 	hBox := w.newProjectHeaderBox(dir, sectionIdx > 0)
 	w.updateProjectHeaderLabels(hBox, dir)
-	hBox.SetTooltipText(fmt.Sprintf("%s (%s) — click to collapse/expand, drag to reorder", projectName(dir), shortDir(dir)))
+	hBox.SetTooltipText(tooltip)
 	row.SetHeader(hBox)
 }
 
@@ -2311,8 +3592,9 @@ func (w *Window) syncProjectSessionVisibility() {
 			continue
 		}
 		expanded := w.expandedProjects[dir]
+		maxVis := w.effectiveMaxVisibleSessions()
 		for i, tab := range tabs {
-			if expanded || i < 5 || tab.main.session.ID == currentID {
+			if expanded || i < maxVis || tab.main.session.ID == currentID {
 				tab.page.SetVisible(true)
 			} else {
 				tab.page.SetVisible(false)
@@ -2321,7 +3603,7 @@ func (w *Window) syncProjectSessionVisibility() {
 	}
 }
 
-func (w *Window) compareTabIDs(idA, idB string) int {
+func (w *Window) compareTabProjects(idA, idB string) int {
 	if idA == idB {
 		return 0
 	}
@@ -2335,32 +3617,14 @@ func (w *Window) compareTabIDs(idA, idB string) int {
 	if dirA != dirB {
 		return w.compareProjectOrder(dirA, dirB)
 	}
-	timeA := cmp.Or(tabA.main.session.Time.Updated, tabA.main.session.Time.Created)
-	timeB := cmp.Or(tabB.main.session.Time.Updated, tabB.main.session.Time.Created)
-	if c := cmp.Compare(timeB, timeA); c != 0 {
-		return c
-	}
-	return cmp.Compare(idB, idA)
+	return 0
 }
 
-func (w *Window) reorderTabsByProject() bool {
-	if len(w.tabOrder) <= 1 || slices.IsSortedFunc(w.tabOrder, w.compareTabIDs) {
-		return false
+func (w *Window) reattachViewStackFrom(startIdx int) {
+	if w.viewStack == nil || startIdx < 0 || startIdx >= len(w.tabOrder) {
+		return
 	}
-	oldOrder := slices.Clone(w.tabOrder)
-	slices.SortFunc(w.tabOrder, w.compareTabIDs)
-	firstDiff := 0
-	for firstDiff < len(w.tabOrder) && w.tabOrder[firstDiff] == oldOrder[firstDiff] {
-		firstDiff++
-	}
-	if firstDiff >= len(w.tabOrder) || w.viewStack == nil {
-		return firstDiff < len(w.tabOrder)
-	}
-
-	prevPopulating := w.populating
-	w.populating = true
-	currID := w.viewStack.VisibleChildName()
-	for _, id := range w.tabOrder[firstDiff:] {
+	for _, id := range w.tabOrder[startIdx:] {
 		tab := w.tabs[id]
 		if tab == nil || tab.stack == nil {
 			continue
@@ -2380,11 +3644,88 @@ func (w *Window) reorderTabsByProject() bool {
 		tab.page = page
 		tab.sidebarIndicator = nil
 	}
+}
+
+func (w *Window) reorderTabsByProject() bool {
+	if len(w.tabOrder) <= 1 || slices.IsSortedFunc(w.tabOrder, w.compareTabProjects) {
+		return false
+	}
+	oldOrder := slices.Clone(w.tabOrder)
+	slices.SortStableFunc(w.tabOrder, w.compareTabProjects)
+	firstDiff := 0
+	for firstDiff < len(w.tabOrder) && w.tabOrder[firstDiff] == oldOrder[firstDiff] {
+		firstDiff++
+	}
+	if firstDiff >= len(w.tabOrder) || w.viewStack == nil {
+		return firstDiff < len(w.tabOrder)
+	}
+
+	prevPopulating := w.populating
+	w.populating = true
+	currID := w.viewStack.VisibleChildName()
+	w.reattachViewStackFrom(firstDiff)
 	if currID != "" && w.tabs[currID] != nil {
 		w.viewStack.SetVisibleChildName(currID)
 	}
 	w.populating = prevPopulating
 	return true
+}
+
+func (w *Window) bumpSessionToTop(tab *sessionTab) {
+	if tab == nil || tab.main == nil {
+		return
+	}
+	w.touchSessionUpdated(tab, tab.main, time.Now().UnixMilli())
+	sessID := tab.main.session.ID
+	currIdx := slices.Index(w.tabOrder, sessID)
+	if currIdx <= 0 {
+		return
+	}
+	targetDir := normalizeProjectDir(tab.main.session.Location.Directory)
+	firstInProj := currIdx
+	for i, id := range w.tabOrder {
+		t := w.tabs[id]
+		if t == nil || t.main == nil {
+			continue
+		}
+		if normalizeProjectDir(t.main.session.Location.Directory) == targetDir {
+			firstInProj = i
+			break
+		}
+	}
+	if currIdx <= firstInProj {
+		return
+	}
+	copy(w.tabOrder[firstInProj+1:currIdx+1], w.tabOrder[firstInProj:currIdx])
+	w.tabOrder[firstInProj] = sessID
+
+	if w.viewStack != nil {
+		prevPopulating := w.populating
+		w.populating = true
+		currID := w.viewStack.VisibleChildName()
+		w.reattachViewStackFrom(firstInProj)
+		if currID != "" && w.tabs[currID] != nil {
+			w.viewStack.SetVisibleChildName(currID)
+		}
+		w.populating = prevPopulating
+	}
+	w.syncSectionStarts()
+	w.syncProjectSessionVisibility()
+	w.syncSwitcherIndicators()
+}
+
+func (w *Window) markTabNeedsAttention(tab *sessionTab, forceBump bool) {
+	if tab == nil || tab.main == nil || tab.main.session.ID == w.currentRootSessionID() {
+		return
+	}
+	wasAttention := tab.page != nil && tab.page.NeedsAttention()
+	if tab.page != nil && !wasAttention {
+		tab.page.SetNeedsAttention(true)
+		w.updateWindowManagerTitle()
+	}
+	if !wasAttention || forceBump {
+		w.bumpSessionToTop(tab)
+	}
 }
 
 func (w *Window) touchSessionUpdated(tab *sessionTab, conv *convTimeline, updatedMs int64) {
@@ -2419,13 +3760,7 @@ func (w *Window) touchSessionUpdated(tab *sessionTab, conv *convTimeline, update
 		})
 		w.projectSessions[dir] = list
 	}
-	if w.reorderTabsByProject() {
-		w.syncSectionStarts()
-		w.syncProjectSessionVisibility()
-		w.syncSwitcherIndicators()
-	} else {
-		w.updateSwitcherIndicators()
-	}
+	w.updateSwitcherIndicators()
 }
 
 func (w *Window) expandProjectSessions(dir string) {
@@ -2602,6 +3937,26 @@ func (w *Window) syncSwitcherIndicators() {
 	w.updateSwitcherIndicators()
 }
 
+func (w *Window) isTabWorking(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	if tab.main != nil && tab.main.active {
+		return true
+	}
+	for _, sub := range tab.subagents {
+		if sub.IsRunning() {
+			return true
+		}
+	}
+	for _, subConv := range tab.subTimelines {
+		if subConv != nil && subConv.active {
+			return true
+		}
+	}
+	return len(w.visibleBackgroundShellsForTab(tab)) > 0
+}
+
 func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *sessionTab) {
 	if ind == nil || tab == nil {
 		return
@@ -2610,7 +3965,7 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		w.closeBtnSessID[ind.closeBtn.Object.Native()] = sessID
 	}
 	focused := (sessID == w.currentRootSessionID())
-	active := tab.main.active
+	active := w.isTabWorking(tab)
 	hovered := ind.rowPtr != 0 && w.hoveredRow[ind.rowPtr]
 	showClose := ind.closeBtn != nil && (hovered || focused)
 	if ind.closeBtn != nil {
@@ -2668,9 +4023,13 @@ func (w *Window) loadAll() {
 
 		return func() {
 			if sessErr != nil {
-				slog.Error("failed to list sessions", "err", sessErr)
+				if w.ctx.Err() == nil {
+					slog.Error("failed to list sessions", "err", sessErr)
+					w.setOfflineError(sessErr)
+				}
 				return
 			}
+			w.setOfflineError(nil)
 			w.allSessions = sessions
 			for _, s := range sessions {
 				if s.Model.ID != "" {
@@ -2695,10 +4054,9 @@ func (w *Window) loadAll() {
 			models   []opencode.ModelInfo
 			commands []opencode.CommandInfo
 			skills   []opencode.SkillInfo
-			shells   []opencode.ShellItem
 			wg       sync.WaitGroup
 		)
-		wg.Add(5)
+		wg.Add(4)
 		go func() {
 			defer wg.Done()
 			agents, _ = w.client.ListAgents(w.ctx, "")
@@ -2715,10 +4073,6 @@ func (w *Window) loadAll() {
 			defer wg.Done()
 			skills, _ = w.client.ListSkills(w.ctx, "")
 		}()
-		go func() {
-			defer wg.Done()
-			shells, _ = w.client.ListShells(w.ctx, "")
-		}()
 		wg.Wait()
 
 		return func() {
@@ -2732,14 +4086,7 @@ func (w *Window) loadAll() {
 			if len(skills) > 0 {
 				w.skills = skills
 			}
-			w.activeShells = make(map[string]opencode.ShellItem)
-			for _, sh := range shells {
-				if sh.Status == "" || sh.Status == "running" {
-					w.activeShells[sh.ID] = sh
-				}
-			}
-			w.updateShellStatus()
-			w.rebuildShellList()
+			w.refreshShells()
 			if len(models) > 0 {
 				w.models = models
 				for _, m := range models {
@@ -2755,6 +4102,7 @@ func (w *Window) loadAll() {
 				}
 				w.rebuildModelList()
 			}
+			w.refreshGreeterProfileAsync()
 		}
 	})
 }
@@ -2762,9 +4110,25 @@ func (w *Window) loadAll() {
 func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[string]opencode.ActiveStatus) {
 	prevSelected := w.currentRootSessionID()
 	w.populating = true
+	if w.visibleSessions == nil {
+		w.visibleSessions = make(map[string]bool)
+	}
+	if w.archivedSessions == nil {
+		w.archivedSessions = make(map[string]bool)
+	}
+
+	activeRootIDs := make(map[string]bool)
+	for _, s := range sessions {
+		if s.ParentID != "" {
+			if _, ok := active[s.ID]; ok || (s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle) {
+				activeRootIDs[s.ParentID] = true
+			}
+		}
+	}
 
 	var topSessions []opencode.Session
 	var discoveredDirs []string
+	stateChanged := false
 	for _, s := range sessions {
 		if s.ParentID != "" {
 			continue
@@ -2772,12 +4136,26 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		if s.Location.Directory != "" {
 			discoveredDirs = append(discoveredDirs, s.Location.Directory)
 		}
+		_, isRunning := active[s.ID]
+		isRunning = isRunning || (s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle) || activeRootIDs[s.ID]
+		if isRunning && !w.archivedSessions[s.ID] {
+			if !w.visibleSessions[s.ID] {
+				w.visibleSessions[s.ID] = true
+				stateChanged = true
+			}
+		}
 		if w.archivedSessions[s.ID] && s.ID != prevSelected {
+			continue
+		}
+		if !w.visibleSessions[s.ID] && s.ID != prevSelected {
 			continue
 		}
 		topSessions = append(topSessions, s)
 	}
 	if w.ensureProjectOrder(discoveredDirs...) {
+		stateChanged = true
+	}
+	if stateChanged {
 		w.saveState()
 	}
 
@@ -2812,12 +4190,13 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	w.tabOrder = make([]string, 0, len(topSessions))
 
 	projCount := make(map[string]int)
+	maxVis := w.effectiveMaxVisibleSessions()
 	var firstID, firstUncollapsedID string
 	for _, sess := range topSessions {
 		dir := normalizeProjectDir(sess.Location.Directory)
 		count := projCount[dir]
 		_, isRunning := active[sess.ID]
-		if count < 5 || sess.ID == prevSelected || isRunning || w.expandedProjects[dir] {
+		if count < maxVis || sess.ID == prevSelected || isRunning || w.expandedProjects[dir] {
 			if firstID == "" {
 				firstID = sess.ID
 			}
@@ -2847,17 +4226,24 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		w.syncProjectSessionVisibility()
 		w.viewStack.SetVisibleChildName(targetID)
 		w.onVisibleTabChanged()
+	} else {
+		w.onVisibleTabChanged()
 	}
 
 	glib.IdleAdd(func() {
 		w.syncProjectSessionVisibility()
 		w.syncSwitcherIndicators()
-		w.inputView.GrabFocus()
+		if w.inputView != nil {
+			w.inputView.GrabFocus()
+		}
 	})
 	w.loadPendingFormsForAllDirs(discoveredDirs)
 }
 
 func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
+	if w.client == nil {
+		return
+	}
 	seen := make(map[string]bool)
 	var uniqueDirs []string
 	for _, raw := range dirs {
@@ -2874,11 +4260,12 @@ func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
 		var (
 			mu       sync.Mutex
 			allForms []opencode.FormInfo
+			allPerms []opencode.PermissionRequest
 			wg       sync.WaitGroup
 		)
 		for _, dir := range uniqueDirs {
 			d := dir
-			wg.Add(1)
+			wg.Add(2)
 			go func() {
 				defer wg.Done()
 				forms, err := w.client.ListForms(w.ctx, d)
@@ -2888,11 +4275,23 @@ func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
 					mu.Unlock()
 				}
 			}()
+			go func() {
+				defer wg.Done()
+				perms, err := w.client.ListPermissions(w.ctx, d)
+				if err == nil && len(perms) > 0 {
+					mu.Lock()
+					allPerms = append(allPerms, perms...)
+					mu.Unlock()
+				}
+			}()
 		}
 		wg.Wait()
 		return func() {
 			for _, f := range allForms {
 				w.upsertPendingForm(f)
+			}
+			for _, p := range allPerms {
+				w.upsertPendingPermission(p)
 			}
 		}
 	})
@@ -2903,8 +4302,15 @@ func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
 const TakeChargeDirective = "The user is currently away (Take Charge mode is active). Proceed autonomously by choosing the most recommended or sensible option for this question. Record this question, the option you selected, and your reasoning, and report all autonomous choices made at the end of your work."
 
 func buildTakeChargeAnswer(form opencode.FormInfo) map[string]any {
+	return buildTakeChargeAnswerWithDirective(form, TakeChargeDirective)
+}
+
+func buildTakeChargeAnswerWithDirective(form opencode.FormInfo, directive string) map[string]any {
+	if strings.TrimSpace(directive) == "" {
+		directive = TakeChargeDirective
+	}
 	if len(form.Fields) == 0 {
-		return map[string]any{"q0": TakeChargeDirective}
+		return map[string]any{"q0": directive}
 	}
 	ans := make(map[string]any, len(form.Fields))
 	for _, f := range form.Fields {
@@ -2913,11 +4319,11 @@ func buildTakeChargeAnswer(form opencode.FormInfo) map[string]any {
 		}
 		switch f.Type {
 		case "multiselect":
-			ans[f.Key] = []string{TakeChargeDirective}
+			ans[f.Key] = []string{directive}
 		case "boolean":
 			ans[f.Key] = true
 		default:
-			ans[f.Key] = TakeChargeDirective
+			ans[f.Key] = directive
 		}
 	}
 	return ans
@@ -2930,6 +4336,8 @@ func isFormSettledOrMissingError(err error) bool {
 	msg := err.Error()
 	return strings.Contains(msg, "FormAlreadySettledError") ||
 		strings.Contains(msg, "FormNotFoundError") ||
+		strings.Contains(msg, "PermissionAlreadySettledError") ||
+		strings.Contains(msg, "PermissionNotFoundError") ||
 		strings.Contains(msg, "http 404") ||
 		strings.Contains(msg, "http 409")
 }
@@ -2944,25 +4352,31 @@ func (w *Window) setTakeCharge(active bool) {
 			w.takeChargeBtn.SetActive(active)
 		}
 		if active {
-			w.takeChargeBtn.SetTooltipText("Take Charge: Active — questions are auto-answered while away")
+			w.takeChargeBtn.SetTooltipText("Take Charge: Active — questions and permissions are auto-answered while away")
 		} else {
-			w.takeChargeBtn.SetTooltipText("Take Charge: Off — click to auto-answer questions while away")
+			w.takeChargeBtn.SetTooltipText("Take Charge: Off — click to auto-answer questions and permissions while away")
 		}
 	}
 	if !active {
 		return
 	}
 	var pending []opencode.FormInfo
+	var pendingPerms []opencode.PermissionRequest
 	for _, tab := range w.tabs {
 		if tab.main != nil {
 			pending = append(pending, tab.main.pendingForms...)
+			pendingPerms = append(pendingPerms, tab.main.pendingPermissions...)
 		}
 		for _, sub := range tab.subTimelines {
 			pending = append(pending, sub.pendingForms...)
+			pendingPerms = append(pendingPerms, sub.pendingPermissions...)
 		}
 	}
 	for _, form := range pending {
 		w.replyFormTakeCharge(form)
+	}
+	for _, perm := range pendingPerms {
+		w.replyPermissionTakeCharge(perm)
 	}
 	if w.client != nil {
 		w.loadPendingFormsForAllDirs(w.projectOrder)
@@ -2983,7 +4397,8 @@ func (w *Window) replyFormTakeCharge(form opencode.FormInfo) {
 
 	sessID := form.SessionID
 	formID := form.ID
-	ans := buildTakeChargeAnswer(form)
+	directive := w.effectiveTakeChargeDirective()
+	ans := buildTakeChargeAnswerWithDirective(form, directive)
 
 	var qw *QuestionFormWidget
 	if _, conv := w.resolveConv(sessID); conv != nil {
@@ -3000,7 +4415,7 @@ func (w *Window) replyFormTakeCharge(form opencode.FormInfo) {
 	gtkutil.Async(ctx, func() func() {
 		err := w.client.ReplyForm(ctx, sessID, formID, ans)
 		if err != nil && strings.Contains(err.Error(), "FormInvalidAnswerError") {
-			err = w.client.CancelForm(ctx, sessID, formID, TakeChargeDirective)
+			err = w.client.CancelForm(ctx, sessID, formID, directive)
 		}
 		return func() {
 			delete(w.takeChargeInFlight, formID)
@@ -3041,9 +4456,7 @@ func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 	if !found {
 		conv.pendingForms = append(conv.pendingForms, form)
 	}
-	if tab.main.session.ID != w.currentRootSessionID() {
-		tab.page.SetNeedsAttention(true)
-	}
+	w.markTabNeedsAttention(tab, !found)
 	if conv.loaded {
 		w.ensureFormWidget(tab, conv, form)
 		conv.keepPendingAtBottom()
@@ -3106,6 +4519,11 @@ func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form open
 				err := w.client.ReplyForm(w.ctx, sessID, formID, ans)
 				return func() {
 					if err != nil {
+						if isFormSettledOrMissingError(err) {
+							w.removePendingForm(sessID, formID)
+							w.reconcileTail(sessID)
+							return
+						}
 						slog.Error("failed to reply to form", "sessionID", sessID, "formID", formID, "err", err)
 						qw.SetBusy(false)
 						app.Error(w.ctx, err)
@@ -3120,6 +4538,11 @@ func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form open
 				err := w.client.CancelForm(w.ctx, sessID, formID, "")
 				return func() {
 					if err != nil {
+						if isFormSettledOrMissingError(err) {
+							w.removePendingForm(sessID, formID)
+							w.reconcileTail(sessID)
+							return
+						}
 						slog.Error("failed to cancel form", "sessionID", sessID, "formID", formID, "err", err)
 						qw.SetBusy(false)
 						app.Error(w.ctx, err)
@@ -3137,9 +4560,169 @@ func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form open
 	return qw
 }
 
+func (w *Window) replyPermissionTakeCharge(perm opencode.PermissionRequest) {
+	if perm.ID == "" || perm.SessionID == "" || w.client == nil {
+		return
+	}
+	if w.takeChargeInFlight == nil {
+		w.takeChargeInFlight = make(map[string]bool)
+	}
+	if w.takeChargeInFlight[perm.ID] {
+		return
+	}
+	w.takeChargeInFlight[perm.ID] = true
+
+	sessID := perm.SessionID
+	reqID := perm.ID
+
+	var pw *PermissionPromptWidget
+	if _, conv := w.resolveConv(sessID); conv != nil {
+		if existing, ok := conv.permissionWidgets[reqID]; ok {
+			pw = existing
+			pw.SetBusy(true)
+		}
+	}
+
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gtkutil.Async(ctx, func() func() {
+		err := w.client.ReplyPermission(ctx, sessID, reqID, opencode.PermissionOnce, "")
+		return func() {
+			delete(w.takeChargeInFlight, reqID)
+			if err != nil && !isFormSettledOrMissingError(err) {
+				slog.Error("failed to auto-reply to permission in take charge mode", "sessionID", sessID, "requestID", reqID, "err", err)
+				if pw != nil {
+					pw.SetBusy(false)
+				}
+				return
+			}
+			w.removePendingPermission(sessID, reqID)
+		}
+	})
+}
+
+func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest) {
+	if perm.ID == "" || perm.SessionID == "" {
+		return
+	}
+	if w.takeCharge {
+		w.replyPermissionTakeCharge(perm)
+		if w.client != nil {
+			return
+		}
+	}
+	tab, conv := w.resolveConv(perm.SessionID)
+	if tab == nil || conv == nil {
+		return
+	}
+	found := false
+	for i, existing := range conv.pendingPermissions {
+		if existing.ID == perm.ID {
+			conv.pendingPermissions[i] = perm
+			found = true
+			break
+		}
+	}
+	if !found {
+		conv.pendingPermissions = append(conv.pendingPermissions, perm)
+	}
+	w.markTabNeedsAttention(tab, !found)
+	if conv.loaded {
+		w.ensurePermissionWidget(tab, conv, perm)
+		conv.keepPendingAtBottom()
+		if conv.scroll != nil {
+			conv.scroll.ScrollToBottomIfBottomed()
+		}
+	}
+}
+
+func (w *Window) removePendingPermission(sessionID, requestID string) {
+	if requestID == "" {
+		return
+	}
+	_, conv := w.resolveConv(sessionID)
+	if conv == nil {
+		for _, t := range w.tabs {
+			if _, ok := t.main.permissionWidgets[requestID]; ok {
+				conv = t.main
+				break
+			}
+			for _, sub := range t.subTimelines {
+				if _, ok := sub.permissionWidgets[requestID]; ok {
+					conv = sub
+					break
+				}
+			}
+		}
+	}
+	if conv == nil {
+		return
+	}
+	next := conv.pendingPermissions[:0]
+	for _, p := range conv.pendingPermissions {
+		if p.ID != requestID {
+			next = append(next, p)
+		}
+	}
+	conv.pendingPermissions = next
+	if pw, ok := conv.permissionWidgets[requestID]; ok {
+		delete(conv.permissionWidgets, requestID)
+		if conv.timelineBox != nil {
+			conv.timelineBox.Remove(pw)
+		}
+	}
+	conv.keepPendingAtBottom()
+}
+
+func (w *Window) ensurePermissionWidget(tab *sessionTab, conv *convTimeline, perm opencode.PermissionRequest) *PermissionPromptWidget {
+	dir := conv.session.Location.Directory
+	if dir == "" && tab != nil && tab.main != nil {
+		dir = tab.main.session.Location.Directory
+	}
+	if pw, ok := conv.permissionWidgets[perm.ID]; ok {
+		pw.Update(perm, dir)
+		return pw
+	}
+	sessID := conv.session.ID
+	reqID := perm.ID
+	var pw *PermissionPromptWidget
+	pw = NewPermissionPromptWidget(
+		perm,
+		dir,
+		func(decision opencode.PermissionDecision) {
+			gtkutil.Async(w.ctx, func() func() {
+				err := w.client.ReplyPermission(w.ctx, sessID, reqID, decision, "")
+				return func() {
+					if err != nil {
+						if isFormSettledOrMissingError(err) {
+							w.removePendingPermission(sessID, reqID)
+							w.reconcileTail(sessID)
+							return
+						}
+						slog.Error("failed to reply to permission", "sessionID", sessID, "requestID", reqID, "err", err)
+						pw.SetBusy(false)
+						app.Error(w.ctx, err)
+						return
+					}
+					w.removePendingPermission(sessID, reqID)
+				}
+			})
+		},
+	)
+	conv.permissionWidgets[perm.ID] = pw
+	if conv.timelineBox != nil {
+		conv.timelineBox.Append(pw)
+	}
+	return pw
+}
+
 func (w *Window) addSessionTab(sess opencode.Session) *sessionTab {
 	stack := gtk.NewStack()
 	stack.SetTransitionType(gtk.StackTransitionTypeNone)
+	stack.SetHhomogeneous(false)
+	stack.SetVhomogeneous(false)
 	stack.SetVExpand(true)
 	stack.SetHExpand(true)
 
@@ -3169,20 +4752,48 @@ func (w *Window) onVisibleTabChanged() {
 	if w.populating {
 		return
 	}
+	w.syncEmptyGreeterVisibility()
 	tab := w.currentTab()
 	if tab == nil {
+		if w.windowTitle != nil {
+			w.windowTitle.SetTitle("Gluppencode")
+			w.windowTitle.SetSubtitle("Select or create a session")
+		}
+		if w.sheetBackToParentBtn != nil {
+			w.sheetBackToParentBtn.SetVisible(false)
+		}
+		w.syncNavigationChrome()
+		w.updateBusyState(false)
+		w.updateBottomBar(nil)
+		w.rebuildSubagentList(nil)
+		w.rebuildShellList()
+		w.syncProjectSessionVisibility()
+		w.syncSwitcherIndicators()
+		w.updateWindowManagerTitle()
 		return
+	}
+	if tab.main != nil && tab.main.session.ID != "" && !w.archivedSessions[tab.main.session.ID] {
+		if w.visibleSessions == nil {
+			w.visibleSessions = make(map[string]bool)
+		}
+		if !w.visibleSessions[tab.main.session.ID] {
+			w.visibleSessions[tab.main.session.ID] = true
+			w.saveState()
+		}
 	}
 	tab.page.SetNeedsAttention(false)
 
 	w.refreshHeaderAndBottomBar(tab)
 	w.rebuildShellList()
+	w.ensureShellOutputPoller()
 	w.syncProjectSessionVisibility()
 	w.syncSwitcherIndicators()
 	w.refreshShells()
-	w.inputView.GrabFocus()
+	if w.inputView != nil {
+		w.inputView.GrabFocus()
+	}
 
-	if !tab.main.loaded && !tab.main.loadingInitial {
+	if !tab.main.loaded && !tab.main.loadingInitial && w.client != nil {
 		tab.main.loadingInitial = true
 		w.loadConvMessages(tab, tab.main)
 		w.loadChildSubagents(tab.main.session.ID)
@@ -3227,6 +4838,41 @@ func (w *Window) refreshHeaderAndBottomBar(tab *sessionTab) {
 	w.updateBusyState(conv.active)
 	w.updateBottomBar(tab)
 	w.rebuildSubagentList(tab)
+	w.updateWindowManagerTitle()
+}
+
+func formatWindowManagerTitle(sessionTitle string, attentionCount int) string {
+	base := "gluppencode"
+	if title := strings.TrimSpace(sessionTitle); title != "" {
+		base = title + " – gluppencode"
+	}
+	if attentionCount > 0 {
+		return fmt.Sprintf("(%d) %s", attentionCount, base)
+	}
+	return base
+}
+
+func (w *Window) countNeedsAttention() int {
+	count := 0
+	for _, tab := range w.tabs {
+		if tab != nil && tab.page != nil && tab.page.NeedsAttention() {
+			count++
+		}
+	}
+	return count
+}
+
+func (w *Window) updateWindowManagerTitle() {
+	var sessionTitle string
+	if tab := w.currentTab(); tab != nil && tab.main != nil {
+		sessionTitle = strings.TrimSpace(tab.main.session.Title)
+		if sessionTitle == "" {
+			sessionTitle = "Untitled Session"
+		}
+	}
+	if w.ApplicationWindow != nil {
+		w.SetTitle(formatWindowManagerTitle(sessionTitle, w.countNeedsAttention()))
+	}
 }
 
 func (w *Window) openSubagent(tab *sessionTab, subSess opencode.Session) {
@@ -3300,10 +4946,12 @@ func (w *Window) upsertSubagent(tab *sessionTab, sess opencode.Session) {
 				s.Time.Idle = sess.Time.Idle
 			}
 			tab.subagents[i] = s
+			w.updateSwitcherIndicators()
 			return
 		}
 	}
 	tab.subagents = append([]opencode.Session{sess}, tab.subagents...)
+	w.updateSwitcherIndicators()
 }
 
 func (w *Window) setSubagentActive(childID string, active bool, outcome string) {
@@ -3353,6 +5001,7 @@ func (w *Window) setSubagentActive(childID string, active bool, outcome string) 
 		w.updateBottomBar(tab)
 		w.rebuildSubagentList(tab)
 	}
+	w.updateSwitcherIndicators()
 }
 
 func (w *Window) loadChildSubagents(rootSessionID string) {
@@ -3394,11 +5043,15 @@ func (w *Window) loadChildSubagents(rootSessionID string) {
 				w.updateBottomBar(tab)
 				w.rebuildSubagentList(tab)
 			}
+			w.updateSwitcherIndicators()
 		}
 	})
 }
 
 func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
+	if w.client == nil || conv == nil {
+		return
+	}
 	sessionID := conv.session.ID
 	gtkutil.Async(w.ctx, func() func() {
 		var (
@@ -3406,9 +5059,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			err        error
 			inboxItems []opencode.InboxItem
 			forms      []opencode.FormInfo
+			perms      []opencode.PermissionRequest
 			wg         sync.WaitGroup
 		)
-		wg.Add(3)
+		wg.Add(4)
 		go func() {
 			defer wg.Done()
 			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, "")
@@ -3421,6 +5075,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			defer wg.Done()
 			forms, _ = w.client.ListSessionForms(w.ctx, sessionID)
 		}()
+		go func() {
+			defer wg.Done()
+			perms, _ = w.client.ListSessionPermissions(w.ctx, sessionID)
+		}()
 		wg.Wait()
 
 		return func() {
@@ -3431,14 +5089,47 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			}
 			conv.loaded = true
 			conv.closeStreams()
-			for child := conv.timelineBox.FirstChild(); child != nil; child = conv.timelineBox.FirstChild() {
-				conv.timelineBox.Remove(child)
+			for _, w := range conv.messageWidgets {
+				if w != nil {
+					conv.timelineBox.Remove(w)
+				}
+			}
+			for _, sb := range conv.slashBubbles {
+				if sb != nil {
+					conv.timelineBox.Remove(sb)
+				}
+			}
+			conv.slashBubbles = nil
+			for _, p := range conv.pendingPrompts {
+				if p != nil && p.widget != nil && p.attached {
+					conv.timelineBox.Remove(p.widget)
+					p.attached = false
+				}
+			}
+			for _, qw := range conv.formWidgets {
+				if qw != nil {
+					conv.timelineBox.Remove(qw)
+				}
+			}
+			for _, pw := range conv.permissionWidgets {
+				if pw != nil {
+					conv.timelineBox.Remove(pw)
+				}
+			}
+			if conv.thinkingLabel != nil && conv.thinkingAttached {
+				conv.timelineBox.Remove(conv.thinkingLabel)
+				conv.thinkingAttached = false
+			}
+			if conv.revertBanner != nil {
+				conv.timelineBox.Remove(conv.revertBanner)
 			}
 			conv.assistantMap = make(map[string]*AssistantMessageWidget)
 			conv.compactionMap = make(map[string]*CompactionWidget)
 			conv.messageWidgets = make(map[string]gtk.Widgetter)
 			conv.formWidgets = make(map[string]*QuestionFormWidget)
 			conv.pendingForms = nil
+			conv.permissionWidgets = make(map[string]*PermissionPromptWidget)
+			conv.pendingPermissions = nil
 			conv.revertBanner = nil
 			prevBlocking := conv.blockingTools
 			conv.seenMsgIDs = make(map[string]bool)
@@ -3452,6 +5143,7 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				conv.messages = nil
 				conv.nextCursor = ""
 				conv.hasOlder = false
+				conv.updateGreeterVisibility()
 				return
 			}
 
@@ -3496,6 +5188,7 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				remainingPending = append(remainingPending, p)
 				if p.widget != nil {
 					conv.timelineBox.Append(p.widget)
+					p.attached = true
 				}
 			}
 			conv.pendingPrompts = remainingPending
@@ -3514,6 +5207,9 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 
 			for _, form := range forms {
 				w.upsertPendingForm(form)
+			}
+			for _, perm := range perms {
+				w.upsertPendingPermission(perm)
 			}
 
 			tab.page.SetBadgeNumber(0)
@@ -3537,6 +5233,8 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 
 			if w.currentTab() == tab {
 				w.updateBottomBar(tab)
+				w.rebuildShellList()
+				w.ensureShellOutputPoller()
 			}
 			w.updateSwitcherIndicators()
 		}
@@ -3614,7 +5312,7 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 			msgID := msg.ID
 			msgText := msg.Text
 			uw.SetOnUndo(func() {
-				w.stageRevertToMessage(tab, conv, msgID, msgText)
+				w.promptRevertToMessage(tab, conv, msgID, msgText)
 			})
 		}
 		return uw
@@ -3637,8 +5335,18 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 			if shID := tw.ShellID(); shID != "" {
 				if out, ok := w.shellOutputs[shID]; ok && out != "" {
 					tw.SetShellLiveOutput(out)
+				} else if f := tw.ShellFile(); f != "" {
+					if data, err := readTailBytes(f, maxShellOutputBytes); err == nil && len(data) > 0 {
+						out := FormatShellOutput(string(data))
+						w.shellOutputs[shID] = out
+						tw.SetShellLiveOutput(out)
+					} else if tw.IsBackgroundRunning() {
+						tw.SetShellLiveOutput(FormatShellOutput(""))
+					}
+				} else if tw.IsBackgroundRunning() {
+					tw.SetShellLiveOutput(FormatShellOutput(""))
 				}
-				if _, active := w.activeShells[shID]; !active && tw.IsBackgroundRunning() {
+				if _, active := w.activeShells[shID]; !active && w.shellsLoaded && tw.IsBackgroundRunning() {
 					tw.SetBackgroundStatus("completed")
 				}
 			}
@@ -3687,9 +5395,10 @@ func (w *Window) reconcileTail(sessionID string) {
 			page  *opencode.MessagePage
 			err   error
 			forms []opencode.FormInfo
+			perms []opencode.PermissionRequest
 			wg    sync.WaitGroup
 		)
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 10, "")
@@ -3697,6 +5406,10 @@ func (w *Window) reconcileTail(sessionID string) {
 		go func() {
 			defer wg.Done()
 			forms, _ = w.client.ListSessionForms(w.ctx, sessionID)
+		}()
+		go func() {
+			defer wg.Done()
+			perms, _ = w.client.ListSessionPermissions(w.ctx, sessionID)
 		}()
 		wg.Wait()
 		return func() {
@@ -3711,6 +5424,16 @@ func (w *Window) reconcileTail(sessionID string) {
 			for i := len(conv.pendingForms) - 1; i >= 0; i-- {
 				if id := conv.pendingForms[i].ID; !activeFormIDs[id] {
 					w.removePendingForm(sessionID, id)
+				}
+			}
+			activePermIDs := make(map[string]bool, len(perms))
+			for _, p := range perms {
+				activePermIDs[p.ID] = true
+				w.upsertPendingPermission(p)
+			}
+			for i := len(conv.pendingPermissions) - 1; i >= 0; i-- {
+				if id := conv.pendingPermissions[i].ID; !activePermIDs[id] {
+					w.removePendingPermission(sessionID, id)
 				}
 			}
 			var appended bool
@@ -3750,11 +5473,12 @@ func (w *Window) reconcileTail(sessionID string) {
 					if matched != nil {
 						msgID := msg.ID
 						msgText := msg.Text
+						matched.attached = false
 						if matched.widget != nil {
 							matched.widget.SetWaiting(false, "")
 							conv.messageWidgets[msgID] = matched.widget
 							matched.widget.SetOnUndo(func() {
-								w.stageRevertToMessage(tab, conv, msgID, msgText)
+								w.promptRevertToMessage(tab, conv, msgID, msgText)
 							})
 							conv.timelineBox.ReorderChildAfter(matched.widget, findPrevWidget(insertIdx))
 						}
@@ -3773,12 +5497,15 @@ func (w *Window) reconcileTail(sessionID string) {
 				},
 			)
 			conv.keepPendingAtBottom()
+			w.updateTurnDurations(conv)
 
 			if appended {
 				conv.scroll.ScrollToBottomIfBottomed()
 			}
 			if tab != nil && w.currentTab() == tab {
 				w.updateBottomBar(tab)
+				w.rebuildShellList()
+				w.ensureShellOutputPoller()
 			}
 			w.updateSwitcherIndicators()
 		}
@@ -4037,7 +5764,24 @@ func (w *Window) isForegroundShell(tab *sessionTab, sh opencode.ShellItem) bool 
 		if _, ok := conv.blockingShellIDs[sh.ID]; ok {
 			return true
 		}
-		if len(conv.blockingShellTools) > 0 {
+		if sh.CallID != "" {
+			if conv.blockingShellTools[sh.CallID] {
+				return true
+			}
+			for _, aw := range conv.assistantMap {
+				if tw, ok := aw.tools[sh.CallID]; ok && tw.IsBackgroundRunning() {
+					return false
+				}
+			}
+		}
+		for _, aw := range conv.assistantMap {
+			for _, tw := range aw.tools {
+				if tw.ShellID() == sh.ID && tw.IsBackgroundRunning() {
+					return false
+				}
+			}
+		}
+		if len(conv.blockingShellTools) > 0 && len(conv.blockingShellIDs) == 0 && sh.CallID == "" {
 			sessID := sh.EffectiveSessionID()
 			if sessID == "" || sessID == conv.session.ID {
 				return true
@@ -4057,9 +5801,10 @@ func (w *Window) isForegroundShell(tab *sessionTab, sh opencode.ShellItem) bool 
 }
 
 func (w *Window) visibleBackgroundShellsForTab(tab *sessionTab) []opencode.ShellItem {
-	if tab == nil || len(w.activeShells) == 0 {
+	if tab == nil {
 		return nil
 	}
+	seen := make(map[string]bool)
 	var out []opencode.ShellItem
 	for _, sh := range w.activeShells {
 		if sh.Status != "" && sh.Status != "running" {
@@ -4071,7 +5816,49 @@ func (w *Window) visibleBackgroundShellsForTab(tab *sessionTab) []opencode.Shell
 		if w.isForegroundShell(tab, sh) {
 			continue
 		}
+		if sh.EffectiveFile() == "" {
+			sh.File = w.findShellOutputFile(sh.ID)
+		}
+		if sh.EffectiveLocationDir() == "" && tab.main != nil {
+			sh.LocationDir = tab.main.session.Location.Directory
+		}
+		seen[sh.ID] = true
 		out = append(out, sh)
+	}
+	collectFromConv := func(conv *convTimeline) {
+		if conv == nil {
+			return
+		}
+		locDir := conv.session.Location.Directory
+		if locDir == "" {
+			locDir = tab.main.session.Location.Directory
+		}
+		for _, aw := range conv.assistantMap {
+			for _, tw := range aw.tools {
+				shID := tw.ShellID()
+				if shID == "" || seen[shID] || !tw.IsBackgroundRunning() {
+					continue
+				}
+				seen[shID] = true
+				cmd := strings.TrimSpace(tw.subtitleLabel.Label())
+				out = append(out, opencode.ShellItem{
+					ID:          shID,
+					SessionID:   conv.session.ID,
+					CallID:      tw.toolID,
+					Command:     cmd,
+					LocationDir: locDir,
+					File:        tw.ShellFile(),
+					Status:      "running",
+				})
+			}
+		}
+	}
+	collectFromConv(tab.main)
+	for _, sub := range tab.subTimelines {
+		collectFromConv(sub)
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	slices.SortFunc(out, func(a, b opencode.ShellItem) int {
 		if a.Time.Created != b.Time.Created {
@@ -4105,28 +5892,89 @@ func readTailBytes(path string, maxBytes int64) ([]byte, error) {
 	return buf[:n], nil
 }
 
-func (w *Window) fetchSingleShellOutput(sh opencode.ShellItem) (string, bool) {
-	if w.client == nil {
-		if f := sh.EffectiveFile(); f != "" {
-			if data, readErr := readTailBytes(f, 16384); readErr == nil {
-				return FormatShellTailLines(string(data), 7), true
+func (w *Window) findShellOutputFile(shellID string) string {
+	if shellID == "" {
+		return ""
+	}
+	for _, tab := range w.tabs {
+		if tab.main != nil {
+			for _, aw := range tab.main.assistantMap {
+				for _, tw := range aw.tools {
+					if tw.ShellID() == shellID && tw.ShellFile() != "" {
+						return tw.ShellFile()
+					}
+				}
 			}
 		}
+		for _, sub := range tab.subTimelines {
+			for _, aw := range sub.assistantMap {
+				for _, tw := range aw.tools {
+					if tw.ShellID() == shellID && tw.ShellFile() != "" {
+						return tw.ShellFile()
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+const maxShellOutputBytes = 65536
+
+func (w *Window) fetchSingleShellOutput(sh opencode.ShellItem) (string, bool) {
+	if sh.EffectiveFile() == "" {
+		sh.File = w.findShellOutputFile(sh.ID)
+	}
+	if sh.EffectiveLocationDir() == "" {
+		if tab := w.currentTab(); tab != nil && tab.main != nil {
+			sh.LocationDir = tab.main.session.Location.Directory
+		}
+	}
+	return fetchShellItemOutputWithLines(w.ctx, w.client, sh, w.effectiveShellTailLines())
+}
+
+func fetchRawShellItemOutput(ctx context.Context, client *opencode.Client, sh opencode.ShellItem) (string, bool) {
+	filePath := sh.EffectiveFile()
+	if filePath != "" {
+		// Without a client an empty file is the best answer available.
+		if data, readErr := readTailBytes(filePath, maxShellOutputBytes); readErr == nil && (len(data) > 0 || client == nil) {
+			return FormatShellOutput(string(data)), true
+		}
+	}
+	if client == nil {
 		return "", false
 	}
-	out, err := w.client.GetShellOutput(w.ctx, sh.ID, sh.EffectiveLocationDir(), 0, 16384)
-	if err == nil && out != nil && out.Output != "" {
-		return FormatShellTailLines(out.Output, 7), true
+	locDir := sh.EffectiveLocationDir()
+	out, err := client.GetShellOutput(ctx, sh.ID, locDir, 0, maxShellOutputBytes)
+	if err == nil && out != nil {
+		if out.Size > len(out.Output) {
+			tailOffset := max(0, out.Size-maxShellOutputBytes)
+			if tailOut, tailErr := client.GetShellOutput(ctx, sh.ID, locDir, tailOffset, maxShellOutputBytes); tailErr == nil && tailOut != nil && tailOut.Output != "" {
+				return FormatShellOutput(tailOut.Output), true
+			}
+		}
+		if out.Output != "" {
+			return FormatShellOutput(out.Output), true
+		}
 	}
-	if f := sh.EffectiveFile(); f != "" {
-		if data, readErr := readTailBytes(f, 16384); readErr == nil {
-			return FormatShellTailLines(string(data), 7), true
+	if filePath != "" {
+		if data, readErr := readTailBytes(filePath, maxShellOutputBytes); readErr == nil {
+			return FormatShellOutput(string(data)), true
 		}
 	}
 	if err == nil && out != nil {
-		return FormatShellTailLines(out.Output, 7), true
+		return FormatShellOutput(out.Output), true
 	}
 	return "", false
+}
+
+func fetchShellItemOutputWithLines(ctx context.Context, client *opencode.Client, sh opencode.ShellItem, maxLines int) (string, bool) {
+	maxLines = clampShellTailLines(maxLines)
+	raw, ok := fetchRawShellItemOutput(ctx, client, sh)
+	if !ok {
+		return "", false
+	}
+	return FormatShellTailLines(raw, maxLines), true
 }
 
 func (w *Window) updateToolWidgetsForShell(shellID, formattedOutput, bgStatus string) {
@@ -4163,7 +6011,10 @@ func (w *Window) pollActiveShellOutputs() {
 	if len(shells) == 0 {
 		return
 	}
-	gtkutil.Async(w.ctx, func() func() {
+	ctx := w.ctx
+	client := w.client
+	tailLines := w.effectiveShellTailLines()
+	gtkutil.Async(ctx, func() func() {
 		type res struct {
 			id   string
 			text string
@@ -4178,7 +6029,7 @@ func (w *Window) pollActiveShellOutputs() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				if text, ok := w.fetchSingleShellOutput(shCopy); ok {
+				if text, ok := fetchRawShellItemOutput(ctx, client, shCopy); ok {
 					mu.Lock()
 					results = append(results, res{id: shCopy.ID, text: text})
 					mu.Unlock()
@@ -4191,7 +6042,7 @@ func (w *Window) pollActiveShellOutputs() {
 				if w.shellOutputs[r.id] != r.text {
 					w.shellOutputs[r.id] = r.text
 					if lbl, ok := w.shellOutputLabels[r.id]; ok && lbl != nil {
-						lbl.SetText(r.text)
+						lbl.SetText(FormatShellTailLines(r.text, tailLines))
 					}
 					w.updateToolWidgetsForShell(r.id, r.text, "")
 				}
@@ -4201,7 +6052,7 @@ func (w *Window) pollActiveShellOutputs() {
 }
 
 func (w *Window) ensureShellOutputPoller() {
-	if w.client == nil || w.shellPollRunning {
+	if w.shellPollRunning {
 		return
 	}
 	if len(w.visibleBackgroundShellsForTab(w.currentTab())) == 0 {
@@ -4237,11 +6088,15 @@ func (w *Window) refreshShells() {
 		}
 	}
 
+	hadTabs := len(w.tabs) > 0
+	before := maps.Clone(w.activeShells)
+	known := w.backgroundRunningShellIDs()
+
 	gtkutil.Async(w.ctx, func() func() {
 		var (
 			mu     sync.Mutex
 			merged = make(map[string]opencode.ShellItem)
-			anyOK  bool
+			okDirs int
 			wg     sync.WaitGroup
 		)
 		for _, dir := range dirs {
@@ -4254,7 +6109,7 @@ func (w *Window) refreshShells() {
 					return
 				}
 				mu.Lock()
-				anyOK = true
+				okDirs++
 				for _, sh := range shells {
 					if sh.Status == "" || sh.Status == "running" {
 						if sh.LocationDir == "" && d != "" {
@@ -4268,17 +6123,71 @@ func (w *Window) refreshShells() {
 		}
 		wg.Wait()
 		return func() {
-			if anyOK {
-				w.activeShells = merged
-				w.updateShellStatus()
-				w.rebuildShellList()
-				w.ensureShellOutputPoller()
+			if okDirs == 0 {
+				return
 			}
+			complete := okDirs == len(dirs)
+			// Events that arrived while the listing was in flight are newer
+			// than it: keep shells created meanwhile (and, after a partial
+			// failure, every known shell) and drop shells that exited meanwhile.
+			for id, sh := range w.activeShells {
+				if _, had := before[id]; !had || !complete {
+					if _, ok := merged[id]; !ok {
+						merged[id] = sh
+					}
+				}
+			}
+			for id := range before {
+				if _, still := w.activeShells[id]; !still {
+					delete(merged, id)
+				}
+			}
+			w.activeShells = merged
+			if complete && hadTabs {
+				w.shellsLoaded = true
+				// A shell that was already running when the refresh started
+				// and is no longer listed died without a shell.exited event
+				// (e.g. the server restarted).
+				for id := range known {
+					if _, active := w.activeShells[id]; !active {
+						w.updateToolWidgetsForShell(id, "", "completed")
+					}
+				}
+			}
+			w.updateShellStatus()
+			w.rebuildShellList()
+			w.ensureShellOutputPoller()
 		}
 	})
 }
 
+// backgroundRunningShellIDs returns the shell IDs of all tool widgets that
+// still show a running background shell.
+func (w *Window) backgroundRunningShellIDs() map[string]bool {
+	ids := make(map[string]bool)
+	collect := func(conv *convTimeline) {
+		if conv == nil {
+			return
+		}
+		for _, aw := range conv.assistantMap {
+			for _, tw := range aw.tools {
+				if id := tw.ShellID(); id != "" && tw.IsBackgroundRunning() {
+					ids[id] = true
+				}
+			}
+		}
+	}
+	for _, tab := range w.tabs {
+		collect(tab.main)
+		for _, sub := range tab.subTimelines {
+			collect(sub)
+		}
+	}
+	return ids
+}
+
 func (w *Window) updateShellStatus() {
+	w.updateSwitcherIndicators()
 	if w.shellStatusBox == nil || w.shellStatusLabel == nil || w.shellsSectionBox == nil {
 		return
 	}
@@ -4339,9 +6248,10 @@ func (w *Window) rebuildContextInfo(tab *sessionTab) {
 	if w.contextSectionBox == nil || w.contextInfoGrid == nil {
 		return
 	}
-	for c := w.contextInfoGrid.FirstChild(); c != nil; c = w.contextInfoGrid.FirstChild() {
-		w.contextInfoGrid.Remove(c)
+	for _, cell := range w.contextInfoCells {
+		w.contextInfoGrid.Remove(cell)
 	}
+	w.contextInfoCells = w.contextInfoCells[:0]
 	if tab == nil {
 		w.contextSectionBox.SetVisible(false)
 		w.updateSheetEmptyState()
@@ -4355,6 +6265,13 @@ func (w *Window) rebuildContextInfo(tab *sessionTab) {
 	}
 
 	sess := conv.session
+	if w.contextSessionIDLabel != nil {
+		w.contextSessionIDLabel.SetText(sess.ID)
+		w.contextSessionIDLabel.SetTooltipText(sess.ID)
+	}
+	if w.contextSessionIDBox != nil {
+		w.contextSessionIDBox.SetVisible(sess.ID != "")
+	}
 	rawDir := tab.main.session.Location.Directory
 	projDisplay := projectName(rawDir)
 	if sd := shortDir(rawDir); sd != "" && sd != projDisplay {
@@ -4464,17 +6381,20 @@ func (w *Window) rebuildContextInfo(tab *sessionTab) {
 		kLbl.AddCSSClass("glup-context-cell-label")
 		kLbl.SetXAlign(0)
 		kLbl.SetEllipsize(pango.EllipsizeEnd)
+		kLbl.SetWidthChars(1)
 		cell.Append(kLbl)
 
 		vLbl := gtk.NewLabel(item.value)
 		vLbl.AddCSSClass("glup-context-cell-value")
 		vLbl.SetXAlign(0)
 		vLbl.SetEllipsize(pango.EllipsizeMiddle)
+		vLbl.SetWidthChars(1)
 		vLbl.SetSelectable(true)
 		vLbl.SetTooltipText(item.value)
 		cell.Append(vLbl)
 
 		w.contextInfoGrid.Attach(cell, col, row, 1, 1)
+		w.contextInfoCells = append(w.contextInfoCells, cell)
 	}
 
 	w.contextSectionBox.SetVisible(true)
@@ -4574,15 +6494,13 @@ func (w *Window) rebuildShellList() {
 		hBox.Append(stopBtn)
 		outerVBox.Append(hBox)
 
-		outText, ok := w.shellOutputs[shellItem.ID]
-		if !ok || outText == "" {
-			outText = FormatShellTailLines("", 7)
-		}
+		outText := FormatShellTailLines(w.shellOutputs[shellItem.ID], w.effectiveShellTailLines())
 		outLbl := gtk.NewLabel(outText)
 		outLbl.AddCSSClass("glup-shell-output")
 		outLbl.SetXAlign(0)
 		outLbl.SetYAlign(0)
 		outLbl.SetHExpand(true)
+		outLbl.SetEllipsize(pango.EllipsizeEnd)
 		outLbl.SetSelectable(true)
 		outLbl.SetOverflow(gtk.OverflowHidden)
 		outerVBox.Append(outLbl)
@@ -4949,213 +6867,6 @@ func (w *Window) switchModel(model opencode.ModelRef) {
 	})
 }
 
-func (w *Window) setupNewSessionPopover(popover *gtk.Popover, searchEntry *gtk.SearchEntry, listBox *gtk.ListBox, folderBtn *gtk.Button) {
-	emptyLabel := gtk.NewLabel("No matching projects")
-	emptyLabel.AddCSSClass("dim-label")
-	emptyLabel.SetMarginTop(12)
-	emptyLabel.SetMarginBottom(12)
-	listBox.SetPlaceholder(emptyLabel)
-
-	type projectMatch struct {
-		dir   string
-		row   *gtk.ListBoxRow
-		score int
-	}
-
-	var allDirs []string
-	var currentMatches []projectMatch
-
-	activateSelected := func() {
-		sel := listBox.SelectedRow()
-		if sel == nil && len(currentMatches) > 0 {
-			sel = currentMatches[0].row
-		}
-		if sel != nil {
-			for _, m := range currentMatches {
-				if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
-					popover.Popdown()
-					w.createNewSessionInDir(m.dir)
-					return
-				}
-			}
-		}
-	}
-
-	rebuildRows := func(query string) {
-		for c := listBox.FirstChild(); c != nil; {
-			next := gtk.BaseWidget(c).NextSibling()
-			listBox.Remove(c)
-			c = next
-		}
-		currentMatches = nil
-
-		currentDir := ""
-		if tab := w.currentTab(); tab != nil {
-			currentDir = normalizeProjectDir(tab.main.session.Location.Directory)
-		}
-
-		q := strings.TrimSpace(query)
-		for _, dir := range allDirs {
-			candidate := projectName(dir) + " " + shortDir(dir) + " " + dir
-			score, ok := fuzzyMatchScore(q, candidate)
-			if !ok {
-				continue
-			}
-			currentMatches = append(currentMatches, projectMatch{
-				dir:   dir,
-				score: score,
-			})
-		}
-		if q != "" {
-			slices.SortStableFunc(currentMatches, func(a, b projectMatch) int {
-				if a.score != b.score {
-					if a.score > b.score {
-						return -1
-					}
-					return 1
-				}
-				return 0
-			})
-		}
-
-		for i := range currentMatches {
-			dir := currentMatches[i].dir
-			row := gtk.NewListBoxRow()
-			hBox := gtk.NewBox(gtk.OrientationHorizontal, 8)
-			hBox.SetMarginTop(6)
-			hBox.SetMarginBottom(6)
-			hBox.SetMarginStart(10)
-			hBox.SetMarginEnd(10)
-
-			icon := gtk.NewImageFromIconName("folder-symbolic")
-			icon.AddCSSClass("glup-sidebar-folder-icon")
-			icon.SetVAlign(gtk.AlignCenter)
-			hBox.Append(icon)
-
-			vBox := gtk.NewBox(gtk.OrientationVertical, 1)
-			vBox.SetHExpand(true)
-
-			titleLbl := gtk.NewLabel(projectName(dir))
-			titleLbl.SetXAlign(0)
-			titleLbl.SetEllipsize(pango.EllipsizeMiddle)
-			titleLbl.AddCSSClass("glup-sidebar-project-title")
-			vBox.Append(titleLbl)
-
-			subLbl := gtk.NewLabel(shortDir(dir))
-			subLbl.SetXAlign(0)
-			subLbl.SetEllipsize(pango.EllipsizeMiddle)
-			subLbl.AddCSSClass("caption")
-			subLbl.AddCSSClass("dim-label")
-			vBox.Append(subLbl)
-
-			hBox.Append(vBox)
-
-			if dir == currentDir {
-				check := gtk.NewImageFromIconName("object-select-symbolic")
-				check.SetVAlign(gtk.AlignCenter)
-				hBox.Append(check)
-			}
-
-			row.SetChild(hBox)
-			listBox.Append(row)
-			currentMatches[i].row = row
-		}
-		if len(currentMatches) > 0 && currentMatches[0].row != nil {
-			listBox.SelectRow(currentMatches[0].row)
-		}
-	}
-
-	popover.ConnectShow(func() {
-		allDirs = nil
-		seen := make(map[string]bool)
-		addDir := func(raw string) {
-			d := normalizeProjectDir(raw)
-			if d != "" && !seen[d] {
-				seen[d] = true
-				allDirs = append(allDirs, d)
-			}
-		}
-		for _, d := range w.projectOrder {
-			addDir(d)
-		}
-		for _, id := range w.tabOrder {
-			if tab := w.tabs[id]; tab != nil {
-				addDir(tab.main.session.Location.Directory)
-			}
-		}
-		for _, s := range w.allSessions {
-			addDir(s.Location.Directory)
-		}
-		if cwd, err := os.Getwd(); err == nil && cwd != "" {
-			addDir(cwd)
-		}
-
-		if searchEntry != nil {
-			searchEntry.SetText("")
-			rebuildRows("")
-			searchEntry.GrabFocus()
-		} else {
-			rebuildRows("")
-		}
-	})
-
-	if searchEntry != nil {
-		searchEntry.ConnectSearchChanged(func() {
-			rebuildRows(searchEntry.Text())
-		})
-		searchEntry.ConnectActivate(activateSelected)
-		searchEntry.ConnectStopSearch(func() {
-			popover.Popdown()
-		})
-
-		keyCtrl := gtk.NewEventControllerKey()
-		keyCtrl.ConnectKeyPressed(func(keyval, _ uint, _ gdk.ModifierType) bool {
-			if keyval == gdk.KEY_Down || keyval == gdk.KEY_Up {
-				if len(currentMatches) == 0 {
-					return false
-				}
-				selIdx := 0
-				if sel := listBox.SelectedRow(); sel != nil {
-					for i, m := range currentMatches {
-						if m.row != nil && m.row.Object.Native() == sel.Object.Native() {
-							selIdx = i
-							break
-						}
-					}
-				}
-				if keyval == gdk.KEY_Down && selIdx+1 < len(currentMatches) {
-					listBox.SelectRow(currentMatches[selIdx+1].row)
-					return true
-				}
-				if keyval == gdk.KEY_Up && selIdx > 0 {
-					listBox.SelectRow(currentMatches[selIdx-1].row)
-					return true
-				}
-			}
-			return false
-		})
-		searchEntry.AddController(keyCtrl)
-	}
-
-	listBox.ConnectRowActivated(func(row *gtk.ListBoxRow) {
-		if row == nil {
-			return
-		}
-		for _, m := range currentMatches {
-			if m.row != nil && m.row.Object.Native() == row.Object.Native() {
-				popover.Popdown()
-				w.createNewSessionInDir(m.dir)
-				return
-			}
-		}
-	})
-
-	folderBtn.ConnectClicked(func() {
-		popover.Popdown()
-		w.promptNewProjectFolder()
-	})
-}
-
 func (w *Window) promptNewProjectFolder() {
 	dialog := gtk.NewFileDialog()
 	dialog.SetTitle("Open Project Folder")
@@ -5229,7 +6940,14 @@ func (w *Window) inheritedAgentAndModel() (string, opencode.ModelRef) {
 }
 
 func (w *Window) createNewSessionInDir(dir string) {
+	w.createNewSessionInDirAndThen(dir, nil)
+}
+
+func (w *Window) createNewSessionInDirAndThen(dir string, onReady func()) {
 	cwd := strings.TrimSpace(dir)
+	if cwd == "" && len(w.projectOrder) > 0 {
+		cwd = w.projectOrder[0]
+	}
 	if cwd == "" {
 		cwd, _ = os.Getwd()
 	}
@@ -5256,6 +6974,13 @@ func (w *Window) createNewSessionInDir(dir string) {
 			}
 			normDir := normalizeProjectDir(sess.Location.Directory)
 			stateChanged := false
+			if w.visibleSessions == nil {
+				w.visibleSessions = make(map[string]bool)
+			}
+			if !w.visibleSessions[sess.ID] {
+				w.visibleSessions[sess.ID] = true
+				stateChanged = true
+			}
 			if w.archivedSessions[sess.ID] {
 				delete(w.archivedSessions, sess.ID)
 				stateChanged = true
@@ -5276,13 +7001,19 @@ func (w *Window) createNewSessionInDir(dir string) {
 			}
 			tab := w.ensureSessionTab(*sess)
 			tab.main.loaded = true
+			tab.main.updateGreeterVisibility()
 			w.syncProjectSessionVisibility()
 			w.viewStack.SetVisibleChildName(sess.ID)
 			w.onVisibleTabChanged()
-			w.inputView.GrabFocus()
+			if w.inputView != nil {
+				w.inputView.GrabFocus()
+			}
 			glib.IdleAdd(func() {
 				w.syncSwitcherIndicators()
 			})
+			if onReady != nil {
+				onReady()
+			}
 		}
 	})
 }
@@ -5290,6 +7021,33 @@ func (w *Window) createNewSessionInDir(dir string) {
 func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	tab := w.currentTab()
 	if tab == nil {
+		if w.inputBuffer != nil && w.client != nil {
+			start, end := w.inputBuffer.Bounds()
+			text := strings.TrimSpace(w.inputBuffer.Text(start, end, false))
+			if strings.HasPrefix(text, "/") {
+				cmdLine := strings.TrimPrefix(text, "/")
+				parts := strings.SplitN(cmdLine, " ", 2)
+				if strings.EqualFold(parts[0], "cd") {
+					var cmdArgs string
+					if len(parts) > 1 {
+						cmdArgs = strings.TrimSpace(parts[1])
+					}
+					w.recordInputHistory(text)
+					w.saveState()
+					w.inputBuffer.SetText("")
+					w.changeSessionDirectory(nil, nil, cmdArgs)
+					return
+				}
+			}
+			if text != "" || len(w.pendingFiles) > 0 {
+				w.createNewSessionInDirAndThen("", func() {
+					// Guard against creating sessions in a loop if no tab became current.
+					if w.currentTab() != nil {
+						w.sendPromptWithDelivery(delivery)
+					}
+				})
+			}
+		}
 		return
 	}
 	conv := tab.activeConv()
@@ -5297,6 +7055,10 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	text := strings.TrimSpace(w.inputBuffer.Text(start, end, false))
 	if text == "" && len(w.pendingFiles) == 0 {
 		return
+	}
+	if text != "" {
+		w.recordInputHistory(text)
+		w.saveState()
 	}
 	w.inputBuffer.SetText("")
 
@@ -5315,7 +7077,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			cmdArgs = strings.TrimSpace(parts[1])
 		}
 		switch cmdName {
-		case "undo", "redo", "new", "compact":
+		case "undo", "redo", "new", "cd", "compact":
 			isSlashCmd = true
 		default:
 			for _, c := range w.commands {
@@ -5350,6 +7112,13 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			}
 			w.createNewSession()
 			return
+		case "cd":
+			if len(files) > 0 {
+				w.pendingFiles = files
+				w.rebuildAttachmentTray()
+			}
+			w.changeSessionDirectory(tab, conv, cmdArgs)
+			return
 		case "compact":
 			if len(files) > 0 {
 				w.pendingFiles = files
@@ -5360,10 +7129,12 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 		default:
 			sessionID := conv.session.ID
 			uw := NewUserMessageWidget(w.ctx, text)
+			conv.slashBubbles = append(conv.slashBubbles, uw)
 			conv.timelineBox.Append(uw)
 			conv.keepPendingAtBottom()
 			conv.scroll.ScrollToBottom()
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
+			w.bumpSessionToTop(tab)
 			w.setConvActive(sessionID, true)
 
 			gtkutil.Async(w.ctx, func() func() {
@@ -5374,6 +7145,10 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 						app.Error(w.ctx, err)
 						w.setConvActive(sessionID, false)
 						conv.timelineBox.Remove(uw)
+						conv.slashBubbles = slices.DeleteFunc(conv.slashBubbles, func(b *UserMessageWidget) bool {
+							return b == uw
+						})
+						conv.updateGreeterVisibility()
 						start, end := w.inputBuffer.Bounds()
 						if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" {
 							w.inputBuffer.SetText(text)
@@ -5409,10 +7184,16 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	uw := NewUserMessageWidget(w.ctx, text, files...)
 	uw.SetWaiting(true, delivery)
 
+	opts := parseMentions(text, w.skills, w.agents, w.activeDirectory())
+	opts.Files = files
+	opts.Delivery = delivery
+
 	p := &pendingPrompt{
 		text:     text,
 		files:    files,
+		opts:     opts,
 		delivery: delivery,
+		attached: true,
 		widget:   uw,
 	}
 	w.bindPendingPromptCallbacks(conv, p)
@@ -5421,11 +7202,8 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	conv.keepPendingAtBottom()
 	conv.scroll.ScrollToBottom()
 	w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
+	w.bumpSessionToTop(tab)
 	w.setConvActive(sessionID, true)
-
-	opts := parseMentions(text, w.skills, w.agents, w.activeDirectory())
-	opts.Files = files
-	opts.Delivery = delivery
 
 	gtkutil.Async(w.ctx, func() func() {
 		item, err := w.client.SendPrompt(w.ctx, sessionID, opts)
@@ -5434,8 +7212,9 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 				slog.Error("failed to send prompt", "err", err)
 				app.Error(w.ctx, err)
 				w.setConvActive(sessionID, false)
-				if p.widget != nil && p.widget.Parent() != nil {
+				if p.widget != nil && p.attached {
 					conv.timelineBox.Remove(p.widget)
+					p.attached = false
 				}
 				for i, cur := range conv.pendingPrompts {
 					if cur == p {
@@ -5467,11 +7246,12 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			if conv.seenMsgIDs[item.ID] {
 				msgID := item.ID
 				msgText := p.text
+				p.attached = false
 				if p.widget != nil {
 					p.widget.SetWaiting(false, "")
 					conv.messageWidgets[msgID] = p.widget
 					p.widget.SetOnUndo(func() {
-						w.stageRevertToMessage(tab, conv, msgID, msgText)
+						w.promptRevertToMessage(tab, conv, msgID, msgText)
 					})
 				}
 				for i, cur := range conv.pendingPrompts {
@@ -5494,6 +7274,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 // a Steer the user clicked before that ID was known.
 func (w *Window) bindInboxDelivery(conv *convTimeline, p *pendingPrompt, inboxID string, delivery opencode.InboxDelivery) {
 	steered := p.steeredInFlight(delivery)
+	p.rewriting = false
 	if inboxID != "" {
 		p.inboxID = inboxID
 	}
@@ -5507,6 +7288,9 @@ func (w *Window) bindInboxDelivery(conv *convTimeline, p *pendingPrompt, inboxID
 	if p.widget != nil {
 		p.widget.SetWaiting(true, p.delivery)
 	}
+	if conv != nil {
+		conv.keepPendingAtBottom()
+	}
 }
 
 func (w *Window) bindPendingPromptCallbacks(conv *convTimeline, p *pendingPrompt) {
@@ -5519,6 +7303,191 @@ func (w *Window) bindPendingPromptCallbacks(conv *convTimeline, p *pendingPrompt
 	p.widget.SetOnCancel(func() {
 		w.cancelPendingPrompt(conv, p)
 	})
+	p.widget.SetDragReorder(
+		func() string {
+			return p.dragKey()
+		},
+		func(srcID string) bool {
+			return w.reorderPendingPrompt(conv, srcID, p)
+		},
+	)
+}
+
+func (w *Window) reorderPendingPrompt(conv *convTimeline, srcID string, target *pendingPrompt) bool {
+	if conv == nil || target == nil || target.cancelled || target.delivery == opencode.DeliverySteer || srcID == "" {
+		return false
+	}
+	srcIdx := -1
+	dstIdx := -1
+	for i, cur := range conv.pendingPrompts {
+		if cur == nil || cur.cancelled {
+			continue
+		}
+		if cur.rewriting {
+			// A previous reorder is still re-admitting this suffix; starting another
+			// would re-admit the same prompts twice and leave duplicates queued.
+			return false
+		}
+		if cur == target {
+			dstIdx = i
+		}
+		if cur.inboxID == srcID || cur.dragKey() == srcID {
+			if cur.delivery == opencode.DeliverySteer {
+				return false
+			}
+			srcIdx = i
+		}
+	}
+	if srcIdx < 0 || dstIdx < 0 || srcIdx == dstIdx {
+		return false
+	}
+
+	prevOrder := slices.Clone(conv.pendingPrompts)
+	moved := conv.pendingPrompts[srcIdx]
+	conv.pendingPrompts = append(conv.pendingPrompts[:srcIdx], conv.pendingPrompts[srcIdx+1:]...)
+	conv.pendingPrompts = slices.Insert(conv.pendingPrompts, dstIdx, moved)
+	conv.keepPendingAtBottom()
+
+	firstChanged := min(srcIdx, dstIdx)
+	w.syncQueuedOrderOnServer(conv, firstChanged, prevOrder)
+	return true
+}
+
+type queuedRewriteEntry struct {
+	p     *pendingPrompt
+	oldID string
+	opts  opencode.PromptOptions
+}
+
+// syncQueuedOrderOnServer re-admits the queued suffix from fromIdx in its new order
+// and cancels the originals. While p.rewriting is set, p keeps its old inbox ID,
+// the replacement's session.inbox.enqueued is swallowed, and Steer/Cancel are
+// deferred; the completion callback binds the new IDs and replays them. On failure
+// the pre-reorder order (prevOrder) is restored.
+func (w *Window) syncQueuedOrderOnServer(conv *convTimeline, fromIdx int, prevOrder []*pendingPrompt) {
+	if w == nil || w.client == nil || conv == nil || conv.session.ID == "" {
+		return
+	}
+	if fromIdx < 0 {
+		fromIdx = 0
+	}
+	if conv.ignoredCancelIDs == nil {
+		conv.ignoredCancelIDs = make(map[string]bool)
+	}
+
+	var entries []queuedRewriteEntry
+	for i := fromIdx; i < len(conv.pendingPrompts); i++ {
+		p := conv.pendingPrompts[i]
+		if p == nil || p.cancelled || p.delivery == opencode.DeliverySteer || p.inboxID == "" {
+			continue
+		}
+		opts := p.opts
+		if opts.Text == "" {
+			opts = parseMentions(p.text, w.skills, w.agents, conv.session.Location.Directory)
+		}
+		if len(opts.Files) == 0 && len(p.files) > 0 {
+			opts.Files = p.files
+		}
+		opts.Delivery = opencode.DeliveryQueue
+		opts.NoResume = true
+		conv.ignoredCancelIDs[p.inboxID] = true
+		p.rewriting = true
+		entries = append(entries, queuedRewriteEntry{
+			p:     p,
+			oldID: p.inboxID,
+			opts:  opts,
+		})
+	}
+	if len(entries) == 0 {
+		return
+	}
+
+	sessionID := conv.session.ID
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gtkutil.Async(ctx, func() func() {
+		newIDs := make([]string, 0, len(entries))
+		var rewriteErr error
+		for _, entry := range entries {
+			item, err := w.client.SendPrompt(ctx, sessionID, entry.opts)
+			if err != nil {
+				rewriteErr = err
+				break
+			}
+			newID := ""
+			if item != nil {
+				newID = item.ID
+			}
+			newIDs = append(newIDs, newID)
+		}
+		if rewriteErr != nil {
+			for _, id := range newIDs {
+				if id != "" {
+					_ = w.client.CancelInbox(ctx, sessionID, id)
+				}
+			}
+			return func() {
+				slog.Error("failed to reorder queued inbox items", "sessionID", sessionID, "err", rewriteErr)
+				app.Error(w.ctx, rewriteErr)
+				rewritten := make(map[*pendingPrompt]bool, len(entries))
+				for _, entry := range entries {
+					rewritten[entry.p] = true
+				}
+				// Put the rewritten prompts back in their pre-reorder relative order,
+				// in the slots they occupy now, so the UI matches the server again.
+				var slots []int
+				for i, cur := range conv.pendingPrompts {
+					if rewritten[cur] {
+						slots = append(slots, i)
+					}
+				}
+				var restored []*pendingPrompt
+				for _, cur := range prevOrder {
+					if rewritten[cur] && slices.Contains(conv.pendingPrompts, cur) {
+						restored = append(restored, cur)
+					}
+				}
+				for j, i := range slots {
+					conv.pendingPrompts[i] = restored[j]
+				}
+				conv.keepPendingAtBottom()
+				for _, entry := range entries {
+					delete(conv.ignoredCancelIDs, entry.oldID)
+					p := entry.p
+					p.rewriting = false
+					switch {
+					case p.cancelled:
+						w.cancelInboxItem(sessionID, entry.oldID)
+					case p.delivery == opencode.DeliverySteer:
+						w.steerPendingPrompt(conv, p)
+					}
+				}
+			}
+		}
+
+		for _, entry := range entries {
+			if err := w.client.CancelInbox(ctx, sessionID, entry.oldID); err != nil {
+				slog.Warn("failed to cancel replaced queued inbox item", "sessionID", sessionID, "inboxID", entry.oldID, "err", err)
+			}
+		}
+		return func() {
+			for i, entry := range entries {
+				p := entry.p
+				if p.cancelled {
+					p.rewriting = false
+					if newIDs[i] != "" {
+						w.cancelInboxItem(sessionID, newIDs[i])
+					}
+					continue
+				}
+				// The replacement was admitted as a plain queue item; bindInboxDelivery
+				// replays a Steer clicked while the rewrite was in flight.
+				w.bindInboxDelivery(conv, p, newIDs[i], opencode.DeliveryQueue)
+			}
+		}
+	})
 }
 
 func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
@@ -5529,7 +7498,8 @@ func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 	if p.widget != nil {
 		p.widget.SetWaiting(true, opencode.DeliverySteer)
 	}
-	if p.inboxID == "" {
+	conv.keepPendingAtBottom()
+	if p.inboxID == "" || p.rewriting {
 		return
 	}
 	sessionID := conv.session.ID
@@ -5551,6 +7521,7 @@ func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 				if p.widget != nil {
 					p.widget.SetWaiting(true, opencode.DeliveryQueue)
 				}
+				conv.keepPendingAtBottom()
 			}
 		}
 	})
@@ -5561,8 +7532,9 @@ func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 		return
 	}
 	p.cancelled = true
-	if p.widget != nil && p.widget.Parent() != nil {
+	if p.widget != nil && p.attached {
 		conv.timelineBox.Remove(p.widget)
+		p.attached = false
 	}
 	for i, cur := range conv.pendingPrompts {
 		if cur == p {
@@ -5570,6 +7542,7 @@ func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 			break
 		}
 	}
+	conv.updateGreeterVisibility()
 	start, end := w.inputBuffer.Bounds()
 	if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" && p.text != "" {
 		w.inputBuffer.SetText(p.text)
@@ -5578,7 +7551,7 @@ func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 		w.pendingFiles = slices.Clone(p.files)
 		w.rebuildAttachmentTray()
 	}
-	if p.inboxID == "" {
+	if p.inboxID == "" || p.rewriting {
 		return
 	}
 	w.cancelInboxItem(conv.session.ID, p.inboxID)
@@ -5623,7 +7596,14 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 	}
 
 	for _, p := range conv.pendingPrompts {
-		if p == nil || p.cancelled {
+		if p == nil {
+			continue
+		}
+		if p.rewriting && p.text == itemText {
+			// Replacement admitted by syncQueuedOrderOnServer; its completion binds the new ID.
+			return
+		}
+		if p.cancelled {
 			continue
 		}
 		if (inboxID != "" && p.inboxID == inboxID) || (p.inboxID == "" && itemText != "" && p.text == itemText) {
@@ -5638,10 +7618,14 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 	}
 	uw := NewUserMessageWidget(w.ctx, itemText, itemFiles...)
 	uw.SetWaiting(true, delivery)
+	opts := parseMentions(itemText, w.skills, w.agents, conv.session.Location.Directory)
+	opts.Files = itemFiles
+	opts.Delivery = delivery
 	p := &pendingPrompt{
 		inboxID:  inboxID,
 		text:     itemText,
 		files:    itemFiles,
+		opts:     opts,
 		delivery: delivery,
 		widget:   uw,
 	}
@@ -5649,6 +7633,7 @@ func (w *Window) onInboxEnqueued(tab *sessionTab, conv *convTimeline, ev opencod
 	conv.pendingPrompts = append(conv.pendingPrompts, p)
 	if conv.loaded {
 		conv.timelineBox.Append(uw)
+		p.attached = true
 		conv.keepPendingAtBottom()
 		conv.scroll.ScrollToBottomIfBottomed()
 	}
@@ -5706,6 +7691,131 @@ func (w *Window) syncComposerCompletionPopup() {
 	word, atStart := activeTriggerWord(w.inputBuffer)
 	if (strings.HasPrefix(word, "/") && atStart) || strings.HasPrefix(word, "@") {
 		completion.Show()
+	}
+}
+
+func (w *Window) recordInputHistory(text string) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return
+	}
+	if n := len(w.inputHistory); n == 0 || w.inputHistory[n-1] != text {
+		w.inputHistory = append(w.inputHistory, text)
+		if len(w.inputHistory) > maxInputHistory {
+			w.inputHistory = slices.Clone(w.inputHistory[len(w.inputHistory)-maxInputHistory:])
+		}
+	}
+	w.historyBrowsing = false
+	w.historyIndex = 0
+	w.historyDraft = ""
+}
+
+func (w *Window) isInputCursorOnTopLine() bool {
+	if w.inputBuffer == nil || w.inputBuffer.HasSelection() {
+		return false
+	}
+	mark := w.inputBuffer.GetInsert()
+	if mark == nil {
+		return true
+	}
+	iter := w.inputBuffer.IterAtMark(mark)
+	return iter == nil || iter.Line() == 0
+}
+
+func (w *Window) isInputCursorOnBottomLine() bool {
+	if w.inputBuffer == nil || w.inputBuffer.HasSelection() {
+		return false
+	}
+	mark := w.inputBuffer.GetInsert()
+	if mark == nil {
+		return true
+	}
+	iter := w.inputBuffer.IterAtMark(mark)
+	if iter == nil {
+		return true
+	}
+	lastLine := max(0, w.inputBuffer.LineCount()-1)
+	return iter.Line() >= lastLine
+}
+
+func (w *Window) setHistoryBufferText(text string) {
+	if w.inputBuffer == nil {
+		return
+	}
+	w.settingHistoryText = true
+	defer func() {
+		w.settingHistoryText = false
+	}()
+	w.inputBuffer.SetText(text)
+	_, end := w.inputBuffer.Bounds()
+	if end != nil {
+		w.inputBuffer.PlaceCursor(end)
+	}
+}
+
+func (w *Window) navigateInputHistory(delta int) bool {
+	if w.inputBuffer == nil || len(w.inputHistory) == 0 {
+		return false
+	}
+	if delta < 0 {
+		if !w.historyBrowsing {
+			start, end := w.inputBuffer.Bounds()
+			if start != nil && end != nil {
+				w.historyDraft = w.inputBuffer.Text(start, end, false)
+			}
+			w.historyBrowsing = true
+			w.historyIndex = len(w.inputHistory) - 1
+			w.setHistoryBufferText(w.inputHistory[w.historyIndex])
+			return true
+		}
+		if w.historyIndex <= 0 {
+			return true
+		}
+		w.historyIndex--
+		w.setHistoryBufferText(w.inputHistory[w.historyIndex])
+		return true
+	}
+	if delta > 0 {
+		if !w.historyBrowsing {
+			return false
+		}
+		if w.historyIndex+1 < len(w.inputHistory) {
+			w.historyIndex++
+			w.setHistoryBufferText(w.inputHistory[w.historyIndex])
+			return true
+		}
+		draft := w.historyDraft
+		w.historyBrowsing = false
+		w.historyIndex = 0
+		w.historyDraft = ""
+		w.setHistoryBufferText(draft)
+		return true
+	}
+	return false
+}
+
+func (w *Window) handleInputHistoryKey(keyval uint, state gdk.ModifierType) bool {
+	if state.Has(gdk.ControlMask) || state.Has(gdk.ShiftMask) || state.Has(gdk.AltMask) {
+		return false
+	}
+	if !w.historyBrowsing {
+		if word, atStart := activeTriggerWord(w.inputBuffer); (strings.HasPrefix(word, "/") && atStart) || strings.HasPrefix(word, "@") {
+			return false
+		}
+	}
+	switch keyval {
+	case gdk.KEY_Up, gdk.KEY_KP_Up:
+		if !w.isInputCursorOnTopLine() {
+			return false
+		}
+		return w.navigateInputHistory(-1)
+	case gdk.KEY_Down, gdk.KEY_KP_Down:
+		if !w.isInputCursorOnBottomLine() {
+			return false
+		}
+		return w.navigateInputHistory(1)
+	default:
+		return false
 	}
 }
 
@@ -5792,6 +7902,7 @@ func reconcileConvMessages(
 	}
 	for k, msg := range pageMessages {
 		if seenIDs != nil && seenIDs[msg.ID] {
+			mergeAuthoritativeMessage(*currentMessages, msg)
 			continue
 		}
 		var matched *pendingPrompt
@@ -5827,6 +7938,237 @@ func reconcileConvMessages(
 		}
 		if onInsert != nil {
 			onInsert(msg, insertIdx, matched)
+		}
+	}
+}
+
+// mergeAuthoritativeMessage updates an already-seen message in msgs with authoritative
+// timestamps, token usage, cost, status, and content from the server.
+func mergeAuthoritativeMessage(msgs []opencode.Message, msg opencode.Message) {
+	if msg.ID == "" {
+		return
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].ID != msg.ID {
+			continue
+		}
+		if msg.Time.Created != 0 {
+			msgs[i].Time.Created = msg.Time.Created
+		}
+		if msg.Time.Streamed != 0 {
+			msgs[i].Time.Streamed = msg.Time.Streamed
+		}
+		if msg.Time.Completed != 0 {
+			msgs[i].Time.Completed = msg.Time.Completed
+		}
+		if msg.Tokens != (opencode.TokenUsage{}) {
+			msgs[i].Tokens = msg.Tokens
+		}
+		if msg.Cost != 0 {
+			msgs[i].Cost = msg.Cost
+		}
+		if msg.Status != "" {
+			msgs[i].Status = msg.Status
+		}
+		if msg.Summary != "" {
+			msgs[i].Summary = msg.Summary
+		}
+		if len(msg.Content) > 0 {
+			msgs[i].Content = msg.Content
+		}
+		if msg.Agent != "" {
+			msgs[i].Agent = msg.Agent
+		}
+		if msg.Model.ID != "" {
+			msgs[i].Model = msg.Model
+		}
+		return
+	}
+}
+
+func formatTurnDuration(d time.Duration) string {
+	if d <= 0 {
+		return ""
+	}
+	if ms := d.Round(time.Millisecond).Milliseconds(); ms < 1000 {
+		if ms <= 0 {
+			ms = 1
+		}
+		return fmt.Sprintf("%dms", ms)
+	}
+	if tenths := d.Round(100*time.Millisecond).Milliseconds() / 100; tenths < 100 {
+		if tenths%10 == 0 {
+			return fmt.Sprintf("%ds", tenths/10)
+		}
+		return fmt.Sprintf("%d.%ds", tenths/10, tenths%10)
+	}
+	totalSec := int(d.Round(time.Second).Seconds())
+	if totalSec < 60 {
+		return fmt.Sprintf("%ds", totalSec)
+	}
+	if totalSec < 3600 {
+		m := totalSec / 60
+		s := totalSec % 60
+		if s == 0 {
+			return fmt.Sprintf("%dm", m)
+		}
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := totalSec / 3600
+	m := (totalSec % 3600) / 60
+	s := totalSec % 60
+	if m == 0 && s == 0 {
+		return fmt.Sprintf("%dh", h)
+	}
+	if s == 0 {
+		return fmt.Sprintf("%dh %dm", h, m)
+	}
+	return fmt.Sprintf("%dh %dm %ds", h, m, s)
+}
+
+func formatTurnDurationNotice(d time.Duration) string {
+	s := formatTurnDuration(d)
+	if s == "" {
+		return ""
+	}
+	return "Worked for " + s
+}
+
+// computeTurnDurations calculates the total agent execution duration for each completed
+// turn in messages, keyed by the ID of the final assistant message in that turn.
+// Compaction, configuration switches, system/restart notices, and idle gaps not attributable
+// to background subagent/shell execution are excluded. When active is true, the tail turn is
+// still in progress and is omitted.
+func computeTurnDurations(
+	messages []opencode.Message,
+	revertMessageID string,
+	active bool,
+	hasWidget func(id string) bool,
+) map[string]time.Duration {
+	if revertMessageID != "" {
+		for i, msg := range messages {
+			if msg.ID == revertMessageID {
+				messages = messages[:i]
+				break
+			}
+		}
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	var turns [][]opencode.Message
+	start := 0
+	for i, msg := range messages {
+		if msg.Type == "user" {
+			if i > start {
+				turns = append(turns, messages[start:i])
+			}
+			start = i + 1
+		}
+	}
+	if start < len(messages) {
+		turns = append(turns, messages[start:])
+	}
+	if active && len(turns) > 0 {
+		turns = turns[:len(turns)-1]
+	}
+
+	var out map[string]time.Duration
+	for _, seg := range turns {
+		var (
+			targetID   string
+			fallbackID string
+			totalMs    int64
+			prevEndMs  int64
+
+			hasExcludedNotice bool
+			hasIdle           bool
+			hasBgCompletion   bool
+		)
+		for _, m := range seg {
+			if m.Type != "assistant" {
+				if prevEndMs > 0 {
+					switch m.Type {
+					case "compaction", "agent-switched", "model-switched", "location-switched", "system":
+						hasExcludedNotice = true
+					case "synthetic":
+						if isSubagentOrShellSynthetic(m) {
+							hasBgCompletion = true
+						} else {
+							hasExcludedNotice = true
+						}
+					case "idle":
+						hasIdle = true
+					}
+				}
+				continue
+			}
+
+			if m.ID != "" {
+				fallbackID = m.ID
+				if hasWidget == nil || hasWidget(m.ID) {
+					targetID = m.ID
+				}
+			}
+
+			startMs := m.Time.Created
+			endMs := m.Time.Completed
+			if endMs == 0 && m.Time.Streamed > startMs {
+				endMs = m.Time.Streamed
+			}
+
+			if prevEndMs > 0 && startMs > prevEndMs {
+				if !hasExcludedNotice && (!hasIdle || hasBgCompletion) {
+					totalMs += startMs - prevEndMs
+				}
+			}
+			if startMs > 0 && endMs > startMs {
+				totalMs += endMs - startMs
+			}
+
+			if endMs > 0 {
+				prevEndMs = endMs
+				hasExcludedNotice = false
+				hasIdle = false
+				hasBgCompletion = false
+			} else if startMs > prevEndMs {
+				prevEndMs = startMs
+				hasExcludedNotice = false
+				hasIdle = false
+				hasBgCompletion = false
+			}
+		}
+
+		if targetID == "" {
+			targetID = fallbackID
+		}
+		if targetID != "" && totalMs > 0 {
+			if out == nil {
+				out = make(map[string]time.Duration)
+			}
+			out[targetID] = time.Duration(totalMs) * time.Millisecond
+		}
+	}
+	return out
+}
+
+func (w *Window) updateTurnDurations(conv *convTimeline) {
+	if conv == nil || len(conv.assistantMap) == 0 {
+		return
+	}
+	var revertID string
+	if conv.session.Revert != nil {
+		revertID = conv.session.Revert.MessageID
+	}
+	durations := computeTurnDurations(conv.messages, revertID, conv.active, func(id string) bool {
+		return conv.assistantMap[id] != nil
+	})
+	for id, aw := range conv.assistantMap {
+		if d, ok := durations[id]; ok {
+			aw.SetTurnDuration(formatTurnDurationNotice(d))
+		} else {
+			aw.SetTurnDuration("")
 		}
 	}
 }
@@ -5871,6 +8213,91 @@ func computeRevertVisibility(messages []opencode.Message, targetMessageID string
 	return visibleIDs, hiddenIDs
 }
 
+// countRevertedUserMessages returns the number of user messages at or after targetMessageID.
+// When targetMessageID is non-empty, it returns at least 1.
+func countRevertedUserMessages(messages []opencode.Message, targetMessageID string) int {
+	if targetMessageID == "" {
+		return 0
+	}
+	var isReverted bool
+	var count int
+	for _, msg := range messages {
+		if msg.ID == targetMessageID {
+			isReverted = true
+		}
+		if isReverted && msg.Type == "user" {
+			count++
+		}
+	}
+	if count == 0 {
+		return 1
+	}
+	return count
+}
+
+// collectRevertedFileChanges extracts modified files and diffs from assistant tool calls
+// at or after targetMessageID as a fallback when the server does not return git snapshot diffs.
+func collectRevertedFileChanges(messages []opencode.Message, targetMessageID string) []opencode.FileDiff {
+	if targetMessageID == "" {
+		return nil
+	}
+	var isReverted bool
+	var order []string
+	byFile := make(map[string]*opencode.FileDiff)
+	for _, msg := range messages {
+		if msg.ID == targetMessageID {
+			isReverted = true
+		}
+		if !isReverted || msg.Type != "assistant" {
+			continue
+		}
+		for _, part := range msg.Content {
+			if part.Type != "tool" {
+				continue
+			}
+			filePath, diffOrContent, ok := opencode.ExtractToolModification(part.Name, part.State.Input)
+			if !ok || filePath == "" {
+				continue
+			}
+			add, del := opencode.CountDiffChanges(diffOrContent)
+			existing, exists := byFile[filePath]
+			if !exists {
+				status := "modified"
+				if strings.EqualFold(part.Name, "write") {
+					status = "added"
+				}
+				fd := &opencode.FileDiff{
+					File:      filePath,
+					Patch:     diffOrContent,
+					Additions: add,
+					Deletions: del,
+					Status:    status,
+				}
+				byFile[filePath] = fd
+				order = append(order, filePath)
+			} else {
+				existing.Additions += add
+				existing.Deletions += del
+				if diffOrContent != "" {
+					if existing.Patch != "" {
+						existing.Patch += "\n\n" + diffOrContent
+					} else {
+						existing.Patch = diffOrContent
+					}
+				}
+			}
+		}
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	out := make([]opencode.FileDiff, 0, len(order))
+	for _, f := range order {
+		out = append(out, *byFile[f])
+	}
+	return out
+}
+
 func (w *Window) undoLastMessage(tab *sessionTab, conv *convTimeline) {
 	if conv == nil || conv.session.ID == "" {
 		return
@@ -5883,7 +8310,43 @@ func (w *Window) undoLastMessage(tab *sessionTab, conv *convTimeline) {
 	if targetMsg == nil {
 		return
 	}
-	w.stageRevertToMessage(tab, conv, targetMsg.ID, targetMsg.Text)
+	w.stageRevertToMessage(tab, conv, targetMsg.ID, targetMsg.Text, true)
+}
+
+func (w *Window) promptRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string) {
+	if conv == nil || conv.session.ID == "" || messageID == "" {
+		return
+	}
+	if w.ApplicationWindow == nil {
+		w.stageRevertToMessage(tab, conv, messageID, messageText, true)
+		return
+	}
+
+	userCount := countRevertedUserMessages(conv.messages, messageID)
+	body := "Revert this message? You can redo or edit and resend it afterward."
+	if userCount > 1 {
+		body = fmt.Sprintf("Revert %d messages starting from this prompt? You can redo or edit and resend afterward.", userCount)
+	}
+
+	dlg := adw.NewAlertDialog("Revert Message?", body)
+
+	rollbackCheck := gtk.NewCheckButtonWithLabel("Also rollback modified files in the working tree")
+	rollbackCheck.SetActive(true)
+	rollbackCheck.SetHAlign(gtk.AlignCenter)
+	dlg.SetExtraChild(rollbackCheck)
+
+	dlg.AddResponse("cancel", "Cancel")
+	dlg.AddResponse("revert", "Revert")
+	dlg.SetResponseAppearance("revert", adw.ResponseDestructive)
+	dlg.SetDefaultResponse("revert")
+	dlg.SetCloseResponse("cancel")
+
+	dlg.ConnectResponse(func(response string) {
+		if response == "revert" {
+			w.stageRevertToMessage(tab, conv, messageID, messageText, rollbackCheck.Active())
+		}
+	})
+	dlg.Present(w.ApplicationWindow)
 }
 
 func (w *Window) redoRevert(tab *sessionTab, conv *convTimeline) {
@@ -5900,6 +8363,7 @@ func (w *Window) redoRevert(tab *sessionTab, conv *convTimeline) {
 				return
 			}
 			conv.session.Revert = nil
+			conv.revertFilesRolled = false
 			if sess != nil {
 				conv.session = *sess
 			}
@@ -5924,26 +8388,29 @@ func (w *Window) compactCurrentSession(tab *sessionTab, conv *convTimeline) {
 	})
 }
 
-func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string) {
+func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string, revertFiles bool) {
 	if conv == nil || conv.session.ID == "" || messageID == "" {
 		return
 	}
 	sessionID := conv.session.ID
 
-	start, end := w.inputBuffer.Bounds()
-	curText := strings.TrimSpace(w.inputBuffer.Text(start, end, false))
-	if curText == "" && messageText != "" {
-		w.inputBuffer.SetText(messageText)
+	if w.inputBuffer != nil {
+		start, end := w.inputBuffer.Bounds()
+		curText := strings.TrimSpace(w.inputBuffer.Text(start, end, false))
+		if curText == "" && messageText != "" {
+			w.inputBuffer.SetText(messageText)
+		}
 	}
 
 	gtkutil.Async(w.ctx, func() func() {
-		rev, err := w.client.StageRevert(w.ctx, sessionID, messageID, true)
+		rev, err := w.client.StageRevert(w.ctx, sessionID, messageID, revertFiles)
 		return func() {
 			if err != nil {
 				slog.Error("failed to stage revert", "sessionID", sessionID, "messageID", messageID, "err", err)
 				app.Error(w.ctx, err)
 				return
 			}
+			conv.revertFilesRolled = revertFiles
 			if rev != nil && rev.MessageID != "" {
 				conv.session.Revert = rev
 			} else {
@@ -5968,6 +8435,7 @@ func (w *Window) applyRevertState(tab *sessionTab, conv *convTimeline) {
 		if conv.revertBanner != nil {
 			conv.revertBanner.SetVisible(false)
 		}
+		w.updateTurnDurations(conv)
 		return
 	}
 
@@ -5990,10 +8458,18 @@ func (w *Window) applyRevertState(tab *sessionTab, conv *convTimeline) {
 		})
 		conv.timelineBox.Append(conv.revertBanner)
 	}
-	conv.revertBanner.Update(len(hiddenIDs), revert.Diff)
+	userCount := countRevertedUserMessages(conv.messages, targetID)
+	var fallbackFiles []opencode.FileDiff
+	if conv.revertFilesRolled && len(revert.Files) == 0 && revert.Diff == "" {
+		fallbackFiles = collectRevertedFileChanges(conv.messages, targetID)
+	}
+	conv.revertBanner.Update(userCount, revert, fallbackFiles)
 	conv.revertBanner.SetVisible(true)
+	w.updateTurnDurations(conv)
 	conv.keepPendingAtBottom()
-	conv.scroll.ScrollToBottom()
+	if conv.scroll != nil {
+		conv.scroll.ScrollToBottom()
+	}
 }
 
 func (w *Window) commitRevertState(tab *sessionTab, conv *convTimeline) {
@@ -6031,6 +8507,8 @@ func (w *Window) commitRevertState(tab *sessionTab, conv *convTimeline) {
 		conv.revertBanner = nil
 	}
 	conv.session.Revert = nil
+	conv.revertFilesRolled = false
+	w.updateTurnDurations(conv)
 }
 
 func (w *Window) clipboardHasImage() bool {
@@ -6284,7 +8762,11 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 			clear(conv.blockingTools)
 			clear(conv.blockingShellTools)
 			clear(conv.blockingShellIDs)
+			if n := len(conv.messages); n > 0 && conv.messages[n-1].Type == "assistant" && conv.messages[n-1].Time.Created > 0 && conv.messages[n-1].Time.Completed == 0 {
+				conv.messages[n-1].Time.Completed = time.Now().UnixMilli()
+			}
 		}
+		w.updateTurnDurations(conv)
 		conv.keepPendingAtBottom()
 		if active && conv.scroll != nil {
 			conv.scroll.ScrollToBottomIfBottomed()
@@ -6303,7 +8785,9 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 }
 
 func (w *Window) updateBusyState(busy bool) {
-	w.stopBtn.SetVisible(busy)
+	if w.stopBtn != nil {
+		w.stopBtn.SetVisible(busy)
+	}
 }
 
 func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgID, agent, model string) *AssistantMessageWidget {
@@ -6327,13 +8811,15 @@ func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgI
 	})
 	conv.assistantMap[msgID] = aw
 	conv.messageWidgets[msgID] = aw
-	conv.messages = append(conv.messages, opencode.Message{
-		ID:    msgID,
-		Type:  "assistant",
-		Agent: agent,
-	})
+	var msg opencode.Message
+	msg.ID = msgID
+	msg.Type = "assistant"
+	msg.Agent = agent
+	msg.Time.Created = time.Now().UnixMilli()
+	conv.messages = append(conv.messages, msg)
 	conv.seenMsgIDs[msgID] = true
 	conv.timelineBox.Append(aw)
+	w.updateTurnDurations(conv)
 	conv.keepPendingAtBottom()
 	return aw
 }
@@ -6379,8 +8865,20 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						}
 					}
 				} else if sess.ID != "" && !w.archivedSessions[sess.ID] {
+					if w.visibleSessions == nil {
+						w.visibleSessions = make(map[string]bool)
+					}
+					if !w.visibleSessions[sess.ID] {
+						w.visibleSessions[sess.ID] = true
+						w.saveState()
+					}
+					wasEmpty := len(w.tabs) == 0
 					w.ensureSessionTab(sess)
 					w.syncProjectSessionVisibility()
+					if wasEmpty && w.viewStack != nil {
+						w.viewStack.SetVisibleChildName(sess.ID)
+						w.onVisibleTabChanged()
+					}
 					w.syncSwitcherIndicators()
 				}
 			}
@@ -6407,6 +8905,38 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			sess := d.Session
 			if sess.ID == "" {
 				sess.ID = d.SessionID
+			}
+			for i := range w.allSessions {
+				if w.allSessions[i].ID == sess.ID {
+					if sess.Title != "" {
+						w.allSessions[i].Title = sess.Title
+					}
+					if sess.Agent != "" {
+						w.allSessions[i].Agent = sess.Agent
+					}
+					if sess.Model.ID != "" {
+						w.allSessions[i].Model = sess.Model
+					}
+					if sess.Outcome != "" {
+						w.allSessions[i].Outcome = sess.Outcome
+					}
+					if sess.Time.Created != 0 {
+						w.allSessions[i].Time.Created = sess.Time.Created
+					}
+					if sess.Time.Busy != 0 {
+						w.allSessions[i].Time.Busy = sess.Time.Busy
+					}
+					if sess.Time.Idle != 0 {
+						w.allSessions[i].Time.Idle = sess.Time.Idle
+					}
+					if sess.Time.Updated != 0 {
+						w.allSessions[i].Time.Updated = sess.Time.Updated
+					}
+					if sess.Location.Directory != "" {
+						w.allSessions[i].Location = sess.Location
+					}
+					break
+				}
 			}
 			if tab, ok := w.tabs[sess.ID]; ok {
 				if sess.Title != "" && tab.main.session.Title != sess.Title {
@@ -6503,6 +9033,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.execution.started":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			w.updateSessionActivityState(d.SessionID, true)
+			w.revealActiveSession(d.SessionID)
 			tab, conv := w.resolveConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, true)
@@ -6513,6 +9045,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			w.updateSessionActivityState(d.SessionID, false)
 			tab, conv := w.resolveConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			w.setConvActive(d.SessionID, false)
@@ -6539,9 +9072,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			switch d.Status.Type {
 			case "busy", "retry":
+				w.updateSessionActivityState(d.SessionID, true)
+				w.revealActiveSession(d.SessionID)
 				w.setConvActive(d.SessionID, true)
 				w.setSubagentActive(d.SessionID, true, "")
 			case "idle":
+				w.updateSessionActivityState(d.SessionID, false)
 				w.setConvActive(d.SessionID, false)
 				w.setSubagentActive(d.SessionID, false, "succeeded")
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
@@ -6582,13 +9118,19 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			_, conv := w.resolveConv(d.SessionID)
 			if conv != nil && d.InboxID != "" {
+				if conv.ignoredCancelIDs[d.InboxID] {
+					delete(conv.ignoredCancelIDs, d.InboxID)
+					break
+				}
 				for i, p := range conv.pendingPrompts {
 					if p != nil && p.inboxID == d.InboxID {
 						p.cancelled = true
-						if p.widget != nil && p.widget.Parent() != nil {
+						if p.widget != nil && p.attached {
 							conv.timelineBox.Remove(p.widget)
+							p.attached = false
 						}
 						conv.pendingPrompts = append(conv.pendingPrompts[:i], conv.pendingPrompts[i+1:]...)
+						conv.updateGreeterVisibility()
 						break
 					}
 				}
@@ -6633,30 +9175,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			SessionID string            `json:"sessionID"`
 			Location  opencode.Location `json:"location"`
 		}
-		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			tab, conv := w.resolveConv(d.SessionID)
-			if conv != nil {
-				if d.Location.Directory != "" {
-					conv.session.Location = d.Location
-				}
-				if conv.loaded {
-					w.reconcileTail(d.SessionID)
-				}
-			}
-			if tab != nil {
-				if conv == tab.main {
-					if w.reorderTabsByProject() {
-						w.syncSectionStarts()
-						w.syncProjectSessionVisibility()
-						w.syncSwitcherIndicators()
-					} else {
-						w.syncSectionStarts()
-					}
-				}
-				if w.currentTab() == tab {
-					w.refreshHeaderAndBottomBar(tab)
-				}
-			}
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" && d.Location.Directory != "" {
+			w.applySessionMoved(d.SessionID, d.Location.Directory)
 		}
 
 	case "session.renamed":
@@ -6789,6 +9309,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if authoritative := opencode.FormatMessageTokPerSec(conv.messages); authoritative != "" {
 					conv.lastTokRate = authoritative
 				}
+				w.updateTurnDurations(conv)
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
 				}
@@ -6824,8 +9345,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				w.onStreamDelta(tab, conv, len(d.Delta))
-				if tab != nil && tab.main.session.ID != w.currentRootSessionID() && strings.TrimSpace(d.Delta) != "" {
-					tab.page.SetNeedsAttention(true)
+				if strings.TrimSpace(d.Delta) != "" {
+					w.markTabNeedsAttention(tab, false)
 				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
@@ -6838,8 +9359,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.TextEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveConv(d.SessionID)
-			if tab != nil && tab.main.session.ID != w.currentRootSessionID() && strings.TrimSpace(d.Text) != "" {
-				tab.page.SetNeedsAttention(true)
+			if strings.TrimSpace(d.Text) != "" {
+				w.markTabNeedsAttention(tab, false)
 			}
 			if conv != nil && conv.loaded {
 				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
@@ -7069,9 +9590,11 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					if shID != "" && tw.IsBackgroundRunning() {
 						conv.backgroundShellIDs[shID] = true
 						delete(conv.blockingShellIDs, shID)
-						if out, ok := w.shellOutputs[shID]; ok && out != "" {
-							tw.SetShellLiveOutput(out)
+						out := w.shellOutputs[shID]
+						if out == "" {
+							out = FormatShellOutput("")
 						}
+						tw.SetShellLiveOutput(out)
 					}
 				}
 				if w.currentTab() == tab {
@@ -7138,6 +9661,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				conv.session.Revert = &d.Revert
+				if len(d.Revert.Files) > 0 || d.Revert.Diff != "" {
+					conv.revertFilesRolled = true
+				}
 				w.applyRevertState(tab, conv)
 			}
 		}
@@ -7148,6 +9674,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveConv(d.SessionID)
 			if conv != nil {
 				conv.session.Revert = nil
+				conv.revertFilesRolled = false
 				w.applyRevertState(tab, conv)
 			}
 		}
@@ -7198,8 +9725,18 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				delete(w.shellOutputLabels, id)
 				w.updateToolWidgetsForShell(id, w.shellOutputs[id], "completed")
 				if hadSh {
-					gtkutil.Async(w.ctx, func() func() {
-						text, ok := w.fetchSingleShellOutput(prevSh)
+					if prevSh.EffectiveFile() == "" {
+						prevSh.File = w.findShellOutputFile(id)
+					}
+					if prevSh.EffectiveLocationDir() == "" {
+						if tab := w.currentTab(); tab != nil && tab.main != nil {
+							prevSh.LocationDir = tab.main.session.Location.Directory
+						}
+					}
+					ctx := w.ctx
+					client := w.client
+					gtkutil.Async(ctx, func() func() {
+						text, ok := fetchRawShellItemOutput(ctx, client, prevSh)
 						return func() {
 							if ok && text != "" {
 								w.shellOutputs[id] = text
@@ -7229,6 +9766,20 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.FormCancelledEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.ID != "" {
 			w.removePendingForm(d.SessionID, d.ID)
+		}
+
+	case "permission.asked":
+		var d opencode.PermissionAskedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.Request.ID != "" {
+			w.upsertPendingPermission(d.Request)
+		}
+
+	case "permission.replied":
+		var d opencode.PermissionRepliedEvent
+		if json.Unmarshal(ev.Data, &d) == nil {
+			if reqID := d.EffectiveRequestID(); reqID != "" {
+				w.removePendingPermission(d.SessionID, reqID)
+			}
 		}
 	}
 }

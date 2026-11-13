@@ -225,6 +225,18 @@ func (p *CompletionProvider) isTrigger(iter *gtk.TextIter, ch uint32) bool {
 	return unicode.IsSpace(rune(cur.Char()))
 }
 
+var builtinSlashCommands = []struct {
+	name string
+	desc string
+	icon string
+}{
+	{"/undo", "Undo last message & file changes", "edit-undo-symbolic"},
+	{"/redo", "Redo undone message", "edit-redo-symbolic"},
+	{"/new", "Create a new session", "document-new-symbolic"},
+	{"/cd", "Change session working directory", "folder-visiting-symbolic"},
+	{"/compact", "Compact session history", "compress-symbolic"},
+}
+
 func (p *CompletionProvider) populate(compCtx *gtksource.CompletionContext) (*gio.ListModel, error) {
 	trigger, query, _ := p.extractTriggerAndQuery(compCtx)
 	if trigger == 0 {
@@ -252,20 +264,8 @@ func (p *CompletionProvider) populate(compCtx *gtksource.CompletionContext) (*gi
 
 	switch trigger {
 	case '/':
-		// Built-in slash commands
-		builtins := []struct {
-			name string
-			desc string
-			icon string
-		}{
-			{"/undo", "Undo last message & file changes", "edit-undo-symbolic"},
-			{"/redo", "Redo undone message", "edit-redo-symbolic"},
-			{"/new", "Create a new session", "document-new-symbolic"},
-			{"/compact", "Compact session history", "compress-symbolic"},
-		}
-
 		seen := make(map[string]bool)
-		for _, b := range builtins {
+		for _, b := range builtinSlashCommands {
 			seen[strings.TrimPrefix(b.name, "/")] = true
 			if lowerQuery == "" || strings.Contains(strings.ToLower(b.name), lowerQuery) {
 				prop := newProposal(ProposalCommand, b.icon, b.name, b.name, b.desc)

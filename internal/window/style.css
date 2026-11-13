@@ -38,6 +38,16 @@
 	border: 1px dashed alpha(@accent_color, 0.55);
 }
 
+.glup-user-card-dragging {
+	opacity: 0.45;
+}
+
+.glup-user-card-drop-target {
+	background-color: alpha(@accent_bg_color, 0.22);
+	border: 1px dashed @accent_color;
+	outline: 1px dashed alpha(@accent_color, 0.7);
+}
+
 .glup-user-card .glup-md-view {
 	margin-top: 0;
 	margin-bottom: 0;
@@ -59,17 +69,34 @@ sidebar .navigation-sidebar > .header > header.glup-sidebar-project-header,
 	background-color: color-mix(in srgb, currentColor 7%, transparent);
 }
 
+.glup-sidebar-project-add-btn,
 .glup-sidebar-project-close-btn {
 	opacity: 0;
 }
 
+.glup-sidebar-project-header-box:hover .glup-sidebar-project-add-btn,
 .glup-sidebar-project-header-box:hover .glup-sidebar-project-close-btn {
 	opacity: 0.6;
 }
 
+.glup-sidebar-project-header-box:hover .glup-sidebar-project-add-btn:hover,
 .glup-sidebar-project-header-box:hover .glup-sidebar-project-close-btn:hover {
 	opacity: 1;
 	background-color: color-mix(in srgb, currentColor 12%, transparent);
+}
+
+.glup-project-menu {
+	min-width: 175px;
+}
+
+.glup-project-menu-item {
+	padding: 6px 10px;
+	border-radius: 6px;
+	font-weight: 500;
+}
+
+.glup-project-menu-item-danger {
+	color: @error_color;
 }
 
 .glup-sidebar-project-chevron {
@@ -329,6 +356,21 @@ sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
 	padding: 1px 0;
 }
 
+expander-widget.glup-tool-expander > title {
+	border-spacing: 0;
+}
+
+expander-widget.glup-tool-expander > title > arrow {
+	min-width: 0;
+	min-height: 0;
+	margin: 0;
+	padding: 0;
+	border: none;
+	-gtk-icon-size: 0px;
+	-gtk-icon-source: none;
+	opacity: 0;
+}
+
 .glup-tool-clickable {
 	border-radius: 6px;
 }
@@ -341,18 +383,22 @@ sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
 	padding: 4px 0 4px 8px;
 }
 
-.glup-tool-body,
-.glup-tool-body text {
+.glup-tool-body {
 	font-family: monospace;
-	font-size: 0.84em;
+	font-size: 0.86em;
 	background-color: alpha(@theme_fg_color, 0.03);
 	padding: 4px 6px;
 	border-radius: 4px;
 }
 
+.glup-tool-body text {
+	background: transparent;
+	background-color: transparent;
+}
+
 .glup-diff-box {
 	font-family: monospace;
-	font-size: 0.84em;
+	font-size: 0.86em;
 	background-color: alpha(@theme_fg_color, 0.03);
 	border: 1px solid alpha(@borders, 0.45);
 	border-radius: 4px;
@@ -423,13 +469,49 @@ sidebar .navigation-sidebar > row.glup-sidebar-row-collapsed:selected {
 	margin: 2px 0;
 }
 
+.glup-turn-duration {
+	margin-top: 4px;
+}
+
+/*
+ * Composer fade. GTK CSS has no mask-image, so the timeline is covered with a
+ * window-coloured scrim whose alpha is (1 - mask alpha). Over the solid window
+ * background this looks the same as masking the scroller.
+ *
+ * Mask stops above the composer top edge (inset): 0.10 at +0, 0.25 at +8px,
+ * 0.55 at +18px, 0.85 at +30px, 1.00 at +40px.
+ */
+.glup-timeline-bottom-fade {
+	min-height: 40px;
+	background: linear-gradient(to top,
+		alpha(@window_bg_color, 0.90) 0px,
+		alpha(@window_bg_color, 0.75) 8px,
+		alpha(@window_bg_color, 0.45) 18px,
+		alpha(@window_bg_color, 0.15) 30px,
+		alpha(@window_bg_color, 0) 40px);
+}
+
+/*
+ * The composer bar itself carries the floor: fully hidden for the 50px gap
+ * under the composer frame (4px padding + 46px bottomBarSpacer), then a flat
+ * 10% (scrim 0.90) floor up to the composer's top edge.
+ */
 .glup-composer-bar {
-	padding: 8px 16px 4px 16px;
-	background: transparent;
+	padding: 0 16px 4px 16px;
+	background: linear-gradient(to top,
+		@window_bg_color 50px,
+		alpha(@window_bg_color, 0.90) 50px);
 }
 
 .glup-composer-frame {
-	background-color: @card_bg_color;
+	/* @card_bg_color is translucent in dark mode; layer it over the window
+	 * colour so the timeline scrolling behind the composer doesn't show. */
+	background-color: @window_bg_color;
+	background-image: linear-gradient(@card_bg_color, @card_bg_color);
+	/* Keep both layers inside the translucent border; with the default
+	 * border-box clip their anti-aliased rounded edges stack under the border
+	 * and the corners come out lighter than the straight edges. */
+	background-clip: padding-box;
 	border: 1px solid alpha(@borders, 0.65);
 	padding: 10px 12px 6px 12px;
 	border-radius: 14px;
@@ -615,14 +697,16 @@ GtkSourceAssistant.completion box.details {
 	margin: 0;
 	border: none;
 	opacity: 0;
-	font-size: 0;
+	-gtk-icon-size: 0px;
 }
 
+GtkSourceAssistant.completion list row box.more *,
 GtkSourceAssistant.completion box.details * {
 	min-height: 0;
 	min-width: 0;
 	padding: 0;
 	margin: 0;
+	-gtk-icon-size: 0px;
 }
 
 .glup-status-bar {
@@ -738,8 +822,20 @@ button.glup-status-background:hover {
 
 menubutton.glup-window-title-btn > button {
 	font-weight: normal;
-	padding: 2px 10px;
+	min-height: 0;
+	margin: -4px 0;
+	padding: 2px 12px 3px 12px;
 	border-radius: 8px;
+}
+
+menubutton.glup-window-title-btn windowtitle {
+	margin: 0;
+	padding: 0;
+}
+
+menubutton.glup-window-title-btn windowtitle .title,
+menubutton.glup-window-title-btn windowtitle .subtitle {
+	line-height: 1.05;
 }
 
 .glup-sheet-content {
@@ -750,7 +846,7 @@ menubutton.glup-window-title-btn > button {
 .glup-shell-command {
 	font-family: monospace;
 	font-weight: 400;
-	font-size: 0.92em;
+	font-size: 0.86em;
 }
 
 .glup-context-grid {
@@ -810,7 +906,7 @@ menubutton.glup-window-title-btn > button {
 
 .glup-revert-banner-diff {
 	font-family: monospace;
-	font-size: 11px;
+	font-size: 0.78em;
 	background-color: alpha(@card_bg_color, 0.85);
 	border: 1px solid alpha(@borders, 0.5);
 	border-radius: 4px;
@@ -818,17 +914,39 @@ menubutton.glup-window-title-btn > button {
 	font-weight: bold;
 }
 
+.glup-revert-files-box {
+	margin-top: 2px;
+	padding-left: 22px;
+}
+
+.glup-revert-file-row {
+	font-size: 0.85em;
+}
+
+.glup-revert-file-path {
+	font-family: monospace;
+	font-size: 0.86em;
+}
+
 .glup-revert-diff-expander {
-	font-size: 12px;
 	margin-top: 4px;
+}
+
+.glup-revert-diff-expander > title {
+	font-size: 0.85em;
 }
 
 .glup-revert-diff-text {
 	font-family: monospace;
-	font-size: 11px;
+	font-size: 0.86em;
 	background-color: alpha(@window_bg_color, 0.6);
 	padding: 6px;
 	border-radius: 4px;
+}
+
+.glup-revert-diff-text text {
+	background: transparent;
+	background-color: transparent;
 }
 
 .glup-user-undo-btn,
@@ -994,9 +1112,55 @@ menubutton.glup-window-title-btn > button {
 	padding-left: 6px;
 }
 
+.glup-permission-card {
+	background-color: var(--card-bg-color, @card_bg_color);
+	color: var(--card-fg-color, @card_fg_color);
+	border: 1px solid alpha(@warning_color, 0.38);
+	border-radius: 12px;
+	padding: 14px 16px;
+	margin: 10px 0;
+	box-shadow: 0 1px 4px alpha(#000000, 0.08);
+}
+
+.glup-permission-pill {
+	background-color: alpha(@warning_bg_color, 0.22);
+	color: @warning_color;
+	border: 1px solid alpha(@warning_color, 0.35);
+	border-radius: 6px;
+	padding: 2px 9px;
+	font-size: 0.8em;
+	font-weight: 700;
+}
+
+.glup-permission-title {
+	font-size: 0.95em;
+	font-weight: 600;
+}
+
+.glup-permission-meta {
+	font-family: monospace;
+	font-size: 0.78em;
+}
+
+.glup-perm-cmd-box {
+	padding: 8px 12px;
+	border-radius: 8px;
+	background-color: alpha(@theme_fg_color, 0.045);
+	border: 1px solid alpha(@borders, 0.45);
+}
+
+.glup-perm-cmd-text {
+	font-family: monospace;
+	font-size: 0.86em;
+}
+
+.glup-permission-footer {
+	margin-top: 2px;
+}
+
 .glup-shell-output {
 	font-family: monospace;
-	font-size: 0.82em;
+	font-size: 0.86em;
 	line-height: 1.32;
 	background-color: alpha(@theme_fg_color, 0.045);
 	border: 1px solid alpha(@borders, 0.45);
@@ -1012,4 +1176,86 @@ togglebutton.glup-take-charge-btn:checked {
 
 togglebutton.glup-take-charge-btn:checked:hover {
 	background-color: alpha(@accent_bg_color, 0.32);
+}
+
+.glup-sidebar-resizer {
+	background-color: transparent;
+	transition: background-color 120ms ease;
+}
+
+.glup-sidebar-resizer:hover,
+.glup-sidebar-resizer.dragging {
+	background-color: alpha(@accent_bg_color, 0.45);
+}
+
+.glup-greeter {
+	padding: 36px 24px 56px 24px;
+}
+
+.glup-greeter-badge {
+	min-width: 56px;
+	min-height: 56px;
+	border-radius: 999px;
+	background: linear-gradient(135deg, alpha(@accent_bg_color, 0.22), alpha(@accent_bg_color, 0.08));
+	border: 1px solid alpha(@accent_color, 0.28);
+}
+
+.glup-greeter-secret {
+	border-radius: 12px;
+	border: 1px solid alpha(@borders, 0.65);
+}
+
+.glup-greeter-secret-pic {
+	border-radius: 12px;
+}
+
+.glup-greeter-icon {
+	color: @accent_color;
+}
+
+.glup-greeter-title {
+	font-size: 1.55em;
+	font-weight: 700;
+	letter-spacing: -0.01em;
+}
+
+.glup-greeter-subtitle {
+	font-size: 1.02em;
+	opacity: 0.72;
+}
+
+.glup-greeter-chips {
+	margin-top: 6px;
+}
+
+button.glup-greeter-chip {
+	background-color: alpha(@card_bg_color, 0.75);
+	border: 1px solid alpha(@borders, 0.65);
+	border-radius: 999px;
+	padding: 6px 14px;
+	font-size: 0.9em;
+	font-weight: 500;
+	opacity: 0.88;
+	transition: background-color 140ms ease, border-color 140ms ease, opacity 140ms ease;
+}
+
+button.glup-greeter-chip:hover {
+	background-color: alpha(@accent_bg_color, 0.14);
+	border-color: alpha(@accent_color, 0.4);
+	opacity: 1.0;
+}
+
+.glup-greeter-chip-icon {
+	color: @accent_color;
+	opacity: 0.9;
+}
+
+.glup-offline-error {
+	font-family: monospace;
+	font-size: 0.86em;
+	background-color: alpha(@card_bg_color, 0.8);
+	border: 1px solid alpha(@borders, 0.65);
+	border-radius: 8px;
+	padding: 8px 12px;
+	opacity: 0.85;
 }

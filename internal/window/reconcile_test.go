@@ -2,6 +2,7 @@ package window
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -10,16 +11,20 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf16"
+	"unicode/utf8"
 	"unsafe"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
 	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	coreglib "github.com/diamondburned/gotk4/pkg/core/glib"
+	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
+	"github.com/diamondburned/gotk4/pkg/pango"
 	"libdb.so/gluppencode/internal/opencode"
 )
 
@@ -1275,12 +1280,29 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	readTw.Append(readTw.headerRow)
 	readTw.Append(readTw.detailsBox)
 	readTw.applyToolKind()
-	if readTw.detailsExpander != nil {
-		t.Fatalf("expected read ToolWidget to strip detailsExpander")
+	if readTw.detailsExpander == nil {
+		t.Fatalf("expected read ToolWidget to keep detailsExpander for lazy expansion")
 	}
-	readTw.SetOutput([]opencode.ToolContentItem{{Type: "text", Text: "1: secret file contents"}}, nil)
+	readTw.SetOutput([]opencode.ToolContentItem{
+		{Type: "text", Text: "1: secret file contents"},
+		{Type: "file", Mime: "image/png", Name: "dot.png", Data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
+	}, nil)
 	if txt := readTw.outputBuf.Text(readTw.outputBuf.StartIter(), readTw.outputBuf.EndIter(), false); txt != "" {
-		t.Fatalf("expected read ToolWidget not to store file output, got %q", txt)
+		t.Fatalf("expected read ToolWidget not to load file output before expansion, got %q", txt)
+	}
+	if len(readTw.imageWidgets) != 0 || readTw.imageBox.Visible() {
+		t.Fatalf("expected read ToolWidget not to decode images before expansion")
+	}
+	readTw.detailsExpander.SetExpanded(true)
+	if txt := readTw.outputBuf.Text(readTw.outputBuf.StartIter(), readTw.outputBuf.EndIter(), false); txt != "1: secret file contents" {
+		t.Fatalf("expected read ToolWidget to load file output when expanded, got %q", txt)
+	}
+	if len(readTw.imageWidgets) != 1 || !readTw.imageBox.Visible() {
+		t.Fatalf("expected read ToolWidget to decode and show image when expanded, got len=%d visible=%v", len(readTw.imageWidgets), readTw.imageBox.Visible())
+	}
+	readTw.detailsExpander.SetExpanded(false)
+	if readTw.imageBox.Visible() {
+		t.Fatalf("expected read ToolWidget to hide imageBox when collapsed again")
 	}
 }
 
@@ -1289,6 +1311,11 @@ func TestBackgroundShellFilteringAndOutput(t *testing.T) {
 	emptyBuf := FormatShellTailLines("", 7)
 	if lines := strings.Split(emptyBuf, "\n"); len(lines) != 7 || !strings.Contains(lines[0], "Waiting for output") {
 		t.Fatalf("unexpected empty FormatShellTailLines: %q (lines=%d)", emptyBuf, len(lines))
+	}
+
+	// A byte-offset tail seek can start mid-rune; GtkTextBuffer rejects invalid UTF-8 outright.
+	if got := FormatShellTailLines("\xa0\xe2\x96 done ✓\n\xff\xfebinary\n", 7); !utf8.ValidString(got) || !strings.Contains(got, "done ✓") {
+		t.Fatalf("expected valid UTF-8 tail keeping 'done ✓', got %q", got)
 	}
 
 	rawAns := "\x1b[32mline1\x1b[0m\nline2\rline2_updated\nline3\nline4\nline5\nline6\nline7\nline8\n"
@@ -1426,6 +1453,69 @@ func TestBackgroundShellFilteringAndOutput(t *testing.T) {
 	if !twBg.IsBackgroundRunning() || twBg.ShellID() != "sh_bg" {
 		t.Errorf("expected twBg.IsBackgroundRunning()=true and ShellID=sh_bg, got bgRunning=%v shellID=%q", twBg.IsBackgroundRunning(), twBg.ShellID())
 	}
+
+	// Starting a new foreground shell tool must NOT hide the existing background shell sh_bg!
+	tab1.main.assistantMap["m1"].tools["tool_fg2"] = newTestToolWidget("tool_fg2", "shell")
+	win.handleEvent(opencode.Event{
+		Type: "session.tool.called",
+		Data: json.RawMessage(`{"sessionID":"ses_1","assistantMessageID":"m1","id":"tool_fg2","name":"shell","input":{"command":"pwd"}}`),
+	})
+	if got := win.visibleBackgroundShellsForTab(tab1); len(got) != 1 || got[0].ID != "sh_bg" {
+		t.Fatalf("expected sh_bg to remain visible while another foreground shell runs, got %+v", got)
+	}
+
+	// Test live tail reading from output file and from GetShellOutput when output exceeds 16 KB.
+	outPath := filepath.Join(t.TempDir(), "sh_bg.out")
+	if err := os.WriteFile(outPath, []byte("tick 1\ntick 2\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	twBg.SetOutput([]opencode.ToolContentItem{{
+		Type: "text",
+		Text: "Command moved to the background (shell ID: sh_bg).\nOutput is streaming to: " + outPath,
+	}}, nil)
+	if twBg.ShellFile() != outPath {
+		t.Fatalf("expected ShellFile()=%q, got %q", outPath, twBg.ShellFile())
+	}
+	if text, ok := win.fetchSingleShellOutput(opencode.ShellItem{ID: "sh_bg"}); !ok || !strings.Contains(text, "tick 2") {
+		t.Fatalf("expected fetchSingleShellOutput to read live file tail with 'tick 2', got ok=%v text=%q", ok, text)
+	}
+	if err := os.WriteFile(outPath, []byte("tick 1\ntick 2\ntick 3\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile update: %v", err)
+	}
+	if text, ok := win.fetchSingleShellOutput(opencode.ShellItem{ID: "sh_bg"}); !ok || !strings.Contains(text, "tick 3") {
+		t.Fatalf("expected fetchSingleShellOutput to reflect updated live file tail with 'tick 3', got ok=%v text=%q", ok, text)
+	}
+
+	// Also verify fallback to synthetic background shell item when w.activeShells is temporarily empty,
+	// and GetShellOutput tail-seek when output size > 16384 bytes.
+	delete(win.activeShells, "sh_bg")
+	if got := win.visibleBackgroundShellsForTab(tab1); len(got) != 1 || got[0].ID != "sh_bg" || got[0].File != outPath {
+		t.Fatalf("expected fallback visible background shell from ToolWidget with File=%q, got %+v", outPath, got)
+	}
+	_ = os.Remove(outPath)
+	bigPrefix := strings.Repeat("old line\n", 2500) // > 20 KB
+	fullRemote := bigPrefix + "tail A\ntail B\n"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cursor := 0
+		_, _ = fmt.Sscanf(r.URL.Query().Get("cursor"), "%d", &cursor)
+		limit := 16384
+		_, _ = fmt.Sscanf(r.URL.Query().Get("limit"), "%d", &limit)
+		if cursor > len(fullRemote) {
+			cursor = len(fullRemote)
+		}
+		end := min(len(fullRemote), cursor+limit)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"output": fullRemote[cursor:end],
+			"cursor": end,
+			"size":   len(fullRemote),
+		})
+	}))
+	defer srv.Close()
+	win.client = &opencode.Client{BaseURL: srv.URL}
+	if text, ok := win.fetchSingleShellOutput(opencode.ShellItem{ID: "sh_bg"}); !ok || !strings.Contains(text, "tail B") {
+		t.Fatalf("expected fetchSingleShellOutput to seek to tail when output > 16KB, got ok=%v text=%q", ok, text)
+	}
+	win.client = nil
 
 	// 3. Test inheritedAgentAndModel inherits agent and model from current conversation
 	tab1.main.session.Agent = "plan"
@@ -1598,7 +1688,8 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 		t.Errorf("win.windowTitle.Title() = %q, want Updated Dissent Session Title", win.windowTitle.Title())
 	}
 
-	// 7. Conversations dynamically sort by most recent activity within each project.
+	// 7. Conversations do NOT reorder on background tool calls, steps, or routine events;
+	// they only reorder to the top when attention is needed (pink dot) or the user sends a message.
 	win.collapsedProjects = make(map[string]bool)
 	win.expandedProjects = make(map[string]bool)
 	win.projectSessions = make(map[string][]opencode.Session)
@@ -1620,13 +1711,51 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 	if !slices.Equal(win.tabOrder, []string{"ses_root", "ses_older_13m", "ses_older_20m"}) {
 		t.Fatalf("initial tabOrder = %v, want [ses_root ses_older_13m ses_older_20m]", win.tabOrder)
 	}
-	// New activity arrives on ses_older_20m -> it should immediately move to the top of tabOrder.
+	vs.SetVisibleChildName("ses_root")
+
+	// Background events (inbox enqueued, step started, tool called, tool success, step ended, session updated)
+	// must NOT bump ses_older_20m up the list.
+	for _, ev := range []opencode.Event{
+		{Type: "session.inbox.enqueued", Data: json.RawMessage(`{"sessionID":"ses_older_20m","inboxID":"in_1","delivery":"queue"}`)},
+		{Type: "session.execution.started", Data: json.RawMessage(`{"sessionID":"ses_older_20m"}`)},
+		{Type: "session.step.started", Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1"}`)},
+		{Type: "session.reasoning.delta", Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1","delta":"thinking..."}`)},
+		{Type: "session.tool.called", Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1","id":"call_1","name":"read"}`)},
+		{Type: "session.tool.success", Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1","id":"call_1","name":"read"}`)},
+		{Type: "session.step.ended", Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1"}`)},
+		{Type: "session.updated", Data: json.RawMessage(`{"sessionID":"ses_older_20m","session":{"id":"ses_older_20m","time":{"updated":9999999999999}}}`)},
+	} {
+		win.handleEvent(ev)
+		if !slices.Equal(win.tabOrder, []string{"ses_root", "ses_older_13m", "ses_older_20m"}) {
+			t.Fatalf("tabOrder after %s on ses_older_20m = %v, want unchanged [ses_root ses_older_13m ses_older_20m]", ev.Type, win.tabOrder)
+		}
+	}
+
+	// Attention needed (pink dot) on background tab ses_older_20m -> bumps it to the top of tabOrder.
 	win.handleEvent(opencode.Event{
-		Type: "session.inbox.enqueued",
-		Data: json.RawMessage(`{"sessionID":"ses_older_20m","inboxID":"in_1","delivery":"queue"}`),
+		Type: "session.text.delta",
+		Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1","delta":"Here is the answer."}`),
 	})
 	if !slices.Equal(win.tabOrder, []string{"ses_older_20m", "ses_root", "ses_older_13m"}) {
-		t.Fatalf("tabOrder after activity on ses_older_20m = %v, want [ses_older_20m ses_root ses_older_13m]", win.tabOrder)
+		t.Fatalf("tabOrder after text delta (attention needed) on ses_older_20m = %v, want [ses_older_20m ses_root ses_older_13m]", win.tabOrder)
+	}
+
+	// User sends a message into ses_older_13m -> bumps ses_older_13m to the top of tabOrder.
+	win.bumpSessionToTop(win.tabs["ses_older_13m"])
+	if !slices.Equal(win.tabOrder, []string{"ses_older_13m", "ses_older_20m", "ses_root"}) {
+		t.Fatalf("tabOrder after user message in ses_older_13m = %v, want [ses_older_13m ses_older_20m ses_root]", win.tabOrder)
+	}
+
+	// Permission asked (attention needed) on background tab ses_root -> bumps ses_root to the top of tabOrder.
+	vs.SetVisibleChildName("ses_older_13m")
+	win.tabs["ses_root"].page.SetNeedsAttention(false)
+	win.tabs["ses_root"].main.loaded = false
+	win.handleEvent(opencode.Event{
+		Type: "permission.asked",
+		Data: json.RawMessage(`{"request":{"id":"perm_bump_1","sessionID":"ses_root","permission":"bash","patterns":["rm -rf /tmp/foo"]}}`),
+	})
+	if !slices.Equal(win.tabOrder, []string{"ses_root", "ses_older_13m", "ses_older_20m"}) {
+		t.Fatalf("tabOrder after permission.asked on ses_root = %v, want [ses_root ses_older_13m ses_older_20m]", win.tabOrder)
 	}
 
 	// 8. Hiding (clearing) a project removes all of its conversations from the sidebar without deleting them,
@@ -1795,5 +1924,2293 @@ func TestTakeChargeAutoReply(t *testing.T) {
 	}
 	if got, _ := ans2["q0"].(string); got != TakeChargeDirective {
 		t.Errorf("frm_incoming q0 answer = %q, want %q", got, TakeChargeDirective)
+	}
+}
+
+func TestReorderPendingPrompts(t *testing.T) {
+	if !gtk.InitCheck() {
+		return
+	}
+
+	var mu sync.Mutex
+	var admitted []opencode.PromptRequest
+	var cancelled []string
+	seq := 10
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/ses_q/prompt":
+			var req opencode.PromptRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			seq++
+			id := fmt.Sprintf("inb_%d", seq)
+			admitted = append(admitted, req)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(opencode.InboxItem{
+				ID:       id,
+				Type:     "user",
+				Delivery: req.Delivery,
+				Payload:  opencode.InboxPayload{Text: req.Text},
+			})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/ses_q/inbox/"):
+			inboxID := strings.TrimPrefix(r.URL.Path, "/api/session/ses_q/inbox/")
+			mu.Lock()
+			cancelled = append(cancelled, inboxID)
+			mu.Unlock()
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	win := &Window{
+		ctx:    t.Context(),
+		client: &opencode.Client{BaseURL: srv.URL},
+		tabs:   make(map[string]*sessionTab),
+	}
+	conv := &convTimeline{
+		session:          opencode.Session{ID: "ses_q"},
+		thinkingLabel:    gtk.NewLabel(""),
+		ignoredCancelIDs: make(map[string]bool),
+		loaded:           true,
+	}
+	conv.thinkingLabel.SetVisible(false)
+	win.tabs["ses_q"] = &sessionTab{main: conv}
+
+	// Verify sidebar indicator spinner shows when background subshells or subagents are running,
+	// without showing Thinking... in the main conversation when the main agent is idle.
+	ind := &switcherIndicator{
+		box:     gtk.NewBox(gtk.OrientationHorizontal, 0),
+		spinner: adw.NewSpinner(),
+		label:   gtk.NewLabel(""),
+	}
+	ind.spinner.SetVisible(false)
+	win.tabs["ses_q"].sidebarIndicator = ind
+	win.activeShells = make(map[string]opencode.ShellItem)
+	win.childToRoot = make(map[string]string)
+
+	win.upsertSubagent(win.tabs["ses_q"], opencode.Session{
+		ID:       "sub_bg",
+		ParentID: "ses_q",
+		Time:     opencode.SessionTime{Busy: 100, Idle: 0},
+	})
+	if !ind.spinner.Visible() {
+		t.Errorf("expected sidebar spinner visible while background subagent is running")
+	}
+	if conv.thinkingLabel.Visible() {
+		t.Errorf("expected main thinkingLabel hidden when only background subagent is running")
+	}
+	win.setSubagentActive("sub_bg", false, "succeeded")
+	if ind.spinner.Visible() {
+		t.Errorf("expected sidebar spinner hidden after background subagent completes")
+	}
+
+	win.activeShells["sh_bg_spin"] = opencode.ShellItem{
+		ID:        "sh_bg_spin",
+		SessionID: "ses_q",
+		Status:    "running",
+	}
+	win.updateShellStatus()
+	if !ind.spinner.Visible() {
+		t.Errorf("expected sidebar spinner visible while background shell is running")
+	}
+	if conv.thinkingLabel.Visible() {
+		t.Errorf("expected main thinkingLabel hidden when only background shell is running")
+	}
+	delete(win.activeShells, "sh_bg_spin")
+	win.updateShellStatus()
+	if ind.spinner.Visible() {
+		t.Errorf("expected sidebar spinner hidden after background shell completes")
+	}
+
+	p1 := &pendingPrompt{inboxID: "inb_1", text: "first", delivery: opencode.DeliveryQueue}
+	p2 := &pendingPrompt{inboxID: "inb_2", text: "second", delivery: opencode.DeliveryQueue}
+	p3 := &pendingPrompt{inboxID: "inb_3", text: "third", delivery: opencode.DeliveryQueue}
+	conv.pendingPrompts = []*pendingPrompt{p1, p2, p3}
+
+	// Dragging p3 onto p2 -> new order [p1, p3, p2]; firstChanged is index 1, so only suffix [p3, p2] is rewritten.
+	if !win.reorderPendingPrompt(conv, "inb_3", p2) {
+		t.Fatalf("expected reorderPendingPrompt(inb_3 -> p2) to succeed")
+	}
+	if len(conv.pendingPrompts) != 3 || conv.pendingPrompts[0] != p1 || conv.pendingPrompts[1] != p3 || conv.pendingPrompts[2] != p2 {
+		t.Fatalf("unexpected pendingPrompts order: [%s, %s, %s]", conv.pendingPrompts[0].text, conv.pendingPrompts[1].text, conv.pendingPrompts[2].text)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		done := len(admitted) == 2 && len(cancelled) == 2
+		mu.Unlock()
+		if done && !p3.rewriting && !p2.rewriting {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	gotAdmitted := slices.Clone(admitted)
+	gotCancelled := slices.Clone(cancelled)
+	mu.Unlock()
+
+	if len(gotAdmitted) != 2 || gotAdmitted[0].Text != "third" || gotAdmitted[1].Text != "second" {
+		t.Fatalf("expected suffix [third, second] to be re-admitted, got %+v", gotAdmitted)
+	}
+	for i, req := range gotAdmitted {
+		if req.Delivery != opencode.DeliveryQueue || req.Resume {
+			t.Errorf("admitted[%d]: expected Delivery=queue and Resume=false, got Delivery=%q Resume=%v", i, req.Delivery, req.Resume)
+		}
+	}
+	if !slices.Equal(gotCancelled, []string{"inb_3", "inb_2"}) {
+		t.Fatalf("expected replaced IDs [inb_3, inb_2] to be cancelled, got %v", gotCancelled)
+	}
+	if p1.inboxID != "inb_1" || p3.inboxID != "inb_11" || p2.inboxID != "inb_12" {
+		t.Fatalf("expected updated inboxIDs [inb_1, inb_11, inb_12], got [%s, %s, %s]", p1.inboxID, p3.inboxID, p2.inboxID)
+	}
+
+	// Simulate the server's SSE session.inbox.cancelled events for the replaced IDs; they must be ignored.
+	for _, oldID := range []string{"inb_3", "inb_2"} {
+		win.handleEvent(opencode.Event{
+			Type: "session.inbox.cancelled",
+			Data: json.RawMessage(fmt.Sprintf(`{"sessionID":"ses_q","inboxID":%q}`, oldID)),
+		})
+	}
+	if len(conv.pendingPrompts) != 3 {
+		t.Fatalf("expected ignored session.inbox.cancelled events not to remove reordered prompts, got len=%d", len(conv.pendingPrompts))
+	}
+
+	// Steered prompts cannot be reordered.
+	p2.delivery = opencode.DeliverySteer
+	if win.reorderPendingPrompt(conv, p2.inboxID, p1) {
+		t.Errorf("expected reorderPendingPrompt to reject steered source prompt")
+	}
+	if win.reorderPendingPrompt(conv, p1.inboxID, p2) {
+		t.Errorf("expected reorderPendingPrompt to reject steered target prompt")
+	}
+}
+
+func TestComposerInputHistory(t *testing.T) {
+	if !gtk.InitCheck() {
+		return
+	}
+	gtksource.Init()
+
+	stateFile := filepath.Join(t.TempDir(), "state.json")
+	buf := gtksource.NewBuffer(nil)
+	win := &Window{
+		statePath:   stateFile,
+		inputBuffer: buf,
+	}
+
+	// 1. Commit history entries (consecutive duplicates are deduplicated) and persist.
+	win.recordInputHistory("first prompt")
+	win.recordInputHistory("first prompt")
+	win.recordInputHistory("second\nmultiline\nprompt")
+	win.recordInputHistory("third prompt")
+	win.saveState()
+
+	if !slices.Equal(win.inputHistory, []string{"first prompt", "second\nmultiline\nprompt", "third prompt"}) {
+		t.Fatalf("unexpected inputHistory: %#v", win.inputHistory)
+	}
+
+	win2 := &Window{statePath: stateFile}
+	win2.loadState()
+	if !slices.Equal(win2.inputHistory, win.inputHistory) {
+		t.Fatalf("expected persisted inputHistory %#v, got %#v", win.inputHistory, win2.inputHistory)
+	}
+
+	// 2. Typing a live draft and pressing Up on the top line recalls "third prompt" and saves the draft.
+	buf.SetText("unsent draft")
+	_, end := buf.Bounds()
+	buf.PlaceCursor(end)
+
+	if !win.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatalf("expected Up on single-line draft to navigate history")
+	}
+	start, end := buf.Bounds()
+	if got := buf.Text(start, end, false); got != "third prompt" {
+		t.Fatalf("expected buffer 'third prompt', got %q", got)
+	}
+
+	// 3. Pressing Up again recalls the multiline entry and places cursor at the end (line 2).
+	if !win.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatalf("expected second Up to recall multiline prompt")
+	}
+	start, end = buf.Bounds()
+	if got := buf.Text(start, end, false); got != "second\nmultiline\nprompt" {
+		t.Fatalf("expected buffer 'second\\nmultiline\\nprompt', got %q", got)
+	}
+
+	// Because cursor is at the end (line 2, not top line 0), Up does NOT jump history yet.
+	if win.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatalf("expected Up on bottom line of multiline prompt to move cursor, not jump history")
+	}
+
+	// Move cursor to top line (line 0); now Down should NOT jump history, while Up jumps to "first prompt".
+	start, _ = buf.Bounds()
+	buf.PlaceCursor(start)
+	if win.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatalf("expected Down on top line of multiline prompt to move cursor, not jump history")
+	}
+	if !win.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatalf("expected Up on top line of multiline prompt to recall 'first prompt'")
+	}
+	start, end = buf.Bounds()
+	if got := buf.Text(start, end, false); got != "first prompt" {
+		t.Fatalf("expected buffer 'first prompt', got %q", got)
+	}
+
+	// 4. Pressing Down steps forward through history and restores "unsent draft" at the bottom.
+	if !win.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatalf("expected Down to step forward to 'second\\nmultiline\\nprompt'")
+	}
+	if !win.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatalf("expected Down at end of multiline prompt to step forward to 'third prompt'")
+	}
+	if !win.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatalf("expected Down from newest history item to restore draft")
+	}
+	start, end = buf.Bounds()
+	if got := buf.Text(start, end, false); got != "unsent draft" {
+		t.Fatalf("expected restored draft 'unsent draft', got %q", got)
+	}
+	if win.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatalf("expected Down at live draft to return false")
+	}
+
+	// 5. Verify Search Sessions sorts strictly by recency when search box is empty (even across large timestamp gaps).
+	pool := []opencode.Session{
+		{ID: "ses_old", Title: "Old Session", Time: opencode.SessionTime{Updated: 1_700_009_999_000}}, // %10000 = 9999 (used to sort first by mistake!)
+		{ID: "ses_mid", Title: "Mid Session", Time: opencode.SessionTime{Updated: 1_700_100_001_000}}, // %10000 = 1
+		{ID: "ses_new", Title: "New Session", Time: opencode.SessionTime{Updated: 1_700_200_000_000}}, // %10000 = 0
+		{ID: "ses_sub", Title: "Child Session", ParentID: "ses_new", Time: opencode.SessionTime{Updated: 1_700_300_000_000}},
+	}
+	matches := win.matchAndSortSessions(pool, "")
+	if len(matches) != 3 {
+		t.Fatalf("expected 3 non-child sessions, got %d", len(matches))
+	}
+	if matches[0].sess.ID != "ses_new" || matches[1].sess.ID != "ses_mid" || matches[2].sess.ID != "ses_old" {
+		t.Fatalf("expected recency order [ses_new, ses_mid, ses_old], got [%s, %s, %s]",
+			matches[0].sess.ID, matches[1].sess.ID, matches[2].sess.ID)
+	}
+}
+
+func TestReorderPendingPromptsInFlight(t *testing.T) {
+	if !gtk.InitCheck() {
+		return
+	}
+	gtksource.Init()
+
+	var mu sync.Mutex
+	var admitted []string
+	var cancelled []string
+	var steered []string
+	failPost := false
+	release := make(chan struct{})
+	seq := 10
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/session/ses_f/prompt":
+			<-release
+			var req opencode.PromptRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			fail := failPost && len(admitted) == 1
+			if fail {
+				mu.Unlock()
+				http.Error(w, "boom", http.StatusInternalServerError)
+				return
+			}
+			seq++
+			id := fmt.Sprintf("inb_%d", seq)
+			admitted = append(admitted, req.Text)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": opencode.InboxItem{ID: id, Type: "user", Delivery: req.Delivery}})
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/ses_f/inbox/"):
+			mu.Lock()
+			cancelled = append(cancelled, strings.TrimPrefix(r.URL.Path, "/api/session/ses_f/inbox/"))
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/session/ses_f/inbox/"):
+			mu.Lock()
+			steered = append(steered, strings.TrimPrefix(r.URL.Path, "/api/session/ses_f/inbox/"))
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	newFixture := func() (*Window, *convTimeline, []*pendingPrompt) {
+		win := &Window{
+			ctx:         t.Context(),
+			client:      &opencode.Client{BaseURL: srv.URL},
+			tabs:        make(map[string]*sessionTab),
+			inputBuffer: gtksource.NewBuffer(nil),
+		}
+		conv := &convTimeline{
+			session:          opencode.Session{ID: "ses_f"},
+			ignoredCancelIDs: make(map[string]bool),
+			loaded:           true,
+		}
+		win.tabs["ses_f"] = &sessionTab{main: conv}
+		ps := []*pendingPrompt{
+			{inboxID: "inb_1", text: "first", delivery: opencode.DeliveryQueue},
+			{inboxID: "inb_2", text: "second", delivery: opencode.DeliveryQueue},
+			{inboxID: "inb_3", text: "third", delivery: opencode.DeliveryQueue},
+		}
+		conv.pendingPrompts = slices.Clone(ps)
+		return win, conv, ps
+	}
+	waitFor := func(cond func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			glib.MainContextDefault().Iteration(false)
+			mu.Lock()
+			ok := cond()
+			mu.Unlock()
+			if ok {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for condition")
+	}
+
+	t.Run("success", func(t *testing.T) {
+		win, conv, ps := newFixture()
+		p1, p2, p3 := ps[0], ps[1], ps[2]
+		if !win.reorderPendingPrompt(conv, "inb_3", p1) { // -> [p3, p1, p2]
+			t.Fatalf("expected reorder to start")
+		}
+		if win.reorderPendingPrompt(conv, "inb_2", p3) {
+			t.Fatalf("expected a second reorder to be rejected while the first is in flight")
+		}
+		// The replacement's session.inbox.enqueued must not bind or spawn a card.
+		win.onInboxEnqueued(nil, conv, opencode.InboxEvent{InboxID: "inb_x", Item: &opencode.InboxItem{Type: "user", Payload: opencode.InboxPayload{Text: "first"}}})
+		if len(conv.pendingPrompts) != 3 || p1.inboxID != "inb_1" {
+			t.Fatalf("replacement enqueue was not swallowed: len=%d p1.inboxID=%q", len(conv.pendingPrompts), p1.inboxID)
+		}
+		win.steerPendingPrompt(conv, p1)
+		win.cancelPendingPrompt(conv, p2)
+		mu.Lock()
+		if len(steered) != 0 || len(cancelled) != 0 {
+			t.Fatalf("expected Steer/Cancel to be deferred while rewriting, got steered=%v cancelled=%v", steered, cancelled)
+		}
+		mu.Unlock()
+
+		close(release)
+		waitFor(func() bool { return len(admitted) == 3 && len(cancelled) == 4 && len(steered) == 1 })
+		mu.Lock()
+		defer mu.Unlock()
+		if !slices.Equal(admitted, []string{"third", "first", "second"}) {
+			t.Fatalf("admitted = %v", admitted)
+		}
+		// Originals inb_3, inb_1, inb_2 plus the replacement of cancelled p2 (inb_13).
+		if !slices.Equal(cancelled, []string{"inb_3", "inb_1", "inb_2", "inb_13"}) {
+			t.Fatalf("cancelled = %v", cancelled)
+		}
+		if p1.inboxID != "inb_12" || !slices.Equal(steered, []string{"inb_12"}) {
+			t.Fatalf("expected deferred Steer replayed on replacement inb_12, got p1.inboxID=%q steered=%v", p1.inboxID, steered)
+		}
+		if p3.inboxID != "inb_11" || p3.rewriting || p1.rewriting {
+			t.Fatalf("unexpected p3 state: inboxID=%q rewriting=%v", p3.inboxID, p3.rewriting)
+		}
+	})
+
+	t.Run("failure restores order", func(t *testing.T) {
+		mu.Lock()
+		admitted, cancelled, steered = nil, nil, nil
+		failPost = true
+		mu.Unlock()
+		win, conv, ps := newFixture()
+		p1, p2, p3 := ps[0], ps[1], ps[2]
+		if !win.reorderPendingPrompt(conv, "inb_3", p1) { // -> [p3, p1, p2], second POST fails
+			t.Fatalf("expected reorder to start")
+		}
+		waitFor(func() bool { return len(cancelled) == 1 && !p3.rewriting })
+		if !slices.Equal(conv.pendingPrompts, []*pendingPrompt{p1, p2, p3}) {
+			t.Fatalf("expected order restored to [first, second, third], got [%s, %s, %s]",
+				conv.pendingPrompts[0].text, conv.pendingPrompts[1].text, conv.pendingPrompts[2].text)
+		}
+		if p1.inboxID != "inb_1" || p2.inboxID != "inb_2" || p3.inboxID != "inb_3" {
+			t.Fatalf("expected original inbox IDs kept, got %q %q %q", p1.inboxID, p2.inboxID, p3.inboxID)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if len(admitted) != 1 || cancelled[0] != fmt.Sprintf("inb_%d", seq) {
+			t.Fatalf("expected the one admitted replacement to be withdrawn, admitted=%v cancelled=%v", admitted, cancelled)
+		}
+	})
+}
+
+func TestRefreshShellsCompletesStaleWidgets(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+	tests := []struct {
+		name         string
+		fail         bool
+		wantLoaded   bool
+		wantDeadDone bool
+	}{
+		{name: "listing succeeds", wantLoaded: true, wantDeadDone: true},
+		{name: "listing fails", fail: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			release := make(chan struct{})
+			var served atomic.Bool
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				<-release
+				defer served.Store(true)
+				if tt.fail {
+					http.Error(w, "boom", http.StatusInternalServerError)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"data": []opencode.ShellItem{{ID: "sh_live", Status: "running"}}})
+			}))
+			defer srv.Close()
+
+			win := &Window{
+				ctx:               t.Context(),
+				client:            &opencode.Client{BaseURL: srv.URL},
+				viewStack:         adw.NewViewStack(),
+				activeShells:      map[string]opencode.ShellItem{"sh_dead": {ID: "sh_dead"}, "sh_live": {ID: "sh_live"}},
+				shellOutputs:      make(map[string]string),
+				shellOutputLabels: make(map[string]*gtk.Label),
+				tabs:              make(map[string]*sessionTab),
+				childToRoot:       make(map[string]string),
+			}
+			tab := win.addSessionTab(opencode.Session{ID: "ses_1"})
+			bgTool := func(id, shellID string) *ToolWidget {
+				out := gtk.NewTextView()
+				tw := &ToolWidget{
+					Box: gtk.NewBox(gtk.OrientationVertical, 0), ctx: t.Context(),
+					toolIcon: gtk.NewImage(), titleLabel: gtk.NewLabel(""), subtitleLabel: gtk.NewLabel(""),
+					badgesBox: gtk.NewBox(gtk.OrientationHorizontal, 0), actionBtn: gtk.NewButton(),
+					spinner: adw.NewSpinner(), statusLabel: gtk.NewLabel(""),
+					outputScroll: gtk.NewScrolledWindow(), outputView: out, outputBuf: out.Buffer(),
+					toolID: id, toolName: "shell",
+				}
+				tw.isBackground, tw.metaStatus, tw.shellID = true, "running", shellID
+				return tw
+			}
+			tools := map[string]*ToolWidget{"t_dead": bgTool("t_dead", "sh_dead"), "t_live": bgTool("t_live", "sh_live")}
+			tab.main.assistantMap["m1"] = &AssistantMessageWidget{tools: tools}
+
+			win.refreshShells()
+			// A shell started while the listing is in flight must survive it.
+			tools["t_new"] = bgTool("t_new", "sh_new")
+			win.handleEvent(opencode.Event{Type: "shell.created", Data: json.RawMessage(`{"info":{"id":"sh_new","status":"running"}}`)})
+			close(release)
+
+			deadline := time.Now().Add(3 * time.Second)
+			for !served.Load() || glib.MainContextDefault().Pending() {
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for refreshShells")
+				}
+				glib.MainContextDefault().Iteration(false)
+				time.Sleep(5 * time.Millisecond)
+			}
+
+			if win.shellsLoaded != tt.wantLoaded {
+				t.Errorf("shellsLoaded = %v, want %v", win.shellsLoaded, tt.wantLoaded)
+			}
+			if done := !tools["t_dead"].IsBackgroundRunning(); done != tt.wantDeadDone {
+				t.Errorf("stale widget completed = %v, want %v", done, tt.wantDeadDone)
+			}
+			if !tools["t_live"].IsBackgroundRunning() || !tools["t_new"].IsBackgroundRunning() {
+				t.Errorf("listed or in-flight shell widgets must stay running")
+			}
+			if _, ok := win.activeShells["sh_new"]; !ok {
+				t.Errorf("shell created during refresh was dropped: %v", win.activeShells)
+			}
+			if _, ok := win.activeShells["sh_dead"]; ok == tt.wantLoaded {
+				t.Errorf("sh_dead in activeShells = %v after listing (fail=%v)", ok, tt.fail)
+			}
+		})
+	}
+}
+
+func TestContextSessionIDAndMarkdownSessionResolution(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	win := &Window{
+		ctx:                   t.Context(),
+		viewStack:             adw.NewViewStack(),
+		contextSectionBox:     gtk.NewBox(gtk.OrientationVertical, 0),
+		contextSessionIDBox:   gtk.NewBox(gtk.OrientationHorizontal, 0),
+		contextSessionIDLabel: gtk.NewLabel(""),
+		copySessionIDBtn:      gtk.NewButton(),
+		contextInfoGrid:       gtk.NewGrid(),
+		tabs:                  make(map[string]*sessionTab),
+		childToRoot:           make(map[string]string),
+		modelNames:            make(map[string]string),
+		modelLimits:           make(map[string]int),
+		expandedProjects:      make(map[string]bool),
+		collapsedProjects:     make(map[string]bool),
+		archivedSessions:      make(map[string]bool),
+		projectSessions:       make(map[string][]opencode.Session),
+		resolvedSessionTitles: make(map[string]string),
+		resolvingSessions:     make(map[string][]func(string)),
+	}
+
+	tab1 := win.addSessionTab(opencode.Session{
+		ID:    "ses_abc1234567890",
+		Title: "First Conversation",
+	})
+	tab2 := win.addSessionTab(opencode.Session{
+		ID:    "ses_def0987654321",
+		Title: "Second Conversation",
+	})
+	_ = tab2
+
+	win.rebuildContextInfo(tab1)
+	if got := win.contextSessionIDLabel.Text(); got != "ses_abc1234567890" {
+		t.Errorf("contextSessionIDLabel.Text() = %q, want ses_abc1234567890", got)
+	}
+	if !win.contextSessionIDBox.Visible() {
+		t.Errorf("expected contextSessionIDBox to be visible")
+	}
+
+	if got := win.resolveSessionTitleAsync("ses_def0987654321", nil); got != "Second Conversation" {
+		t.Errorf("resolveSessionTitleAsync() = %q, want Second Conversation", got)
+	}
+
+	win.viewStack.SetVisibleChildName("ses_abc1234567890")
+	if !win.handleMarkdownLink("opencode://session/ses_def0987654321") {
+		t.Errorf("expected handleMarkdownLink to handle opencode://session/ link")
+	}
+	if got := win.viewStack.VisibleChildName(); got != "ses_def0987654321" {
+		t.Errorf("VisibleChildName() after clicking session link = %q, want ses_def0987654321", got)
+	}
+}
+
+func TestStartFromScratchDefaultVisibility(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	sessions := []opencode.Session{
+		{
+			ID:       "ses_inactive_1",
+			Title:    "Old Conversation 1",
+			Location: opencode.Location{Directory: "/home/diamond/proj"},
+			Time:     opencode.SessionTime{Updated: 1000},
+		},
+		{
+			ID:       "ses_active_1",
+			Title:    "Running Conversation",
+			Location: opencode.Location{Directory: "/home/diamond/proj"},
+			Time:     opencode.SessionTime{Updated: 2000},
+		},
+		{
+			ID:       "ses_inactive_2",
+			Title:    "Old Conversation 2",
+			Location: opencode.Location{Directory: "/home/diamond/proj"},
+			Time:     opencode.SessionTime{Updated: 3000},
+		},
+	}
+	active := map[string]opencode.ActiveStatus{
+		"ses_active_1": {Type: "busy"},
+	}
+
+	win1 := &Window{
+		ctx:               t.Context(),
+		statePath:         stateFile,
+		viewStack:         adw.NewViewStack(),
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+		expandedProjects:  make(map[string]bool),
+		collapsedProjects: make(map[string]bool),
+		visibleSessions:   make(map[string]bool),
+		archivedSessions:  make(map[string]bool),
+		projectSessions:   make(map[string][]opencode.Session),
+		allSessions:       sessions,
+	}
+	win1.loadState()
+	win1.populateSessionTabs(sessions, active)
+
+	if !slices.Equal(win1.tabOrder, []string{"ses_active_1"}) {
+		t.Fatalf("initial tabOrder = %v, want [ses_active_1] (inactive conversations hidden by default)", win1.tabOrder)
+	}
+
+	// Explicitly opening an inactive session reveals it and persists it across restarts.
+	win1.selectSession(sessions[2])
+	if !slices.Equal(win1.tabOrder, []string{"ses_inactive_2", "ses_active_1"}) {
+		t.Fatalf("tabOrder after selectSession = %v, want [ses_inactive_2 ses_active_1]", win1.tabOrder)
+	}
+
+	// Simulate app restart when no sessions are actively running anymore.
+	win2 := &Window{
+		ctx:               t.Context(),
+		statePath:         stateFile,
+		viewStack:         adw.NewViewStack(),
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+		expandedProjects:  make(map[string]bool),
+		collapsedProjects: make(map[string]bool),
+		visibleSessions:   make(map[string]bool),
+		archivedSessions:  make(map[string]bool),
+		projectSessions:   make(map[string][]opencode.Session),
+		allSessions:       sessions,
+	}
+	win2.loadState()
+	win2.populateSessionTabs(sessions, nil)
+
+	if !slices.Equal(win2.tabOrder, []string{"ses_inactive_2", "ses_active_1"}) {
+		t.Fatalf("tabOrder after restart = %v, want [ses_inactive_2 ses_active_1] (ses_inactive_1 remains hidden)", win2.tabOrder)
+	}
+}
+
+func TestThinkingIndicatorAboveQueuedMessages(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	// Widgets are hand-built: NewUserMessageWidget trips checkptr under -race.
+	box := gtk.NewBox(gtk.OrientationVertical, 0)
+	history := gtk.NewLabel("history")
+	prompt := func(id string, delivery opencode.InboxDelivery) *pendingPrompt {
+		return &pendingPrompt{
+			inboxID:  id,
+			delivery: delivery,
+			attached: true,
+			widget:   &UserMessageWidget{Box: gtk.NewBox(gtk.OrientationVertical, 0)},
+		}
+	}
+	queued1 := prompt("inb_q1", opencode.DeliveryQueue)
+	steered := prompt("inb_steer", opencode.DeliverySteer)
+	queued2 := prompt("inb_q2", opencode.DeliveryQueue)
+	conv := &convTimeline{
+		timelineBox:      box,
+		thinkingLabel:    gtk.NewLabel("Thinking..."),
+		thinkingAttached: true,
+		revertBanner:     &RevertBannerWidget{Box: gtk.NewBox(gtk.OrientationHorizontal, 0)},
+		pendingPrompts:   []*pendingPrompt{queued1, steered, queued2},
+		active:           true,
+	}
+	// Start from a scrambled order to prove keepPendingAtBottom reorders.
+	box.Append(conv.revertBanner)
+	box.Append(queued2.widget)
+	box.Append(conv.thinkingLabel)
+	box.Append(history)
+	box.Append(queued1.widget)
+	box.Append(steered.widget)
+
+	conv.keepPendingAtBottom()
+
+	names := map[uintptr]string{
+		history.Object.Native():            "history",
+		steered.widget.Object.Native():     "steered",
+		conv.thinkingLabel.Object.Native(): "thinking",
+		queued1.widget.Object.Native():     "queued1",
+		queued2.widget.Object.Native():     "queued2",
+		conv.revertBanner.Object.Native():  "revert",
+	}
+	// ObserveChildren items avoid marshalling *gtk.Box siblings (checkptr-safe).
+	children := box.ObserveChildren()
+	var order []string
+	for i := range children.NItems() {
+		order = append(order, names[children.Item(i).Native()])
+	}
+
+	want := []string{"history", "steered", "thinking", "queued1", "queued2", "revert"}
+	if !slices.Equal(order, want) {
+		t.Fatalf("timeline order = %v, want %v", order, want)
+	}
+	if !conv.thinkingLabel.Visible() {
+		t.Error("thinking label hidden while conversation is active")
+	}
+}
+
+func TestSidebarResizePersistence(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	win1 := &Window{
+		ctx:         t.Context(),
+		statePath:   stateFile,
+		rootContent: adw.NewOverlaySplitView(),
+	}
+	win1.loadState()
+	win1.setDesktopSidebarWidth(380)
+	win1.saveState()
+
+	if got := int(win1.rootContent.MaxSidebarWidth()); got != 380 {
+		t.Fatalf("MaxSidebarWidth() = %d, want 380", got)
+	}
+
+	// Simulate app restart and verify sidebar width is restored on desktop and reset when collapsed.
+	win2 := &Window{
+		ctx:         t.Context(),
+		statePath:   stateFile,
+		rootContent: adw.NewOverlaySplitView(),
+	}
+	win2.loadState()
+	if win2.sidebarWidth != 380 {
+		t.Fatalf("restored sidebarWidth = %d, want 380", win2.sidebarWidth)
+	}
+	if got := int(win2.rootContent.MaxSidebarWidth()); got != 380 {
+		t.Fatalf("restored MaxSidebarWidth() = %d, want 380", got)
+	}
+
+	win2.rootContent.SetCollapsed(true)
+	win2.syncNavigationChrome()
+	if got := int(win2.rootContent.MaxSidebarWidth()); got != 300 {
+		t.Fatalf("collapsed MaxSidebarWidth() = %d, want 300", got)
+	}
+	win2.rootContent.SetCollapsed(false)
+	win2.syncNavigationChrome()
+	if got := int(win2.rootContent.MaxSidebarWidth()); got != 380 {
+		t.Fatalf("uncollapsed MaxSidebarWidth() = %d, want 380", got)
+	}
+}
+
+func TestGreeterVisibilityAndPersonalizedGeneration(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+	gtksource.Init()
+
+	var (
+		mu        sync.Mutex
+		gotPrompt string
+		gotModel  opencode.ModelRef
+		genCalls  int
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/api/experimental/generate/text" {
+			var body struct {
+				Prompt string            `json:"prompt"`
+				Model  opencode.ModelRef `json:"model"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			genCalls++
+			gotPrompt = body.Prompt
+			gotModel = body.Model
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"data":{"text":"{\"userName\":\"diamond\",\"pronouns\":\"it/its (3rd person)\",\"tone\":\"friendly, informal, feminine, direct\",\"title\":\"What is diamond building today?\",\"subtitle\":\"Ask a question, explore the repo, or let's dive into diamond's code together.\"}"}}`))
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	defer srv.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	win := &Window{
+		ctx:         t.Context(),
+		statePath:   stateFile,
+		client:      &opencode.Client{BaseURL: srv.URL},
+		viewStack:   adw.NewViewStack(),
+		inputBuffer: gtksource.NewBuffer(nil),
+		tabs:        make(map[string]*sessionTab),
+		childToRoot: make(map[string]string),
+		agents: []opencode.Agent{
+			{
+				ID:     "build",
+				Name:   "build",
+				Mode:   "primary",
+				System: "You are providing code help for diamond. Always refer to diamond in the third person using it/its pronouns.",
+			},
+		},
+		models: []opencode.ModelInfo{
+			{ProviderID: "cloudflare-workers-ai", ID: "@cf/zai-org/glm-5.3-flash"},
+		},
+	}
+	win.loadState()
+
+	tab := win.addSessionTab(opencode.Session{ID: "ses_empty", Title: "Untitled Session"})
+	tab.main.updateGreeterVisibility()
+	if tab.main.greeter == nil || tab.main.greeter.Visible() {
+		t.Fatalf("expected greeter hidden while conversation history is not loaded")
+	}
+	tab.main.loaded = true
+	tab.main.updateGreeterVisibility()
+	if !tab.main.greeter.Visible() {
+		t.Fatalf("expected greeter to be visible on empty conversation")
+	}
+	if got := tab.main.greeter.titleLabel.Label(); got != defaultGreeterTitle {
+		t.Fatalf("initial greeter title = %q, want %q", got, defaultGreeterTitle)
+	}
+
+	// Trigger lightweight model generation to read the system prompt and persist personalized greeting.
+	win.refreshGreeterProfileAsync()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		if win.greeterProfile != nil && !win.greeterRefreshing {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	calls := genCalls
+	modelUsed := gotModel
+	promptUsed := gotPrompt
+	mu.Unlock()
+
+	if calls != 1 {
+		t.Fatalf("expected 1 generate/text call, got %d", calls)
+	}
+	if modelUsed.ProviderID != "cloudflare-workers-ai" || modelUsed.ID != "@cf/zai-org/glm-5.3-flash" {
+		t.Fatalf("expected lightweight model cloudflare-workers-ai/@cf/zai-org/glm-5.3-flash, got %+v", modelUsed)
+	}
+	if !strings.Contains(promptUsed, "Always refer to diamond in the third person") {
+		t.Fatalf("expected system prompt excerpt in generate/text prompt, got %q", promptUsed)
+	}
+	if got := tab.main.greeter.titleLabel.Label(); got != "What is diamond building today?" {
+		t.Fatalf("personalized greeter title = %q, want 'What is diamond building today?'", got)
+	}
+
+	// Calling refreshGreeterProfileAsync again with the same system prompt hash must be a no-op (cached).
+	win.refreshGreeterProfileAsync()
+	mu.Lock()
+	callsAfter := genCalls
+	mu.Unlock()
+	if callsAfter != 1 {
+		t.Fatalf("expected cached greeter profile to skip second LLM call, got %d calls", callsAfter)
+	}
+
+	// Verify greeter hides as soon as conversation becomes active or has messages, and reappears if cleared.
+	tab.main.active = true
+	tab.main.keepPendingAtBottom()
+	if tab.main.greeter.Visible() {
+		t.Fatalf("expected greeter to hide when conversation is active")
+	}
+	tab.main.active = false
+	tab.main.messages = []opencode.Message{{ID: "m1", Type: "user", Text: "hi"}}
+	tab.main.keepPendingAtBottom()
+	if tab.main.greeter.Visible() {
+		t.Fatalf("expected greeter to stay hidden when conversation has messages")
+	}
+	tab.main.messages = nil
+	tab.main.keepPendingAtBottom()
+	if !tab.main.greeter.Visible() {
+		t.Fatalf("expected greeter to reappear when conversation is empty again")
+	}
+
+	// Verify personalized greeter profile persists across restarts.
+	win2 := &Window{
+		ctx:       t.Context(),
+		statePath: stateFile,
+		viewStack: adw.NewViewStack(),
+		tabs:      make(map[string]*sessionTab),
+	}
+	win2.loadState()
+	if win2.greeterProfile == nil || win2.greeterProfile.UserName != "diamond" || win2.greeterProfile.Title != "What is diamond building today?" {
+		t.Fatalf("expected persisted greeterProfile after reload, got %+v", win2.greeterProfile)
+	}
+}
+
+func TestEmptyWindowGreeterSessionPersistenceAndOfflineScreen(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	rootContent := adw.NewOverlaySplitView()
+	contentMainBox := gtk.NewBox(gtk.OrientationVertical, 0)
+	viewStackOverlay := gtk.NewOverlay()
+	viewStack := adw.NewViewStack()
+	viewStackOverlay.SetChild(viewStack)
+	contentMainBox.Append(viewStackOverlay)
+
+	win := &Window{
+		ctx:              t.Context(),
+		statePath:        stateFile,
+		rootContent:      rootContent,
+		contentMainBox:   contentMainBox,
+		viewStackOverlay: viewStackOverlay,
+		viewStack:        viewStack,
+		tabs:             make(map[string]*sessionTab),
+		childToRoot:      make(map[string]string),
+		projectOrder:     []string{"/home/diamond/proj"},
+	}
+	win.emptyGreeter = NewGreeterWidget(win.greeterProfile, win.populateComposerSuggestion)
+	win.contentMainBox.Prepend(win.emptyGreeter)
+	win.initOfflineScreen()
+	win.syncEmptyGreeterVisibility()
+
+	// 1. When 0 sessions are open, emptyGreeter is visible and viewStackOverlay / viewStack are hidden.
+	if !win.emptyGreeter.Visible() {
+		t.Fatalf("expected emptyGreeter to be visible when no session is selected")
+	}
+	if win.viewStackOverlay.Visible() || win.viewStack.Visible() {
+		t.Fatalf("expected viewStackOverlay and viewStack to be hidden when no session is selected")
+	}
+
+	// 2. Opening a session in an already-known project directory persists visibleSessions to disk
+	// and hides emptyGreeter while showing viewStackOverlay / viewStack.
+	sess := opencode.Session{
+		ID:       "ses_persisted_1",
+		Title:    "Persisted Session",
+		Location: opencode.Location{Directory: "/home/diamond/proj"},
+		Time:     opencode.SessionTime{Updated: 1000},
+	}
+	win.ensureSessionTab(sess)
+	win.viewStack.SetVisibleChildName(sess.ID)
+	win.onVisibleTabChanged()
+
+	if win.emptyGreeter.Visible() {
+		t.Fatalf("expected emptyGreeter to hide once a session tab is selected")
+	}
+	if !win.viewStackOverlay.Visible() || !win.viewStack.Visible() {
+		t.Fatalf("expected viewStackOverlay and viewStack to be visible once a session tab is selected")
+	}
+
+	reloaded := loadPersistedState(stateFile)
+	if !reloaded.VisibleSessions["ses_persisted_1"] {
+		t.Fatalf("expected ses_persisted_1 to be persisted in visibleSessions even when projectDir was already in projectOrder, got %+v", reloaded.VisibleSessions)
+	}
+
+	// 3. Offline error screen transitions windowStack to "offline" and back to "main" on recovery.
+	win.client = &opencode.Client{BaseURL: "http://127.0.0.1:4096"}
+	if got := win.windowStack.VisibleChildName(); got != "main" {
+		t.Fatalf("initial windowStack visible child = %q, want main", got)
+	}
+	win.setOfflineError(errors.New("dial tcp 127.0.0.1:4096: connect: connection refused"))
+	if !win.offline {
+		t.Fatalf("expected win.offline = true after setOfflineError")
+	}
+	if got := win.windowStack.VisibleChildName(); got != "offline" {
+		t.Fatalf("windowStack visible child = %q, want offline", got)
+	}
+	if !strings.Contains(win.offlineStatus.Description(), "http://127.0.0.1:4096") {
+		t.Fatalf("expected offlineStatus description to include server URL, got %q", win.offlineStatus.Description())
+	}
+	if !strings.Contains(win.offlineErrorLabel.Label(), "connection refused") || !win.offlineErrorLabel.Visible() {
+		t.Fatalf("expected offlineErrorLabel to be visible with connection error, got %q (visible=%v)", win.offlineErrorLabel.Label(), win.offlineErrorLabel.Visible())
+	}
+
+	win.setOfflineError(nil)
+	if win.offline {
+		t.Fatalf("expected win.offline = false after clearing error")
+	}
+	if got := win.windowStack.VisibleChildName(); got != "main" {
+		t.Fatalf("windowStack visible child after recovery = %q, want main", got)
+	}
+
+	// 4. Session search marks active sessions (direct busy, activeMap, running child subagent, or background shell).
+	win.activeShells = map[string]opencode.ShellItem{
+		"sh_bg_1": {ID: "sh_bg_1", SessionID: "ses_shell_active", Status: "running"},
+	}
+	searchPool := []opencode.Session{
+		{ID: "ses_idle", Title: "Idle Session", Time: opencode.SessionTime{Updated: 4000}},
+		{ID: "ses_map_active", Title: "Active Map Session", Time: opencode.SessionTime{Updated: 3000}},
+		{ID: "ses_parent_active", Title: "Parent With Busy Child", Time: opencode.SessionTime{Updated: 2000}},
+		{ID: "ses_child_1", ParentID: "ses_parent_active", Time: opencode.SessionTime{Busy: 500, Idle: 100}},
+		{ID: "ses_shell_active", Title: "Shell Active Session", Time: opencode.SessionTime{Updated: 1000}},
+	}
+	matches := win.matchAndSortSessionsWithActive(searchPool, "", map[string]opencode.ActiveStatus{
+		"ses_map_active": {Type: "busy"},
+	})
+	if len(matches) != 4 {
+		t.Fatalf("len(matches) = %d, want 4 root sessions", len(matches))
+	}
+	wantActive := map[string]bool{
+		"ses_idle":          false,
+		"ses_map_active":    true,
+		"ses_parent_active": true,
+		"ses_shell_active":  true,
+	}
+	for _, m := range matches {
+		if m.active != wantActive[m.sess.ID] {
+			t.Errorf("session %s active = %v, want %v", m.sess.ID, m.active, wantActive[m.sess.ID])
+		}
+	}
+
+	// 5. Window manager title formats session title and attention count with an en-dash.
+	if got := formatWindowManagerTitle("", 0); got != "gluppencode" {
+		t.Errorf("formatWindowManagerTitle(\"\", 0) = %q, want %q", got, "gluppencode")
+	}
+	if got := formatWindowManagerTitle("GTK 4 frontend for Opencode in gotk4", 0); got != "GTK 4 frontend for Opencode in gotk4 – gluppencode" {
+		t.Errorf("formatWindowManagerTitle(title, 0) = %q, want %q", got, "GTK 4 frontend for Opencode in gotk4 – gluppencode")
+	}
+	if got := formatWindowManagerTitle("GTK 4 frontend for Opencode in gotk4", 3); got != "(3) GTK 4 frontend for Opencode in gotk4 – gluppencode" {
+		t.Errorf("formatWindowManagerTitle(title, 3) = %q, want %q", got, "(3) GTK 4 frontend for Opencode in gotk4 – gluppencode")
+	}
+	if got := formatWindowManagerTitle("", 2); got != "(2) gluppencode" {
+		t.Errorf("formatWindowManagerTitle(\"\", 2) = %q, want %q", got, "(2) gluppencode")
+	}
+}
+
+func TestArchiveSessionAndProjectDoesNotStopRunningSession(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var (
+		mu             sync.Mutex
+		interruptCalls int
+		repliedForms   = make(map[string]map[string]any)
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/interrupt"):
+			mu.Lock()
+			interruptCalls++
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+		case strings.Contains(r.URL.Path, "/form/") && strings.HasSuffix(r.URL.Path, "/reply"):
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			formID := parts[len(parts)-2]
+			var body struct {
+				Answer map[string]any `json:"answer"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			repliedForms[formID] = body.Answer
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:              t.Context(),
+		statePath:        stateFile,
+		client:           &opencode.Client{BaseURL: srv.URL},
+		viewStack:        vs,
+		tabs:             make(map[string]*sessionTab),
+		childToRoot:      make(map[string]string),
+		visibleSessions:  make(map[string]bool),
+		archivedSessions: make(map[string]bool),
+		projectSessions:  make(map[string][]opencode.Session),
+		projectOrder:     []string{"/home/diamond/proj1", "/home/diamond/proj2"},
+		takeCharge:       true,
+	}
+
+	s1 := opencode.Session{
+		ID:       "ses_active_1",
+		Title:    "Running Task 1",
+		Location: opencode.Location{Directory: "/home/diamond/proj1"},
+		Time:     opencode.SessionTime{Updated: 1000, Busy: 1000, Idle: 500},
+	}
+	s2 := opencode.Session{
+		ID:       "ses_active_2",
+		Title:    "Running Task 2",
+		Location: opencode.Location{Directory: "/home/diamond/proj2"},
+		Time:     opencode.SessionTime{Updated: 2000, Busy: 2000, Idle: 500},
+	}
+	win.allSessions = []opencode.Session{s1, s2}
+	win.projectSessions["/home/diamond/proj1"] = []opencode.Session{s1}
+	win.projectSessions["/home/diamond/proj2"] = []opencode.Session{s2}
+	win.ensureSessionTab(s1)
+	win.ensureSessionTab(s2)
+	win.setConvActive("ses_active_1", true)
+	win.setConvActive("ses_active_2", true)
+
+	// 1. Archive individual running session ("x" on chat row).
+	win.archiveSession("ses_active_1")
+	if !win.archivedSessions["ses_active_1"] {
+		t.Fatalf("expected ses_active_1 to be marked archived")
+	}
+	if _, exists := win.tabs["ses_active_1"]; exists {
+		t.Fatalf("expected ses_active_1 tab to be removed from sidebar")
+	}
+
+	// 2. Archive entire project with running session ("x" on project header).
+	win.clearProjectSessions("/home/diamond/proj2")
+	if !win.archivedSessions["ses_active_2"] {
+		t.Fatalf("expected ses_active_2 to be marked archived when project is cleared")
+	}
+	if _, exists := win.tabs["ses_active_2"]; exists {
+		t.Fatalf("expected ses_active_2 tab to be removed from sidebar")
+	}
+
+	mu.Lock()
+	gotInterrupts := interruptCalls
+	mu.Unlock()
+	if gotInterrupts != 0 {
+		t.Fatalf("archiving session or project must NOT interrupt running sessions, got %d interrupt calls", gotInterrupts)
+	}
+
+	// 3. Background SSE events for archived sessions must NOT re-open tabs,
+	// must keep allSessions activity state updated for Search Sessions,
+	// and must still auto-reply to forms when Take Charge is enabled.
+	win.handleEvent(opencode.Event{
+		Type: "session.status",
+		Data: json.RawMessage(`{"sessionID":"ses_active_1","status":{"type":"busy"}}`),
+	})
+	if _, exists := win.tabs["ses_active_1"]; exists {
+		t.Fatalf("expected archived ses_active_1 to stay hidden on session.status busy")
+	}
+	matches := win.matchAndSortSessionsWithActive(win.allSessions, "Running Task 1", nil)
+	if len(matches) != 1 || !matches[0].active {
+		t.Fatalf("expected archived ses_active_1 to still appear as active in Search Sessions, got %+v", matches)
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "form.created",
+		Data: json.RawMessage(`{"form":{"id":"frm_archived","sessionID":"ses_active_1","title":"Confirm","fields":[{"key":"q0","title":"Proceed?","type":"string"}]}}`),
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		_, ok := repliedForms["frm_archived"]
+		mu.Unlock()
+		if ok && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	ans, ok := repliedForms["frm_archived"]
+	mu.Unlock()
+	if !ok || ans["q0"] != TakeChargeDirective {
+		t.Fatalf("expected Take Charge to auto-reply to form in archived session ses_active_1, got %v", ans)
+	}
+
+	// 4. When the archived session finishes in the background, its status in allSessions transitions to idle.
+	win.handleEvent(opencode.Event{
+		Type: "session.idle",
+		Data: json.RawMessage(`{"sessionID":"ses_active_1"}`),
+	})
+	matchesAfter := win.matchAndSortSessionsWithActive(win.allSessions, "Running Task 1", nil)
+	if len(matchesAfter) != 1 || matchesAfter[0].active {
+		t.Fatalf("expected archived ses_active_1 to become idle in Search Sessions after session.idle, got %+v", matchesAfter)
+	}
+}
+
+func TestCdCommandAndSessionMoved(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	// 1. Test builtinSlashCommands includes "/cd".
+	hasCd := false
+	for _, b := range builtinSlashCommands {
+		if b.name == "/cd" {
+			hasCd = true
+			break
+		}
+	}
+	if !hasCd {
+		t.Fatalf("expected builtinSlashCommands to include '/cd', got %+v", builtinSlashCommands)
+	}
+
+	// 2. Test resolveTargetDirectory with relative paths, ~, and absolute paths.
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		if got := resolveTargetDirectory("/tmp", "~/subproject"); got != normalizeProjectDir(filepath.Join(home, "subproject")) {
+			t.Fatalf("resolveTargetDirectory('~/subproject') = %q, want %q", got, normalizeProjectDir(filepath.Join(home, "subproject")))
+		}
+	}
+	baseDir := t.TempDir()
+	subDir := filepath.Join(baseDir, "nested")
+	if err := os.MkdirAll(subDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveTargetDirectory(baseDir, "nested"); got != normalizeProjectDir(subDir) {
+		t.Fatalf("resolveTargetDirectory(baseDir, 'nested') = %q, want %q", got, normalizeProjectDir(subDir))
+	}
+
+	// 3. Test /cd moving an active session via API and updating project grouping on session.moved.
+	var (
+		mu       sync.Mutex
+		movedID  string
+		movedDir string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/move") {
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			sessID := parts[len(parts)-2]
+			var body struct {
+				Directory string `json:"directory"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			movedID = sessID
+			movedDir = body.Directory
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	dirA := normalizeProjectDir(baseDir)
+	dirB := normalizeProjectDir(subDir)
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:             t.Context(),
+		client:          &opencode.Client{BaseURL: srv.URL},
+		viewStack:       vs,
+		tabs:            make(map[string]*sessionTab),
+		childToRoot:     make(map[string]string),
+		visibleSessions: make(map[string]bool),
+		projectSessions: make(map[string][]opencode.Session),
+		projectOrder:    []string{dirA},
+	}
+
+	sess := opencode.Session{
+		ID:       "ses_move_1",
+		Title:    "Movable Session",
+		Location: opencode.Location{Directory: dirA},
+		Time:     opencode.SessionTime{Updated: 1000},
+	}
+	win.allSessions = []opencode.Session{sess}
+	win.projectSessions[dirA] = []opencode.Session{sess}
+	tab := win.ensureSessionTab(sess)
+	vs.SetVisibleChildName(sess.ID)
+
+	win.changeSessionDirectory(tab, tab.main, "nested")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		done := movedID != ""
+		mu.Unlock()
+		if done && tab.main.session.Location.Directory == dirB && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	gotID, gotDir := movedID, movedDir
+	mu.Unlock()
+	if gotID != "ses_move_1" || gotDir != dirB {
+		t.Fatalf("expected MoveSession('ses_move_1', %q), got (%q, %q)", dirB, gotID, gotDir)
+	}
+	if tab.main.session.Location.Directory != dirB {
+		t.Fatalf("tab session directory = %q, want %q", tab.main.session.Location.Directory, dirB)
+	}
+	if len(win.projectSessions[dirA]) != 0 {
+		t.Fatalf("expected dirA projectSessions to be empty after move, got %+v", win.projectSessions[dirA])
+	}
+	if len(win.projectSessions[dirB]) != 1 || win.projectSessions[dirB][0].ID != "ses_move_1" {
+		t.Fatalf("expected dirB projectSessions to contain ses_move_1, got %+v", win.projectSessions[dirB])
+	}
+}
+
+func TestPreferencesPersistenceAndLiveApply(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	vs := adw.NewViewStack()
+	composerClamp := adw.NewClamp()
+	sendBtn := gtk.NewButton()
+
+	win := &Window{
+		ctx:             t.Context(),
+		statePath:       stateFile,
+		viewStack:       vs,
+		composerClamp:   composerClamp,
+		sendBtn:         sendBtn,
+		tabs:            make(map[string]*sessionTab),
+		childToRoot:     make(map[string]string),
+		visibleSessions: make(map[string]bool),
+		projectSessions: make(map[string][]opencode.Session),
+		shellOutputs:    make(map[string]string),
+		greeterProfile: &GreeterProfile{
+			Title:    "Generated Title",
+			Subtitle: "Generated Subtitle",
+			Model:    "glm-5.3-flash",
+		},
+		prefs: Preferences{
+			ColorScheme:          "dark",
+			ChatWidth:            1240,
+			MaxVisibleSessions:   3,
+			ShellTailLines:       5,
+			DiffTruncationLines:  25,
+			CtrlEnterToSend:      true,
+			TakeChargeDirective:  "Custom take charge reply",
+			GreeterTitleOverride: "Custom Greeting Headline",
+			GreeterSubOverride:   "Custom Greeting Subtext",
+			GreeterModelOverride: "google/antigravity-gemini-3.5-flash-lite",
+			ServerURL:            "http://127.0.0.1:4199/",
+		},
+	}
+	win.ctx = WithDiffMaxLines(win.ctx, win.effectiveDiffTruncationLines)
+	win.emptyGreeter = NewGreeterWidget(win.effectiveGreeterProfile(), nil)
+	win.saveState()
+
+	// 1. Verify persistence round-trip.
+	reloaded := &Window{
+		ctx:       t.Context(),
+		statePath: stateFile,
+		viewStack: adw.NewViewStack(),
+		tabs:      make(map[string]*sessionTab),
+	}
+	reloaded.loadState()
+	if reloaded.prefs != win.prefs {
+		t.Fatalf("reloaded prefs = %+v, want %+v", reloaded.prefs, win.prefs)
+	}
+
+	// 2. Verify live-apply on chat width, send shortcut, and greeter overrides.
+	dir := "/home/diamond/proj"
+	win.projectOrder = []string{dir}
+	for i := 1; i <= 5; i++ {
+		s := opencode.Session{
+			ID:       fmt.Sprintf("ses_%d", i),
+			Title:    fmt.Sprintf("Session %d", i),
+			Location: opencode.Location{Directory: dir},
+			Time:     opencode.SessionTime{Updated: int64(6000 - i*100)},
+		}
+		win.projectSessions[dir] = append(win.projectSessions[dir], s)
+		if i <= 3 {
+			win.ensureSessionTab(s)
+		}
+	}
+	win.applyAllPreferences()
+
+	if got := composerClamp.MaximumSize(); got != 1240 {
+		t.Fatalf("composerClamp.MaximumSize() = %d, want 1240", got)
+	}
+	if got := win.tabs["ses_1"].main.clamp.MaximumSize(); got != 1240 {
+		t.Fatalf("conv.clamp.MaximumSize() = %d, want 1240", got)
+	}
+	if got := sendBtn.TooltipText(); got != "Send Message (Ctrl+Enter)" {
+		t.Fatalf("sendBtn.TooltipText() = %q, want 'Send Message (Ctrl+Enter)'", got)
+	}
+	if got := win.emptyGreeter.titleLabel.Label(); got != "Custom Greeting Headline" {
+		t.Fatalf("emptyGreeter title = %q, want 'Custom Greeting Headline'", got)
+	}
+
+	// 3. Increasing MaxVisibleSessions from 3 to 4 dynamically promotes the 4th session into a tab.
+	win.prefs.MaxVisibleSessions = 4
+	win.applyMaxVisibleSessions()
+	if _, exists := win.tabs["ses_4"]; !exists {
+		t.Fatalf("expected ses_4 to be promoted when MaxVisibleSessions increased to 4")
+	}
+
+	// 4. Decreasing MaxVisibleSessions from 4 to 2 hides tabs beyond the first 2.
+	win.prefs.MaxVisibleSessions = 2
+	win.applyMaxVisibleSessions()
+	if !win.tabs["ses_1"].page.Visible() || !win.tabs["ses_2"].page.Visible() {
+		t.Fatalf("expected first 2 tabs to remain visible")
+	}
+	if win.tabs["ses_3"].page.Visible() || win.tabs["ses_4"].page.Visible() {
+		t.Fatalf("expected tabs 3 and 4 to be hidden when MaxVisibleSessions=2")
+	}
+
+	// 5. Verify Take Charge custom directive and ToolWidget diff truncation limit.
+	form := opencode.FormInfo{
+		ID:        "f1",
+		SessionID: "ses_1",
+		Fields:    []opencode.FormField{{Key: "q0", Type: "string"}},
+	}
+	ans := buildTakeChargeAnswerWithDirective(form, win.effectiveTakeChargeDirective())
+	if ans["q0"] != "Custom take charge reply" {
+		t.Fatalf("buildTakeChargeAnswerWithDirective = %v, want 'Custom take charge reply'", ans)
+	}
+
+	var diffLines []string
+	for i := 1; i <= 40; i++ {
+		diffLines = append(diffLines, fmt.Sprintf("+line %d", i))
+	}
+	tw := &ToolWidget{
+		Box:          gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:          win.ctx,
+		diffBox:      gtk.NewBox(gtk.OrientationVertical, 0),
+		diffMaxLines: diffMaxLinesFromContext(win.ctx),
+	}
+	tw.renderInlineDiff(strings.Join(diffLines, "\n"))
+	// 25 lines + 1 "... (15 more lines)" label = 26 diffWidgets.
+	if len(tw.diffWidgets) != 26 {
+		t.Fatalf("len(tw.diffWidgets) with limit 25 = %d, want 26", len(tw.diffWidgets))
+	}
+	tw.SetDiffMaxLines(30)
+	if len(tw.diffWidgets) != 31 {
+		t.Fatalf("len(tw.diffWidgets) after SetDiffMaxLines(30) = %d, want 31", len(tw.diffWidgets))
+	}
+}
+
+func TestRevertUserMessageCountAndFileRollbackBanner(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	messages := []opencode.Message{
+		{ID: "u1", Type: "user", Text: "first prompt"},
+		{ID: "a1", Type: "assistant", Text: "first reply"},
+		{ID: "u2", Type: "user", Text: "second prompt"},
+		{
+			ID:   "a2_1",
+			Type: "assistant",
+			Content: []opencode.ContentPart{
+				{
+					Type:  "tool",
+					Name:  "edit",
+					State: opencode.ToolState{Input: json.RawMessage(`{"filePath":"internal/window/window.go","oldString":"old1\n","newString":"new1\nnew2\n"}`)},
+				},
+			},
+		},
+		{ID: "a2_2", Type: "assistant", Text: "step 2"},
+		{
+			ID:   "a2_3",
+			Type: "assistant",
+			Content: []opencode.ContentPart{
+				{
+					Type:  "tool",
+					Name:  "write",
+					State: opencode.ToolState{Input: json.RawMessage(`{"filePath":"internal/window/preferences.go","content":"package window\n"}`)},
+				},
+			},
+		},
+		{ID: "a2_4", Type: "assistant", Text: "done"},
+	}
+
+	// 1. Reverting the latest prompt (u2) hides 5 messages [u2, a2_1, a2_2, a2_3, a2_4],
+	// but countRevertedUserMessages must only count user messages (1).
+	_, hidden := computeRevertVisibility(messages, "u2")
+	if len(hidden) != 5 {
+		t.Fatalf("len(hidden) = %d, want 5", len(hidden))
+	}
+	if got := countRevertedUserMessages(messages, "u2"); got != 1 {
+		t.Fatalf("countRevertedUserMessages(u2) = %d, want 1", got)
+	}
+	if got := countRevertedUserMessages(messages, "u1"); got != 2 {
+		t.Fatalf("countRevertedUserMessages(u1) = %d, want 2", got)
+	}
+
+	// 2. collectRevertedFileChanges extracts modified files from assistant tool calls at/after u2.
+	fallbackFiles := collectRevertedFileChanges(messages, "u2")
+	if len(fallbackFiles) != 2 {
+		t.Fatalf("len(fallbackFiles) = %d, want 2: %+v", len(fallbackFiles), fallbackFiles)
+	}
+	if fallbackFiles[0].File != "internal/window/window.go" || fallbackFiles[0].Status != "modified" {
+		t.Fatalf("fallbackFiles[0] = %+v, want internal/window/window.go (modified)", fallbackFiles[0])
+	}
+	if fallbackFiles[1].File != "internal/window/preferences.go" || fallbackFiles[1].Status != "added" {
+		t.Fatalf("fallbackFiles[1] = %+v, want internal/window/preferences.go (added)", fallbackFiles[1])
+	}
+
+	// 3. StageRevert with files=true vs files=false updates RevertBannerWidget with user message count and rolled-back files.
+	var (
+		mu          sync.Mutex
+		gotFilesArg bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/revert/stage") {
+			var body struct {
+				MessageID string `json:"messageID"`
+				Files     bool   `json:"files"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			gotFilesArg = body.Files
+			mu.Unlock()
+			if body.Files {
+				_, _ = w.Write([]byte(`{"data":{"messageID":"u2","snapshot":"snap_2","files":[{"file":"internal/window/window.go","patch":"@@ -1 +1,2 @@\n-old1\n+new1\n+new2","additions":2,"deletions":1,"status":"modified"},{"file":"internal/window/preferences.go","patch":"@@ -0,0 +1 @@\n+package window","additions":1,"deletions":0,"status":"added"}]}}`))
+			} else {
+				_, _ = w.Write([]byte(`{"data":{"messageID":"u2"}}`))
+			}
+			return
+		}
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer srv.Close()
+
+	win := &Window{
+		ctx:         t.Context(),
+		client:      &opencode.Client{BaseURL: srv.URL},
+		viewStack:   adw.NewViewStack(),
+		tabs:        make(map[string]*sessionTab),
+		childToRoot: make(map[string]string),
+	}
+	tab := win.addSessionTab(opencode.Session{ID: "ses_rev"})
+	conv := tab.main
+	conv.messages = messages
+
+	// Revert with files rollback = true.
+	win.stageRevertToMessage(tab, conv, "u2", "second prompt", true)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		if conv.session.Revert != nil && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	filesTrue := gotFilesArg
+	mu.Unlock()
+	if !filesTrue {
+		t.Fatalf("expected files=true sent to /revert/stage")
+	}
+	if conv.revertBanner == nil || !conv.revertBanner.Visible() {
+		t.Fatalf("expected revertBanner to be visible")
+	}
+	if got := conv.revertBanner.titleLabel.Text(); got != "1 reverted message" {
+		t.Fatalf("revertBanner title = %q, want '1 reverted message'", got)
+	}
+	if !conv.revertBanner.filesBox.Visible() || len(conv.revertBanner.fileWidgets) != 2 {
+		t.Fatalf("expected 2 rolled-back file rows visible in revertBanner, got visible=%v len=%d", conv.revertBanner.filesBox.Visible(), len(conv.revertBanner.fileWidgets))
+	}
+	if got := conv.revertBanner.diffBadge.Text(); got != "+3 -1" || !conv.revertBanner.diffBadge.Visible() {
+		t.Fatalf("revertBanner diffBadge = %q (visible=%v), want '+3 -1'", got, conv.revertBanner.diffBadge.Visible())
+	}
+
+	// Revert with files rollback = false -> no files listed in banner.
+	conv.session.Revert = nil
+	win.stageRevertToMessage(tab, conv, "u2", "second prompt", false)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		if conv.session.Revert != nil && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	filesFalse := gotFilesArg
+	mu.Unlock()
+	if filesFalse {
+		t.Fatalf("expected files=false sent to /revert/stage")
+	}
+	if conv.revertBanner.filesBox.Visible() || len(conv.revertBanner.fileWidgets) != 0 {
+		t.Fatalf("expected filesBox hidden when files=false, got visible=%v len=%d", conv.revertBanner.filesBox.Visible(), len(conv.revertBanner.fileWidgets))
+	}
+}
+
+func TestPermissionPromptWidgetAndTakeCharge(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var (
+		mu              sync.Mutex
+		repliedDecision = make(map[string]string)
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && strings.Contains(r.URL.Path, "/permission/") && strings.HasSuffix(r.URL.Path, "/reply") {
+			parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+			reqID := parts[len(parts)-2]
+			var body struct {
+				Decision string `json:"decision"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			repliedDecision[reqID] = body.Decision
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:              t.Context(),
+		client:           &opencode.Client{BaseURL: srv.URL},
+		viewStack:        vs,
+		tabs:             make(map[string]*sessionTab),
+		childToRoot:      make(map[string]string),
+		visibleSessions:  make(map[string]bool),
+		archivedSessions: make(map[string]bool),
+		projectSessions:  make(map[string][]opencode.Session),
+	}
+
+	tab1 := win.addSessionTab(opencode.Session{
+		ID:       "ses_perm_1",
+		Title:    "Active Session",
+		Location: opencode.Location{Directory: "/home/diamond/proj"},
+	})
+	tab1.main.loaded = true
+	tab1.main.active = true
+	tab2 := win.addSessionTab(opencode.Session{
+		ID:       "ses_perm_2",
+		Title:    "Background Session",
+		Location: opencode.Location{Directory: "/home/diamond/proj"},
+	})
+	tab2.main.loaded = true
+	tab2.main.active = true
+	vs.SetVisibleChildName("ses_perm_1")
+
+	// 1. Emit permission.asked on background session ses_perm_2 -> marks NeedsAttention, hides thinkingLabel, creates PermissionPromptWidget.
+	win.handleEvent(opencode.Event{
+		Type: "permission.asked",
+		Data: json.RawMessage(`{
+			"id": "per_bg_1",
+			"sessionID": "ses_perm_2",
+			"action": "bash",
+			"resources": ["run0 systemctl restart opencode.service"],
+			"save": ["run0 systemctl restart *"],
+			"message": "Allow Shell tool to execute via run0?"
+		}`),
+	})
+
+	if !tab2.page.NeedsAttention() {
+		t.Fatalf("expected tab2.page.NeedsAttention() = true when permission is asked on background tab")
+	}
+	if len(tab2.main.pendingPermissions) != 1 {
+		t.Fatalf("expected 1 pending permission in tab2, got %d", len(tab2.main.pendingPermissions))
+	}
+	if tab2.main.thinkingLabel.Visible() {
+		t.Fatalf("expected thinkingLabel to be hidden while permission prompt is pending")
+	}
+	pw := tab2.main.permissionWidgets["per_bg_1"]
+	if pw == nil {
+		t.Fatalf("expected PermissionPromptWidget to be created for per_bg_1")
+	}
+	if got := pw.pillLabel.Text(); got != "Permission Required · Shell Command" {
+		t.Errorf("pw.pillLabel.Text() = %q, want %q", got, "Permission Required · Shell Command")
+	}
+	if got := pw.titleLabel.Text(); got != "Allow Shell tool to execute via run0?" {
+		t.Errorf("pw.titleLabel.Text() = %q, want %q", got, "Allow Shell tool to execute via run0?")
+	}
+	if got := pw.cmdLabel.Text(); got != "$ run0 systemctl restart opencode.service" {
+		t.Errorf("pw.cmdLabel.Text() = %q, want %q", got, "$ run0 systemctl restart opencode.service")
+	}
+	if got := pw.footerLbl.Text(); got != "Always Allow saves: run0 systemctl restart *" {
+		t.Errorf("pw.footerLbl.Text() = %q, want %q", got, "Always Allow saves: run0 systemctl restart *")
+	}
+
+	// 2. Clicking "Always Allow" sends decision="always" and removes the card.
+	pw.TriggerDecision(opencode.PermissionAlways)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		if len(tab2.main.pendingPermissions) == 0 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	gotDec := repliedDecision["per_bg_1"]
+	mu.Unlock()
+	if gotDec != "always" {
+		t.Fatalf("repliedDecision[per_bg_1] = %q, want 'always'", gotDec)
+	}
+	if _, exists := tab2.main.permissionWidgets["per_bg_1"]; exists {
+		t.Fatalf("expected permission widget per_bg_1 to be removed after reply")
+	}
+	if !tab2.main.thinkingLabel.Visible() {
+		t.Fatalf("expected thinkingLabel to become visible again after permission is resolved")
+	}
+
+	// 3. Emit permission.asked and resolve via permission.replied SSE event.
+	win.handleEvent(opencode.Event{
+		Type: "permission.asked",
+		Data: json.RawMessage(`{
+			"id": "per_sse_2",
+			"sessionID": "ses_perm_1",
+			"action": "external_directory",
+			"resources": ["/tmp/opencode/scratch"]
+		}`),
+	})
+	if len(tab1.main.pendingPermissions) != 1 || tab1.main.permissionWidgets["per_sse_2"] == nil {
+		t.Fatalf("expected per_sse_2 widget to be present on tab1")
+	}
+	win.handleEvent(opencode.Event{
+		Type: "permission.replied",
+		Data: json.RawMessage(`{"sessionID":"ses_perm_1","requestID":"per_sse_2","reply":"reject"}`),
+	})
+	if len(tab1.main.pendingPermissions) != 0 || tab1.main.permissionWidgets["per_sse_2"] != nil {
+		t.Fatalf("expected per_sse_2 to be removed on permission.replied SSE event")
+	}
+
+	// 4. Enabling Take Charge auto-allows pending permissions with decision="once".
+	win.handleEvent(opencode.Event{
+		Type: "permission.asked",
+		Data: json.RawMessage(`{
+			"id": "per_tc_3",
+			"sessionID": "ses_perm_1",
+			"action": "edit",
+			"resources": ["internal/window/window.go"]
+		}`),
+	})
+	if len(tab1.main.pendingPermissions) != 1 {
+		t.Fatalf("expected per_tc_3 to be pending before Take Charge")
+	}
+	win.setTakeCharge(true)
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		if len(tab1.main.pendingPermissions) == 0 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	tcDec := repliedDecision["per_tc_3"]
+	mu.Unlock()
+	if tcDec != "once" {
+		t.Fatalf("expected Take Charge to auto-reply with decision='once', got %q", tcDec)
+	}
+}
+
+func TestProjectHeaderPlusButtonAndContextMenu(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var (
+		mu             sync.Mutex
+		createdDirs    []string
+		sessionCounter int
+		openedDir      string
+		copiedPath     string
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost && r.URL.Path == "/api/session" {
+			var body opencode.CreateSessionRequest
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			reqDir := body.Directory
+			if reqDir == "" && body.Location != nil {
+				reqDir = body.Location.Directory
+			}
+			mu.Lock()
+			sessionCounter++
+			id := fmt.Sprintf("ses_new_%d", sessionCounter)
+			createdDirs = append(createdDirs, reqDir)
+			mu.Unlock()
+			resp := opencode.Session{
+				ID:       id,
+				Title:    "New Session",
+				Location: opencode.Location{Directory: reqDir},
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	dir := "/home/diamond/proj_header"
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:               t.Context(),
+		client:            &opencode.Client{BaseURL: srv.URL},
+		viewStack:         vs,
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+		visibleSessions:   make(map[string]bool),
+		archivedSessions:  make(map[string]bool),
+		collapsedProjects: make(map[string]bool),
+		projectSessions:   make(map[string][]opencode.Session),
+		projectOrder:      []string{dir},
+		fileOpener: func(d string) {
+			openedDir = d
+		},
+		clipboardSetter: func(s string) {
+			copiedPath = s
+		},
+	}
+
+	s1 := opencode.Session{
+		ID:       "ses_existing_1",
+		Title:    "Existing Session",
+		Location: opencode.Location{Directory: dir},
+	}
+	win.allSessions = []opencode.Session{s1}
+	win.projectSessions[dir] = []opencode.Session{s1}
+	win.ensureSessionTab(s1)
+
+	hdrBox := win.newProjectHeaderBox(dir, false)
+	hw := win.headerWidgets[hdrBox.Object.Native()]
+	if hw == nil {
+		t.Fatalf("expected projectHeaderWidgets to be registered for hdrBox")
+	}
+	if got := hw.newBtn.IconName(); got != "list-add-symbolic" {
+		t.Fatalf("hw.newBtn.IconName() = %q, want 'list-add-symbolic'", got)
+	}
+	if got := hw.newBtn.TooltipText(); got != "New Session in Project" {
+		t.Fatalf("hw.newBtn.TooltipText() = %q, want 'New Session in Project'", got)
+	}
+
+	// 1. Clicking the "+" button on the project header creates a new session in that project's directory.
+	hw.onNewSession()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(createdDirs)
+		mu.Unlock()
+		if n == 1 && win.tabs["ses_new_1"] != nil && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	gotDirs := slices.Clone(createdDirs)
+	mu.Unlock()
+	if len(gotDirs) != 1 || gotDirs[0] != dir {
+		t.Fatalf("expected newBtn click to create session in %q, got %v", dir, gotDirs)
+	}
+	if win.tabs["ses_new_1"] == nil {
+		t.Fatalf("expected ses_new_1 tab to be created and selected")
+	}
+
+	// 2. Popover menu actions: Open in Files, Copy Path, Collapse/Expand, and Archive Project.
+	hw.openMenuAt(12, 16)
+	hw.onOpenFiles()
+	if openedDir != dir {
+		t.Fatalf("openedDir = %q, want %q", openedDir, dir)
+	}
+
+	hw.onCopyPath()
+	if copiedPath != dir {
+		t.Fatalf("copiedPath = %q, want %q", copiedPath, dir)
+	}
+
+	if got := hw.toggleLbl.Text(); got != "Collapse Project" {
+		t.Fatalf("hw.toggleLbl.Text() = %q, want 'Collapse Project'", got)
+	}
+	hw.onToggle()
+	if !win.collapsedProjects[dir] {
+		t.Fatalf("expected project %q to be collapsed after clicking Collapse Project", dir)
+	}
+	win.updateProjectHeaderLabels(hdrBox, dir)
+	if got := hw.toggleLbl.Text(); got != "Expand Project" {
+		t.Fatalf("hw.toggleLbl.Text() after collapse = %q, want 'Expand Project'", got)
+	}
+
+	hw.onArchive()
+	if !win.archivedSessions["ses_existing_1"] || !win.archivedSessions["ses_new_1"] {
+		t.Fatalf("expected Archive Project in popover menu to archive all project sessions, got %+v", win.archivedSessions)
+	}
+
+	// 3. App menu button setup attaches a popover menu and syncNavigationChrome toggles appMenuTopBtn and searchSessionsTopBtn with sidebar visibility.
+	menuBtn := gtk.NewMenuButton()
+	win.setupAppMenuButton(menuBtn)
+	if menuBtn.Popover() == nil {
+		t.Fatalf("expected setupAppMenuButton to attach a popover to menuBtn")
+	}
+	win.rootContent = adw.NewOverlaySplitView()
+	win.showSidebarBtn = gtk.NewButton()
+	win.appMenuTopBtn = gtk.NewMenuButton()
+	win.searchSessionsTopBtn = gtk.NewButton()
+	win.rootContent.SetShowSidebar(true)
+	win.syncNavigationChrome()
+	if win.appMenuTopBtn.Visible() || win.searchSessionsTopBtn.Visible() {
+		t.Fatalf("expected appMenuTopBtn and searchSessionsTopBtn to be hidden when sidebar is visible")
+	}
+	win.rootContent.SetShowSidebar(false)
+	win.syncNavigationChrome()
+	if !win.appMenuTopBtn.Visible() || !win.searchSessionsTopBtn.Visible() {
+		t.Fatalf("expected appMenuTopBtn and searchSessionsTopBtn to be visible when sidebar is hidden")
+	}
+
+	// 4. Unified search (matchAndSortSearchItems) matches sessions, known projects, and filesystem paths.
+	tmpRoot := t.TempDir()
+	unvisitedDir := filepath.Join(tmpRoot, "brand_new_repo")
+	if err := os.MkdirAll(unvisitedDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// Searching by project name matches the known project and its sessions.
+	projItems := win.matchAndSortSearchItems(win.allSessions, "proj_header", nil)
+	hasProjMatch := false
+	for _, it := range projItems {
+		if it.isProject && it.dir == dir {
+			hasProjMatch = true
+			break
+		}
+	}
+	if !hasProjMatch {
+		t.Fatalf("expected matchAndSortSearchItems('proj_header') to include project match for %q, got %+v", dir, projItems)
+	}
+
+	// Searching by filesystem path prefix discovers unvisited directories on disk.
+	fsQuery := filepath.Join(tmpRoot, "brand_new")
+	fsItems := win.matchAndSortSearchItems(win.allSessions, fsQuery, nil)
+	hasFSMatch := false
+	for _, it := range fsItems {
+		if it.isProject && it.dir == normalizeProjectDir(unvisitedDir) {
+			hasFSMatch = true
+			break
+		}
+	}
+	if !hasFSMatch {
+		t.Fatalf("expected matchAndSortSearchItems(%q) to discover unvisited directory %q, got %+v", fsQuery, unvisitedDir, fsItems)
+	}
+
+	// 5. applySidebarWidth pins both min and max sidebar width to the exact pixel width when uncollapsed,
+	// and rebuildShellList ellipsizes background shell output labels so long lines cannot inflate bottomSheet.
+	win.sidebarWidth = 0
+	win.applySidebarWidth()
+	if gotMin, gotMax := win.rootContent.MinSidebarWidth(), win.rootContent.MaxSidebarWidth(); gotMin != defaultSidebarWidth || gotMax != defaultSidebarWidth {
+		t.Fatalf("applySidebarWidth() with 0 width: min=%v max=%v, want %v", gotMin, gotMax, defaultSidebarWidth)
+	}
+	win.setDesktopSidebarWidth(340)
+	if gotMin, gotMax := win.rootContent.MinSidebarWidth(), win.rootContent.MaxSidebarWidth(); gotMin != 340 || gotMax != 340 {
+		t.Fatalf("setDesktopSidebarWidth(340): min=%v max=%v, want 340", gotMin, gotMax)
+	}
+	delete(win.archivedSessions, "ses_existing_1")
+	win.ensureSessionTab(s1)
+	win.viewStack.SetVisibleChildName("ses_existing_1")
+	win.shellListBox = gtk.NewListBox()
+	win.activeShells = map[string]opencode.ShellItem{
+		"sh_test_1": {ID: "sh_test_1", SessionID: "ses_existing_1", Command: "nix build", Status: "running"},
+	}
+	win.shellOutputs = map[string]string{
+		"sh_test_1": strings.Repeat("x", 140),
+	}
+	win.rebuildShellList()
+	outLbl := win.shellOutputLabels["sh_test_1"]
+	if outLbl == nil || outLbl.Ellipsize() != pango.EllipsizeEnd {
+		t.Fatalf("expected shell output label to ellipsize at end, got %v", outLbl)
+	}
+
+	// 6. Inline diffs and long subagent titles must keep a compact horizontal minimum width
+	// so content and windowStack never overflow narrow windows (e.g. <953px).
+	tw := &ToolWidget{
+		diffBox: gtk.NewBox(gtk.OrientationVertical, 0),
+	}
+	tw.renderInlineDiff("+" + strings.Repeat("extremely_long_unbroken_identifier_token_", 10) + "\n-" + strings.Repeat("another_very_long_diff_line_", 10))
+	minW, _, _, _ := tw.diffBox.Measure(gtk.OrientationHorizontal, -1)
+	if minW > 120 {
+		t.Fatalf("diffBox horizontal minimum width = %d px, want <= 120 px", minW)
+	}
+	subW := NewSyntheticSubagentWidget(t.Context(), opencode.Message{
+		ID:    "msg_sub_1",
+		Agent: strings.Repeat("very-long-subagent-agent-name-", 6),
+		Metadata: map[string]any{
+			"description": strings.Repeat("very-long-subagent-description-segment-", 6),
+			"childID":     "ses_child_1",
+		},
+	}, nil)
+	subMinW, _, _, _ := subW.Measure(gtk.OrientationHorizontal, -1)
+	if subMinW > 200 {
+		t.Fatalf("SyntheticSubagentWidget horizontal minimum width = %d px, want <= 200 px", subMinW)
+	}
+
+	win.initOfflineScreen()
+	if win.windowStack.Hhomogeneous() || win.windowStack.Vhomogeneous() {
+		t.Fatalf("expected windowStack hhomogeneous=false and vhomogeneous=false")
+	}
+}
+
+func TestComputeTurnDurations(t *testing.T) {
+	t.Parallel()
+
+	makeAssistant := func(id string, created, completed int64) opencode.Message {
+		var m opencode.Message
+		m.ID = id
+		m.Type = "assistant"
+		m.Time.Created = created
+		m.Time.Completed = completed
+		m.Content = []opencode.ContentPart{{Type: "text", Text: "ok"}}
+		return m
+	}
+	makeNotice := func(id, typ, text string, created int64) opencode.Message {
+		var m opencode.Message
+		m.ID = id
+		m.Type = typ
+		m.Text = text
+		m.Time.Created = created
+		return m
+	}
+
+	formatTests := []struct {
+		dur  time.Duration
+		want string
+	}{
+		{0, ""},
+		{-5 * time.Second, ""},
+		{420 * time.Millisecond, "Worked for 420ms"},
+		{1000 * time.Millisecond, "Worked for 1s"},
+		{2440 * time.Millisecond, "Worked for 2.4s"},
+		{9960 * time.Millisecond, "Worked for 10s"},
+		{18300 * time.Millisecond, "Worked for 18s"},
+		{59600 * time.Millisecond, "Worked for 1m"},
+		{83000 * time.Millisecond, "Worked for 1m 23s"},
+		{3600 * time.Second, "Worked for 1h"},
+		{3660 * time.Second, "Worked for 1h 1m"},
+		{3725 * time.Second, "Worked for 1h 2m 5s"},
+	}
+	for _, tc := range formatTests {
+		if got := formatTurnDurationNotice(tc.dur); got != tc.want {
+			t.Errorf("formatTurnDurationNotice(%v) = %q, want %q", tc.dur, got, tc.want)
+		}
+	}
+
+	tests := []struct {
+		name     string
+		messages []opencode.Message
+		revertID string
+		active   bool
+		want     map[string]time.Duration
+	}{
+		{
+			name: "contiguous multi-step turn with trailing compaction and model switch excluded",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "build feature", 1000),
+				makeAssistant("a1", 1010, 4010),
+				makeAssistant("a2", 4030, 8030),
+				makeAssistant("a3", 8050, 11010),
+				makeNotice("idle1", "idle", "", 11020),
+				makeNotice("c1", "compaction", "", 12000),
+				makeNotice("ms1", "model-switched", "", 25000),
+			},
+			want: map[string]time.Duration{
+				"a3": 10 * time.Second,
+			},
+		},
+		{
+			name: "mid-turn auto-compaction gap is excluded",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "refactor", 1000),
+				makeAssistant("a1", 1000, 6000), // 5s
+				makeNotice("c1", "compaction", "", 6010),
+				makeAssistant("a2", 21000, 25000), // 4s (15s compaction gap excluded)
+			},
+			want: map[string]time.Duration{
+				"a2": 9 * time.Second,
+			},
+		},
+		{
+			name: "background subagent or shell wait between steps is included",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "run background job", 1000),
+				makeAssistant("a1", 1000, 3000), // 2s
+				makeNotice("i1", "idle", "", 3010),
+				makeNotice("syn1", "synthetic", `<shell id="sh_1" state="completed">done</shell>`, 15000),
+				makeAssistant("a2", 15020, 18000), // 12.02s wait + 2.98s step = 15s -> 17s total
+			},
+			want: map[string]time.Duration{
+				"a2": 17 * time.Second,
+			},
+		},
+		{
+			name: "server restart synthetic notice gap is excluded",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "long task", 1000),
+				makeAssistant("a1", 1000, 4000), // 3s
+				makeNotice("syn_restart", "synthetic", "Continuing after restart", 604000),
+				makeAssistant("a2", 604020, 606020), // 2s
+			},
+			want: map[string]time.Duration{
+				"a2": 5 * time.Second,
+			},
+		},
+		{
+			name: "active second turn suppresses tail duration while preserving first turn duration",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "turn 1", 1000),
+				makeAssistant("a1", 1000, 5000), // 4s
+				makeNotice("u2", "user", "turn 2", 10000),
+				makeAssistant("a2", 10000, 13000),
+			},
+			active: true,
+			want: map[string]time.Duration{
+				"a1": 4 * time.Second,
+			},
+		},
+		{
+			name: "reverted second turn is excluded while first turn remains visible",
+			messages: []opencode.Message{
+				makeNotice("u1", "user", "turn 1", 1000),
+				makeAssistant("a1", 1000, 5000), // 4s
+				makeNotice("u2", "user", "turn 2", 10000),
+				makeAssistant("a2", 10000, 16000),
+			},
+			revertID: "u2",
+			want: map[string]time.Duration{
+				"a1": 4 * time.Second,
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeTurnDurations(tc.messages, tc.revertID, tc.active, nil)
+			if len(got) != len(tc.want) {
+				t.Fatalf("computeTurnDurations() = %v, want %v", got, tc.want)
+			}
+			for k, wantDur := range tc.want {
+				if got[k] != wantDur {
+					t.Errorf("computeTurnDurations()[%q] = %v, want %v", k, got[k], wantDur)
+				}
+			}
+		})
+	}
+}
+
+func TestTurnDurationAndScrollableInlineShellOutput(t *testing.T) {
+	// 1. Verify FormatShellOutput preserves all lines and full line lengths for scrollable inline tool output,
+	// whereas FormatShellTailLines truncates to the configured N-line tail for the bottom sheet.
+	var rawLines []string
+	for i := 1; i <= 25; i++ {
+		rawLines = append(rawLines, fmt.Sprintf("\x1b[32mline %02d\x1b[0m: %s", i, strings.Repeat("a", 160)))
+	}
+	raw := strings.Join(rawLines, "\n") + "\n"
+
+	fullOut := FormatShellOutput(raw)
+	fullSplit := strings.Split(fullOut, "\n")
+	if len(fullSplit) != 25 {
+		t.Fatalf("FormatShellOutput line count = %d, want 25", len(fullSplit))
+	}
+	if !strings.HasPrefix(fullSplit[0], "line 01: ") || len(fullSplit[0]) < 165 {
+		t.Fatalf("expected FormatShellOutput to preserve line 01 without 140-char truncation, got len=%d", len(fullSplit[0]))
+	}
+
+	tailOut := FormatShellTailLines(raw, 7)
+	tailSplit := strings.Split(tailOut, "\n")
+	if len(tailSplit) != 7 || !strings.HasPrefix(tailSplit[0], "line 19: ") {
+		t.Fatalf("expected FormatShellTailLines(..., 7) to return lines 19..25, got %d lines starting with %q", len(tailSplit), tailSplit[0])
+	}
+
+	if !gtk.InitCheck() {
+		return
+	}
+
+	// 2. Verify live turn duration lifecycle and authoritative timestamp merging on reconcileConvMessages.
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:               t.Context(),
+		viewStack:         vs,
+		stopBtn:           gtk.NewButton(),
+		activeShells:      make(map[string]opencode.ShellItem),
+		shellOutputs:      make(map[string]string),
+		shellOutputLabels: make(map[string]*gtk.Label),
+		shellListBox:      gtk.NewListBox(),
+		shellsSectionBox:  gtk.NewBox(gtk.OrientationVertical, 0),
+		sheetEmptyLabel:   gtk.NewLabel(""),
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+	}
+	tab := win.addSessionTab(opencode.Session{ID: "ses_turn", Title: "Turn Test"})
+	conv := tab.main
+	conv.loaded = true
+
+	var u1 opencode.Message
+	u1.ID = "u1"
+	u1.Type = "user"
+	u1.Text = "hello"
+	u1.Time.Created = 1000
+	conv.messages = append(conv.messages, u1)
+	conv.seenMsgIDs["u1"] = true
+
+	aw1 := &AssistantMessageWidget{
+		Box:               gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:               t.Context(),
+		partsBox:          gtk.NewBox(gtk.OrientationVertical, 0),
+		turnDurationLabel: gtk.NewLabel(""),
+		tools:             make(map[string]*ToolWidget),
+	}
+	conv.assistantMap["a1"] = aw1
+	conv.messageWidgets["a1"] = aw1
+
+	var a1Placeholder opencode.Message
+	a1Placeholder.ID = "a1"
+	a1Placeholder.Type = "assistant"
+	a1Placeholder.Time.Created = 1000
+	conv.messages = append(conv.messages, a1Placeholder)
+	conv.seenMsgIDs["a1"] = true
+
+	win.setConvActive("ses_turn", true)
+	if aw1.TurnDuration() != "" {
+		t.Fatalf("expected empty TurnDuration while turn is active, got %q", aw1.TurnDuration())
+	}
+
+	// Reconcile authoritative message from server with exact Created and Completed timestamps.
+	var a1Server opencode.Message
+	a1Server.ID = "a1"
+	a1Server.Type = "assistant"
+	a1Server.Time.Created = 10000
+	a1Server.Time.Streamed = 13500
+	a1Server.Time.Completed = 14200
+	reconcileConvMessages(&conv.messages, conv.seenMsgIDs, &conv.pendingPrompts, []opencode.Message{u1, a1Server}, nil, nil)
+
+	win.setConvActive("ses_turn", false)
+	if got := aw1.TurnDuration(); got != "Worked for 4.2s" {
+		t.Fatalf("aw1.TurnDuration() = %q, want %q", got, "Worked for 4.2s")
+	}
+	if !aw1.turnDurationLabel.Visible() {
+		t.Fatalf("expected aw1.turnDurationLabel to be visible after turn completion")
+	}
+
+	// 3. Verify expanded shell ToolWidget receives full scrollable output while bottom sheet label gets 7-line tail.
+	outView := gtk.NewTextView()
+	twShell := &ToolWidget{
+		Box:          gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:          t.Context(),
+		outputScroll: gtk.NewScrolledWindow(),
+		outputView:   outView,
+		outputBuf:    outView.Buffer(),
+		toolID:       "call_sh_1",
+		toolName:     "shell",
+		shellID:      "sh_scroll_1",
+	}
+	aw1.tools["call_sh_1"] = twShell
+
+	win.activeShells["sh_scroll_1"] = opencode.ShellItem{
+		ID:        "sh_scroll_1",
+		SessionID: "ses_turn",
+		Command:   "seq 1 25",
+		Status:    "running",
+	}
+	win.shellOutputs["sh_scroll_1"] = fullOut
+	win.rebuildShellList()
+	win.updateToolWidgetsForShell("sh_scroll_1", fullOut, "")
+
+	startIter, endIter := twShell.outputBuf.Bounds()
+	gotToolText := twShell.outputBuf.Text(startIter, endIter, false)
+	if gotLines := strings.Split(gotToolText, "\n"); len(gotLines) != 25 {
+		t.Fatalf("expected inline ToolWidget outputBuf to contain all 25 scrollable lines, got %d", len(gotLines))
+	}
+	bottomLbl := win.shellOutputLabels["sh_scroll_1"]
+	if bottomLbl == nil {
+		t.Fatalf("expected bottom sheet shell output label for sh_scroll_1")
+	}
+	if gotBottomLines := strings.Split(bottomLbl.Text(), "\n"); len(gotBottomLines) != 7 {
+		t.Fatalf("expected bottom sheet label to stay a 7-line tail, got %d lines", len(gotBottomLines))
+	}
+
+	// Verify markSyntheticTargetCompleted also populates full output on completed <shell> synthetic message.
+	twShell2Out := gtk.NewTextView()
+	twShell2 := &ToolWidget{
+		Box:          gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:          t.Context(),
+		statusLabel:  gtk.NewLabel(""),
+		spinner:      adw.NewSpinner(),
+		outputScroll: gtk.NewScrolledWindow(),
+		outputView:   twShell2Out,
+		outputBuf:    twShell2Out.Buffer(),
+		toolID:       "call_sh_2",
+		toolName:     "shell",
+		shellID:      "sh_scroll2",
+	}
+	aw1.tools["call_sh_2"] = twShell2
+	conv.markSyntheticTargetCompleted(opencode.Message{
+		ID:   "syn_sh_2",
+		Type: "synthetic",
+		Text: "<shell id=\"sh_scroll2\" state=\"completed\">\n" + raw + "</shell>",
+	})
+	s2, e2 := twShell2.outputBuf.Bounds()
+	if gotLines := strings.Split(twShell2.outputBuf.Text(s2, e2, false), "\n"); len(gotLines) != 25 {
+		t.Fatalf("expected markSyntheticTargetCompleted to populate all 25 lines in ToolWidget, got %d", len(gotLines))
 	}
 }
