@@ -1,0 +1,50 @@
+schema = 3
+
+[mod]
+  [mod.'github.com/alecthomas/chroma']
+    version = 'v0.10.0'
+    hash = 'sha256-p721vddVTv4iv1O0/dqpdk5xF6x9iLIHcrfh8JEVnqQ='
+
+  [mod.'github.com/diamondburned/chatkit']
+    version = 'v0.0.0-20261031204703-9ef48f54f871'
+    hash = 'sha256-MO8XHZDL/EN5Su4oWdAffrsH9Pch0Kfixn56r8o9ft8='
+
+  [mod.'github.com/diamondburned/gotk4-adwaita/pkg']
+    version = 'v0.0.0-20261031204147-41c057c79b39'
+    hash = 'sha256-vGUVibfVdVOYJgF5wHoIEjSf7hjlEPFn4ydTY9BGfLo='
+
+  [mod.'github.com/diamondburned/gotk4-sourceview/pkg']
+    version = 'v0.0.0-20261108103011-991c0e50d980'
+    hash = 'sha256-FIfakjRaAgqm5y7/AuqzbT/5zMp2wgiKt1xPFFRFZ5U='
+
+  [mod.'github.com/diamondburned/gotk4/pkg']
+    version = 'v0.4.2-0.20261031204942-a6ab0d7b121f'
+    hash = 'sha256-UOniA6Ocim4Bwl7kKc+ytXiFztndJd5zkVkbIY5iOLo='
+
+  [mod.'github.com/diamondburned/gotkit']
+    version = 'v0.0.0-20261031204637-f5304451c287'
+    hash = 'sha256-7uuAVThTrrKo/YTuRmOfsnv0oGsoUxyXkGPeK9lz8LA='
+
+  [mod.'github.com/dlclark/regexp2']
+    version = 'v1.4.0'
+    hash = 'sha256-Pk/S2x2rX7xnGFLyoHEw09CoNQimvz/msdPRsxLaLsc='
+
+  [mod.'github.com/leonelquinteros/gotext']
+    version = 'v1.7.2'
+    hash = 'sha256-qWopQ/gt8frbHEGhCql1ozpWF1KX9yqWCbIXkOmPESU='
+
+  [mod.'github.com/pkg/errors']
+    version = 'v0.9.1'
+    hash = 'sha256-mNfQtcrQmu3sNg/7IwiieKWOgFQOVVe2yXgKBpe/wZw='
+
+  [mod.'github.com/yalue/merged_fs']
+    version = 'v1.3.0'
+    hash = 'sha256-Ww4EEsieMo7UzQYRBFaJNfNiIMPajCPANGABNeHFL0U='
+
+  [mod.'github.com/yuin/goldmark']
+    version = 'v1.8.6'
+    hash = 'sha256-rAwGzzmVrhhtzr8OSGid+F+NM5YWMyYYW6BSTWaDIGE='
+
+  [mod.'golang.org/x/sync']
+    version = 'v0.22.0'
+    hash = 'sha256-VZjl0fAM0p/nI81zh+pdBjzxFupx0UcKYXBBpL2ZS7k='

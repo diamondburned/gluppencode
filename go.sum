@@ -7,6 +7,8 @@ github.com/diamondburned/chatkit v0.0.0-20261031204703-9ef48f54f871 h1:fJESsVEUx
 github.com/diamondburned/chatkit v0.0.0-20261031204703-9ef48f54f871/go.mod h1:fTYJSdMhcQR6SnFqEwZJldIH8l7ZDbdl8K6TT8V5HBI=
 github.com/diamondburned/gotk4-adwaita/pkg v0.0.0-20261031204147-41c057c79b39 h1:HHjqiQdenUolB652OV8akZYxMKIaADJijVs7Zt3q/dA=
 github.com/diamondburned/gotk4-adwaita/pkg v0.0.0-20261031204147-41c057c79b39/go.mod h1:Nl+CqqQj2EoLnieVZQyUtbRs1jLpbIB7qY/pCZBFiEw=
+github.com/diamondburned/gotk4-sourceview/pkg v0.0.0-20261108103011-991c0e50d980 h1:ths/6CCetAN3DFkVSVWCO0NudyeeDPTI/OS2C/HZ46M=
+github.com/diamondburned/gotk4-sourceview/pkg v0.0.0-20261108103011-991c0e50d980/go.mod h1:m2DgYtAVlEHY+BP3eF2k89aNGTGOR3AYiL+kAbsrSAA=
 github.com/diamondburned/gotk4/pkg v0.4.2-0.20261031204942-a6ab0d7b121f h1:kbtw4h+/UaWl4QIktSpivvcaolCeJoUix95jKSPP71M=
 github.com/diamondburned/gotk4/pkg v0.4.2-0.20261031204942-a6ab0d7b121f/go.mod h1:BAEEDXtj5srQ1S2++5HX2K1s9c6CtuWSa60dAywrkRM=
 github.com/diamondburned/gotkit v0.0.0-20261031204637-f5304451c287 h1:n690LX49dYP1WRYdxL8tm21M5UC5tGFJEPoQXsaUTVk=

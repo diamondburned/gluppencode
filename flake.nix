@@ -27,20 +27,16 @@
       ...
     }:
     let
-      baseFunc = pkgs: {
-        src = self;
-        pname = "gluppencode";
-        buildInputs =
-          pkgs: with pkgs; [
-            libadwaita
-            gtksourceview5
-            pcre2
-          ];
-      };
+      baseFunc =
+        pkgs:
+        import ./nix/base.nix {
+          inherit pkgs;
+          src = self;
+        };
 
       goPackage = "go_1_27";
     in
-    flake-utils.lib.eachDefaultSystem (
+    (flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system}.appendOverlays [
@@ -57,9 +53,30 @@
           buildInputs = with pkgs; [
             jq
             libxml2
-            pkgs.gomod2nix
+            (pkgs.gomod2nix.override { inherit go; })
           ];
         };
+
+        packages.default = gotk4-nix.lib.mkPackage {
+          inherit pkgs go;
+          base = baseFunc pkgs;
+          version = self.rev or "unknown";
+        };
+
+        apps = rec {
+          default = gluppencode;
+          gluppencode = {
+            type = "app";
+            program = "${self.packages.${system}.default}/bin/gluppencode";
+          };
+        };
       }
-    );
+    ))
+    // {
+      lib = gotk4-nix.lib.mkLib rec {
+        pkgs = nixpkgs.legacyPackages.${builtins.currentSystem};
+        base = baseFunc pkgs;
+        go = pkgs.${goPackage};
+      };
+    };
 }

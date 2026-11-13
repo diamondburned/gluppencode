@@ -1,0 +1,14 @@
+[Desktop Entry]
+Name=Gluppencode
+Version=1.0
+Type=Application
+Terminal=false
+GenericName=OpenCode desktop client
+Comment=A GTK4 and libadwaita desktop frontend for OpenCode
+Exec=gluppencode
+Icon=so.libdb.gluppencode
+Categories=GNOME;GTK;Development;Utility;
+Keywords=OpenCode;AI;coding;assistant;chat;
+StartupNotify=true
+DBusActivatable=true
+X-GNOME-UsesNotifications=true

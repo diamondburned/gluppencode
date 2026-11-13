@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<component type="desktop-application">
+  <id>so.libdb.gluppencode</id>
+  <name>Gluppencode</name>
+  <summary>Native GTK4 desktop frontend for OpenCode</summary>
+  <developer id="so.libdb">
+    <name translatable="no">diamondburned</name>
+  </developer>
+  <launchable type="desktop-id">so.libdb.gluppencode.desktop</launchable>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+
+  <description>
+    <p>
+      Gluppencode is a native GTK4 and libadwaita desktop client for OpenCode.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/diamondburned/gluppencode</url>
+  <url type="bugtracker">https://github.com/diamondburned/gluppencode/issues</url>
+
+  <kudos>
+    <kudo>HiDpiIcon</kudo>
+    <kudo>ModernToolkit</kudo>
+  </kudos>
+
+  <recommends>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </recommends>
+
+  <content_rating type="oars-1.1" />
+</component>
