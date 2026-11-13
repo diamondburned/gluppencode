@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/diamondburned/gotk4-adwaita/pkg/adw"
@@ -20,6 +22,14 @@ func decodeBase64Texture(data string) (*gdk.Texture, error) {
 		data = data[idx+1:]
 	}
 	data = strings.TrimSpace(data)
+	if strings.ContainsAny(data, " \r\n\t") {
+		data = strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\n' || r == '\r' || r == '\t' {
+				return -1
+			}
+			return r
+		}, data)
+	}
 	rawBytes, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		rawBytes, err = base64.RawStdEncoding.DecodeString(data)
@@ -31,23 +41,40 @@ func decodeBase64Texture(data string) (*gdk.Texture, error) {
 	return gdk.NewTextureFromBytes(bytes)
 }
 
+// decodeImageTexture decodes an image from base64, data URI, file:// URI, or local file path.
+func decodeImageTexture(data string) (*gdk.Texture, error) {
+	if strings.HasPrefix(data, "file://") {
+		path := strings.TrimPrefix(data, "file://")
+		if b, err := os.ReadFile(path); err == nil {
+			return gdk.NewTextureFromBytes(glib.NewBytesWithGo(b))
+		}
+	} else if filepath.IsAbs(data) && !strings.HasPrefix(data, "data:") {
+		if b, err := os.ReadFile(data); err == nil {
+			if tex, err := gdk.NewTextureFromBytes(glib.NewBytesWithGo(b)); err == nil {
+				return tex, nil
+			}
+		}
+	}
+	return decodeBase64Texture(data)
+}
+
 // newImageThumbnail creates a clickable thumbnail widget that opens the lightbox image viewer.
 func newImageThumbnail(ctx context.Context, title string, tex *gdk.Texture) gtk.Widgetter {
 	pic := gtk.NewPictureForPaintable(tex)
 	pic.SetCanShrink(true)
 	pic.SetContentFit(gtk.ContentFitCover)
-	pic.SetSizeRequest(84, 84)
+	pic.SetSizeRequest(64, 64)
 
 	hClamp := adw.NewClamp()
 	hClamp.SetOrientation(gtk.OrientationHorizontal)
-	hClamp.SetMaximumSize(84)
-	hClamp.SetTighteningThreshold(84)
+	hClamp.SetMaximumSize(64)
+	hClamp.SetTighteningThreshold(64)
 	hClamp.SetChild(pic)
 
 	vClamp := adw.NewClamp()
 	vClamp.SetOrientation(gtk.OrientationVertical)
-	vClamp.SetMaximumSize(84)
-	vClamp.SetTighteningThreshold(84)
+	vClamp.SetMaximumSize(64)
+	vClamp.SetTighteningThreshold(64)
 	vClamp.SetChild(hClamp)
 
 	btn := gtk.NewButton()
@@ -55,6 +82,7 @@ func newImageThumbnail(ctx context.Context, title string, tex *gdk.Texture) gtk.
 	btn.AddCSSClass("glup-image-thumb")
 	btn.SetHAlign(gtk.AlignStart)
 	btn.SetVAlign(gtk.AlignStart)
+	btn.SetCursorFromName("pointer")
 	btn.SetChild(vClamp)
 	btn.SetTooltipText(fmt.Sprintf("%s (%dx%d) — click to zoom", title, tex.Width(), tex.Height()))
 

@@ -8660,6 +8660,15 @@ func (w *Window) rebuildAttachmentTray() {
 		tex, err := decodeBase64Texture(f.Data)
 		if err == nil && tex != nil {
 			pic.SetPaintable(tex)
+			pic.SetCursorFromName("pointer")
+			pic.SetTooltipText(fmt.Sprintf("%s (%dx%d) — click to zoom", f.Name, tex.Width(), tex.Height()))
+			name := f.Name
+			click := gtk.NewGestureClick()
+			click.SetButton(1)
+			click.ConnectReleased(func(_ int, _, _ float64) {
+				showImageViewer(w.ctx, name, tex)
+			})
+			pic.AddController(click)
 		}
 		hClamp := adw.NewClamp()
 		hClamp.SetOrientation(gtk.OrientationHorizontal)

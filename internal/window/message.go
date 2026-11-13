@@ -307,6 +307,7 @@ type ToolWidget struct {
 	shellFile          string
 	liveShellOutput    string
 	childSessionID     string
+	readPath           string
 	onOpenSubagent     func(string)
 	expanderWired      bool
 	lazyOutputItems    []opencode.ToolContentItem
@@ -432,11 +433,12 @@ func (t *ToolWidget) applyToolKind() {
 				return
 			}
 			expanded := t.detailsExpander.Expanded()
-			if t.detailsBox != nil {
-				t.detailsBox.SetVisible(expanded)
-			}
 			if expanded && t.lazyOutputDirty {
 				t.flushLazyOutput()
+			}
+			if t.detailsBox != nil {
+				hasDetails := (t.inputView != nil && t.inputView.Visible()) || (t.outputScroll != nil && t.outputScroll.Visible())
+				t.detailsBox.SetVisible(expanded && hasDetails)
 			}
 			if strings.EqualFold(t.toolName, "read") && t.imageBox != nil {
 				t.imageBox.SetVisible(expanded && len(t.imageWidgets) > 0)
@@ -772,6 +774,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		t.toolIcon.SetFromIconName("document-open-symbolic")
 		t.titleLabel.SetLabel("Read")
 		path, _ := m["path"].(string)
+		t.readPath = path
 		t.subtitleLabel.SetLabel(shortPath(path))
 		offset := toInt(m["offset"])
 		limit := toInt(m["limit"])
@@ -1163,13 +1166,39 @@ func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) 
 
 	var hasImage bool
 	for _, item := range items {
-		if item.Type == "file" && strings.HasPrefix(item.Mime, "image/") && item.Data != "" {
-			tex, err := decodeBase64Texture(item.Data)
+		data := item.ImageData()
+		if data == "" {
+			continue
+		}
+		isImage := strings.HasPrefix(item.Mime, "image/") || strings.HasPrefix(data, "data:image/")
+		if !isImage && (item.Type == "file" || item.Type == "") {
+			ext := strings.ToLower(filepath.Ext(item.Name))
+			switch ext {
+			case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
+				isImage = true
+			}
+		}
+		if isImage {
+			tex, err := decodeImageTexture(data)
 			if err == nil {
 				name := filepath.Base(item.Name)
 				if name == "" || name == "." {
 					name = "Image Output"
 				}
+				thumb := newImageThumbnail(t.ctx, name, tex)
+				t.imageBox.Append(thumb)
+				t.imageWidgets = append(t.imageWidgets, thumb)
+				hasImage = true
+			}
+		}
+	}
+	// Fallback for read tool if items did not contain an inline image payload but points to an image file on disk.
+	if !hasImage && strings.EqualFold(t.toolName, "read") && t.readPath != "" {
+		ext := strings.ToLower(filepath.Ext(t.readPath))
+		switch ext {
+		case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
+			if tex, err := decodeImageTexture(t.readPath); err == nil {
+				name := filepath.Base(t.readPath)
 				thumb := newImageThumbnail(t.ctx, name, tex)
 				t.imageBox.Append(thumb)
 				t.imageWidgets = append(t.imageWidgets, thumb)
@@ -1205,6 +1234,9 @@ func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) 
 		if strings.HasPrefix(txt, "You will be notified automatically when the command finishes.") {
 			continue
 		}
+		if hasImage && (txt == "Image read successfully" || txt == "PDF read successfully") {
+			continue
+		}
 		if sb.Len() > 0 {
 			sb.WriteByte('\n')
 		}
@@ -1227,6 +1259,13 @@ func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) 
 			t.detailsExpander.SetVisible(true)
 			t.detailsExpander.SetExpanded(true)
 		}
+	} else {
+		t.outputBuf.SetText("")
+		t.outputScroll.SetVisible(false)
+	}
+	if t.detailsBox != nil && t.detailsExpander != nil && t.detailsExpander.Expanded() {
+		hasDetails := (t.inputView != nil && t.inputView.Visible()) || (t.outputScroll != nil && t.outputScroll.Visible())
+		t.detailsBox.SetVisible(hasDetails)
 	}
 
 	if t.toolName == "shell" || t.toolName == "bash" {

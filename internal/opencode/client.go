@@ -923,6 +923,15 @@ type ToolContentItem struct {
 	Mime string `json:"mime,omitempty"`
 	Name string `json:"name,omitempty"`
 	Data string `json:"data,omitempty"`
+	URI  string `json:"uri,omitempty"`
+}
+
+// ImageData returns the image payload from either Data or URI.
+func (item ToolContentItem) ImageData() string {
+	if item.Data != "" {
+		return item.Data
+	}
+	return item.URI
 }
 
 // ToolState holds the execution state of a tool invocation.

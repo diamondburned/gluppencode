@@ -1304,6 +1304,60 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	if readTw.imageBox.Visible() {
 		t.Fatalf("expected read ToolWidget to hide imageBox when collapsed again")
 	}
+
+	// 2. Test read ToolWidget with OpenCode URI and "Image read successfully" suppression
+	readImgTw := &ToolWidget{
+		Box:             gtk.NewBox(gtk.OrientationVertical, 0),
+		ctx:             t.Context(),
+		headerRow:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+		summaryRow:      gtk.NewBox(gtk.OrientationHorizontal, 0),
+		detailsBox:      gtk.NewBox(gtk.OrientationVertical, 0),
+		toolIcon:        gtk.NewImage(),
+		titleLabel:      gtk.NewLabel(""),
+		subtitleLabel:   gtk.NewLabel(""),
+		badgesBox:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+		actionBtn:       gtk.NewButton(),
+		spinner:         adw.NewSpinner(),
+		statusLabel:     gtk.NewLabel(""),
+		imageBox:        gtk.NewBox(gtk.OrientationHorizontal, 0),
+		diffBox:         gtk.NewBox(gtk.OrientationVertical, 0),
+		detailsExpander: gtk.NewExpander(""),
+		inputView:       gtk.NewTextView(),
+		outputScroll:    gtk.NewScrolledWindow(),
+		outputView:      gtk.NewTextView(),
+		toolID:          "call_read_img",
+		toolName:        "read",
+	}
+	readImgTw.inputBuf = readImgTw.inputView.Buffer()
+	readImgTw.outputBuf = readImgTw.outputView.Buffer()
+	readImgTw.headerRow.Append(readImgTw.detailsExpander)
+	readImgTw.Append(readImgTw.headerRow)
+	readImgTw.Append(readImgTw.detailsBox)
+	readImgTw.Append(readImgTw.imageBox)
+	readImgTw.applyToolKind()
+	readImgTw.SetInput(map[string]any{"path": "opencode/offline-new2.png"})
+	readImgTw.SetOutput([]opencode.ToolContentItem{
+		{Type: "text", Text: "Image read successfully"},
+		{Type: "file", Mime: "image/png", Name: "opencode/offline-new2.png", URI: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
+	}, nil)
+
+	if readImgTw.imageBox.Visible() {
+		t.Fatalf("expected imageBox hidden before expansion")
+	}
+	readImgTw.detailsExpander.SetExpanded(true)
+	if txt := readImgTw.outputBuf.Text(readImgTw.outputBuf.StartIter(), readImgTw.outputBuf.EndIter(), false); txt != "" {
+		t.Fatalf("expected 'Image read successfully' placeholder to be suppressed, got %q", txt)
+	}
+	if readImgTw.outputScroll.Visible() {
+		t.Fatalf("expected outputScroll hidden when only image is present")
+	}
+	if len(readImgTw.imageWidgets) != 1 || !readImgTw.imageBox.Visible() {
+		t.Fatalf("expected 1 thumbnail and imageBox visible upon expansion, got len=%d visible=%v", len(readImgTw.imageWidgets), readImgTw.imageBox.Visible())
+	}
+	readImgTw.detailsExpander.SetExpanded(false)
+	if readImgTw.imageBox.Visible() {
+		t.Fatalf("expected imageBox hidden when collapsed again")
+	}
 }
 
 func TestBackgroundShellFilteringAndOutput(t *testing.T) {

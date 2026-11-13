@@ -1064,6 +1064,29 @@ func TestDecodeMessagesAndEvents(t *testing.T) {
 		if item.Type != "file" || item.Mime != "image/jpeg" || item.Name != "photo.jpg" || item.Data != "/9j/4AAQSkZJRg==" {
 			t.Errorf("unexpected ToolContentItem: %+v", item)
 		}
+		if item.ImageData() != "/9j/4AAQSkZJRg==" {
+			t.Errorf("unexpected ImageData(): %q", item.ImageData())
+		}
+	})
+
+	t.Run("decode tool content item with uri", func(t *testing.T) {
+		t.Parallel()
+		raw := `{
+			"type": "file",
+			"mime": "image/png",
+			"name": "/tmp/test.png",
+			"uri": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
+		}`
+		var item ToolContentItem
+		if err := json.Unmarshal([]byte(raw), &item); err != nil {
+			t.Fatalf("Unmarshal ToolContentItem: %v", err)
+		}
+		if item.Type != "file" || item.Mime != "image/png" || item.Name != "/tmp/test.png" || !strings.HasPrefix(item.URI, "data:image/png") {
+			t.Errorf("unexpected ToolContentItem with URI: %+v", item)
+		}
+		if item.ImageData() != item.URI {
+			t.Errorf("unexpected ImageData(): %q, want %q", item.ImageData(), item.URI)
+		}
 	})
 
 	t.Run("decode compaction SSE event", func(t *testing.T) {
