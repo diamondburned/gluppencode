@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <defs>
+    <linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="12" x2="116" y1="66" y2="66">
+      <stop offset="0" stop-color="#111418"/>
+      <stop offset="0.05" stop-color="#485061"/>
+      <stop offset="0.1" stop-color="#181b21"/>
+      <stop offset="0.9" stop-color="#181b21"/>
+      <stop offset="0.95" stop-color="#485061"/>
+      <stop offset="1" stop-color="#111418"/>
+    </linearGradient>
+  </defs>
+  <rect x="12" y="22" width="104" height="94" rx="8" fill="url(#rim)"/>
+  <rect x="12" y="14" width="104" height="96" rx="8" fill="#21252d"/>
+  <path d="M 50 38 L 58 56 L 76 64 L 58 72 L 50 90 L 42 72 L 24 64 L 42 56 Z" fill="#ffffff"/>
+  <path d="M 86 28 L 91 39 L 102 44 L 91 49 L 86 60 L 81 49 L 70 44 L 81 39 Z" fill="#f5a9b8"/>
+  <path d="M 86 68 L 91 79 L 102 84 L 91 89 L 86 100 L 81 89 L 70 84 L 81 79 Z" fill="#5bcefa"/>
+</svg>
