@@ -1,18 +1,24 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
   <defs>
-    <linearGradient id="rim" gradientUnits="userSpaceOnUse" x1="12" x2="116" y1="66" y2="66">
-      <stop offset="0" stop-color="#111418"/>
-      <stop offset="0.05" stop-color="#485061"/>
-      <stop offset="0.1" stop-color="#181b21"/>
-      <stop offset="0.9" stop-color="#181b21"/>
-      <stop offset="0.95" stop-color="#485061"/>
-      <stop offset="1" stop-color="#111418"/>
-    </linearGradient>
+    <clipPath id="star"><path d="M64.00 6.00 Q71.20 53.60 112.00 62.00 Q71.20 70.40 64.00 118.00 Q56.80 70.40 16.00 62.00 Q56.80 53.60 64.00 6.00 Z"/></clipPath>
+    <!-- lower half of the ring's plane = the part in front of the sparkle -->
+    <clipPath id="front"><rect x="-64" y="78" width="256" height="128" transform="rotate(-10 64 78)"/></clipPath>
+    <!-- same split, moved down with the shadow, so only the front half casts it -->
+    <clipPath id="front-shadow"><rect x="-64" y="78" width="256" height="128" transform="translate(0 6) rotate(-10 64 78)"/></clipPath>
+    <linearGradient id="tg" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="118" y2="0"><stop offset="0.000" stop-color="#f5a9b8"/><stop offset="0.062" stop-color="#f3a8c1"/><stop offset="0.125" stop-color="#f0a8cb"/><stop offset="0.188" stop-color="#eca9d5"/><stop offset="0.250" stop-color="#e6aade"/><stop offset="0.312" stop-color="#e0abe7"/><stop offset="0.375" stop-color="#d8adef"/><stop offset="0.438" stop-color="#d0aff6"/><stop offset="0.500" stop-color="#c6b2fd"/><stop offset="0.562" stop-color="#bcb5ff"/><stop offset="0.625" stop-color="#b0b8ff"/><stop offset="0.688" stop-color="#a4bcff"/><stop offset="0.750" stop-color="#96c0ff"/><stop offset="0.812" stop-color="#88c3ff"/><stop offset="0.875" stop-color="#7ac7ff"/><stop offset="0.938" stop-color="#6acbff"/><stop offset="1.000" stop-color="#5bcefa"/></linearGradient>
+    <clipPath id="upper"><rect x="0" y="0" width="128" height="62"/></clipPath>
   </defs>
-  <rect x="12" y="22" width="104" height="94" rx="8" fill="url(#rim)"/>
-  <rect x="12" y="14" width="104" height="96" rx="8" fill="#21252d"/>
-  <path d="M 50 38 L 58 56 L 76 64 L 58 72 L 50 90 L 42 72 L 24 64 L 42 56 Z" fill="#ffffff"/>
-  <path d="M 86 28 L 91 39 L 102 44 L 91 49 L 86 60 L 81 49 L 70 44 L 81 39 Z" fill="#f5a9b8"/>
-  <path d="M 86 68 L 91 79 L 102 84 L 91 89 L 86 100 L 81 89 L 70 84 L 81 79 Z" fill="#5bcefa"/>
+  <!-- back of the ring -->
+  <ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-10 64 78)"/><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-10 64 78)"/>
+  <radialGradient id="blob" gradientUnits="userSpaceOnUse" cx="64" cy="45.2" r="53.2">
+    <stop offset="0" stop-color="#f4f3ef"/><stop offset="0.45" stop-color="#dbd8cf"/><stop offset="1" stop-color="#959183"/>
+  </radialGradient>
+  <path d="M64.00 6.00 Q71.20 53.60 112.00 62.00 Q71.20 70.40 64.00 118.00 Q56.80 70.40 16.00 62.00 Q56.80 53.60 64.00 6.00 Z" fill="url(#blob)"/>
+  <!-- shadow the front of the ring casts onto the sparkle (light from above) -->
+  <g clip-path="url(#star)"><g clip-path="url(#front-shadow)">
+    <ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 6) rotate(-10 64 78)"/>
+  </g></g>
+  <!-- front of the ring -->
+  <g clip-path="url(#front)"><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-10 64 78)"/><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-10 64 78)"/></g>
 </svg>
