@@ -34,7 +34,6 @@
           })
           [
             ../internal/icons/hicolor
-            ../internal/icons/scalable
             ../internal/icons/symbolic
           ]
       );
