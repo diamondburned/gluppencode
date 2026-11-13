@@ -6,6 +6,8 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -547,6 +549,19 @@ func TestClientEndpointsSynctest(t *testing.T) {
 							t.Errorf("SwitchModel body = %s", string(b))
 						}
 						return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/move":
+						b, _ := io.ReadAll(req.Body)
+						if !strings.Contains(string(b), `"directory":"/workspace/sub"`) {
+							t.Errorf("MoveSession body = %s", string(b))
+						}
+						return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+					case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/revert/stage":
+						b, _ := io.ReadAll(req.Body)
+						if strings.Contains(string(b), `"files":true`) {
+							respBody = `{"data":{"messageID":"msg_u1","snapshot":"snap_1","files":[{"file":"internal/window/window.go","patch":"@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1,"status":"modified"}]}}`
+						} else {
+							respBody = `{"data":{"messageID":"msg_u1"}}`
+						}
 					case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/diff":
 						respBody = `{"data":[{"file":"internal/opencode/client.go","patch":"--- a/internal/opencode/client.go\n+++ b/internal/opencode/client.go\n@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1,"status":"modified"}]}`
 					default:
@@ -596,6 +611,26 @@ func TestClientEndpointsSynctest(t *testing.T) {
 
 		if err := client.SwitchModel(ctx, "ses_123", models[0].Ref()); err != nil {
 			t.Fatalf("SwitchModel: %v", err)
+		}
+
+		if err := client.MoveSession(ctx, "ses_123", "/workspace/sub"); err != nil {
+			t.Fatalf("MoveSession: %v", err)
+		}
+
+		revWithFiles, err := client.StageRevert(ctx, "ses_123", "msg_u1", true)
+		if err != nil {
+			t.Fatalf("StageRevert(files=true): %v", err)
+		}
+		if revWithFiles.MessageID != "msg_u1" || len(revWithFiles.Files) != 1 || revWithFiles.Files[0].File != "internal/window/window.go" {
+			t.Errorf("StageRevert(files=true) = %+v", revWithFiles)
+		}
+
+		revWithoutFiles, err := client.StageRevert(ctx, "ses_123", "msg_u1", false)
+		if err != nil {
+			t.Fatalf("StageRevert(files=false): %v", err)
+		}
+		if revWithoutFiles.MessageID != "msg_u1" || len(revWithoutFiles.Files) != 0 {
+			t.Errorf("StageRevert(files=false) = %+v", revWithoutFiles)
 		}
 
 		diffs, err := client.SessionDiff(ctx, "ses_123")
@@ -1329,7 +1364,7 @@ func TestRevertEndpoints(t *testing.T) {
 					if err := json.NewDecoder(req.Body).Decode(&capturedStageBody); err != nil {
 						t.Fatalf("decode stage body: %v", err)
 					}
-					resp := `{"data":{"id":"ses_123","title":"Staged","revert":{"messageID":"msg_target","snapshot":"snap_1","diff":"+added"}}}`
+					resp := `{"data":{"messageID":"msg_target","snapshot":"snap_1","diff":"+added"}}`
 					return &http.Response{
 						StatusCode: http.StatusOK,
 						Header:     http.Header{"Content-Type": []string{"application/json"}},
@@ -1376,19 +1411,19 @@ func TestRevertEndpoints(t *testing.T) {
 	ctx := context.Background()
 
 	// StageRevert
-	sess, err := client.StageRevert(ctx, "ses_123", "msg_target", true)
+	rev, err := client.StageRevert(ctx, "ses_123", "msg_target", true)
 	if err != nil {
 		t.Fatalf("StageRevert failed: %v", err)
 	}
-	if sess.Revert == nil || sess.Revert.MessageID != "msg_target" || sess.Revert.Diff != "+added" {
-		t.Errorf("unexpected sess.Revert: %+v", sess.Revert)
+	if rev == nil || rev.MessageID != "msg_target" || rev.Diff != "+added" {
+		t.Errorf("unexpected rev: %+v", rev)
 	}
 	if capturedStageBody["messageID"] != "msg_target" || capturedStageBody["files"] != true {
 		t.Errorf("unexpected StageRevert payload: %+v", capturedStageBody)
 	}
 
 	// ClearRevert
-	sess, err = client.ClearRevert(ctx, "ses_123")
+	sess, err := client.ClearRevert(ctx, "ses_123")
 	if err != nil {
 		t.Fatalf("ClearRevert failed: %v", err)
 	}
@@ -1804,6 +1839,94 @@ func TestDiscover(t *testing.T) {
 			t.Errorf("Password = %q, want secret123", c.Password)
 		}
 	})
+
+	t.Run("reads XDG_STATE_HOME/opencode/service.json and rediscovers on connection failure", func(t *testing.T) {
+		stateDir := t.TempDir()
+		svcDir := filepath.Join(stateDir, "opencode")
+		if err := os.MkdirAll(svcDir, 0o700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		svcFile := filepath.Join(svcDir, "service.json")
+		if err := os.WriteFile(svcFile, []byte(`{"url":"http://127.0.0.1:41111","password":"pass-old"}`), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		t.Setenv("OPENCODE_SERVER_URL", "")
+		t.Setenv("OPENCODE_SERVER_PASSWORD", "")
+		t.Setenv("XDG_STATE_HOME", stateDir)
+
+		c, err := Discover(ctx)
+		if err != nil {
+			t.Fatalf("Discover failed: %v", err)
+		}
+		if c.BaseURL != "http://127.0.0.1:41111" || c.Password != "pass-old" {
+			t.Fatalf("Discover got (%q, %q), want (http://127.0.0.1:41111, pass-old)", c.BaseURL, c.Password)
+		}
+
+		// Simulate server restarting on a new ephemeral port and updating service.json.
+		if err := os.WriteFile(svcFile, []byte(`{"url":"http://127.0.0.1:49374","password":"pass-new"}`), 0o600); err != nil {
+			t.Fatalf("WriteFile updated: %v", err)
+		}
+
+		var hosts []string
+		c.HTTP = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				hosts = append(hosts, req.URL.Host)
+				if req.URL.Host == "127.0.0.1:41111" {
+					return nil, errors.New("dial tcp 127.0.0.1:41111: connect: connection refused")
+				}
+				_, pass, _ := req.BasicAuth()
+				if pass != "pass-new" {
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Body:       io.NopCloser(strings.NewReader("unauthorized")),
+					}, nil
+				}
+				return &http.Response{
+					StatusCode: http.StatusNoContent,
+					Body:       http.NoBody,
+				}, nil
+			}),
+		}
+
+		if err := c.ReplyForm(ctx, "ses_1", "frm_1", map[string]any{"q0": "yes"}); err != nil {
+			t.Fatalf("ReplyForm after server restart failed: %v", err)
+		}
+		if len(hosts) != 2 || hosts[0] != "127.0.0.1:41111" || hosts[1] != "127.0.0.1:49374" {
+			t.Errorf("hosts = %v, want [127.0.0.1:41111 127.0.0.1:49374]", hosts)
+		}
+	})
+
+	t.Run("does not replay requests when the endpoint is unchanged", func(t *testing.T) {
+		stateDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(stateDir, "opencode"), 0o700); err != nil {
+			t.Fatalf("MkdirAll: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(stateDir, "opencode", "service.json"), []byte(`{"url":"http://127.0.0.1:41111","password":"p"}`), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		t.Setenv("OPENCODE_SERVER_URL", "")
+		t.Setenv("OPENCODE_SERVER_PASSWORD", "")
+		t.Setenv("XDG_STATE_HOME", stateDir)
+
+		c, err := Discover(ctx)
+		if err != nil {
+			t.Fatalf("Discover failed: %v", err)
+		}
+		var calls int
+		c.HTTP = &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				calls++
+				return nil, errors.New("read: connection reset by peer")
+			}),
+		}
+		if err := c.ReplyForm(ctx, "ses_1", "frm_1", map[string]any{"q0": "yes"}); err == nil {
+			t.Fatal("ReplyForm succeeded, want transport error")
+		}
+		if calls != 1 {
+			t.Errorf("calls = %d, want 1 (no replay against the same endpoint)", calls)
+		}
+	})
 }
 
 func TestInboxEndpoints(t *testing.T) {
@@ -2165,5 +2288,116 @@ func TestSessionCreatedEventAndIsRunning(t *testing.T) {
 	}
 	if patchedPath != "/api/session/ses_root_1" || patchedTitle != "Renamed Session Title" {
 		t.Errorf("RenameSession sent (%q, %q), want (/api/session/ses_root_1, Renamed Session Title)", patchedPath, patchedTitle)
+	}
+}
+
+func TestPermissionEndpointsAndEvents(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		capturedDir       string
+		capturedReplyBody map[string]any
+		capturedReplyPath string
+	)
+
+	permJSON := `{
+		"id": "per_123",
+		"sessionID": "ses_123",
+		"action": "bash",
+		"resources": ["run0 systemctl restart nginx.service"],
+		"save": ["run0 systemctl restart *"],
+		"metadata": {"command": "run0 systemctl restart nginx.service"},
+		"source": {"type": "tool", "messageID": "msg_1", "id": "call_1"},
+		"message": "Allow Shell tool to execute via run0?"
+	}`
+
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/permission/request":
+					capturedDir = req.URL.Query().Get("location[directory]")
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":[` + permJSON + `]}`)),
+					}, nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/permission":
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":[` + permJSON + `]}`)),
+					}, nil
+				case req.Method == http.MethodPost && strings.HasPrefix(req.URL.Path, "/api/session/ses_123/permission/"):
+					capturedReplyPath = req.URL.Path
+					if err := json.NewDecoder(req.Body).Decode(&capturedReplyBody); err != nil {
+						t.Fatalf("decode permission reply body: %v", err)
+					}
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+				default:
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       io.NopCloser(strings.NewReader("not found")),
+					}, nil
+				}
+			}),
+		},
+	}
+
+	perms, err := client.ListPermissions(ctx, "/workspace")
+	if err != nil {
+		t.Fatalf("ListPermissions failed: %v", err)
+	}
+	if capturedDir != "/workspace" {
+		t.Errorf("capturedDir = %q, want /workspace", capturedDir)
+	}
+	if len(perms) != 1 || perms[0].ID != "per_123" || perms[0].Action != "bash" || len(perms[0].Resources) != 1 {
+		t.Fatalf("unexpected permissions: %+v", perms)
+	}
+
+	sPerms, err := client.ListSessionPermissions(ctx, "ses_123")
+	if err != nil {
+		t.Fatalf("ListSessionPermissions failed: %v", err)
+	}
+	if len(sPerms) != 1 || sPerms[0].ID != "per_123" || len(sPerms[0].Save) != 1 {
+		t.Fatalf("unexpected session permissions: %+v", sPerms)
+	}
+
+	if err := client.ReplyPermission(ctx, "ses_123", "per_123", PermissionAlways, ""); err != nil {
+		t.Fatalf("ReplyPermission failed: %v", err)
+	}
+	if capturedReplyPath != "/api/session/ses_123/permission/per_123/reply" {
+		t.Errorf("capturedReplyPath = %q, want /api/session/ses_123/permission/per_123/reply", capturedReplyPath)
+	}
+	if capturedReplyBody["decision"] != "always" {
+		t.Errorf("capturedReplyBody = %+v, want decision=always", capturedReplyBody)
+	}
+
+	// Test both flat and wrapped permission.asked SSE payloads.
+	var flatAsked PermissionAskedEvent
+	if err := json.Unmarshal([]byte(permJSON), &flatAsked); err != nil {
+		t.Fatalf("unmarshal flat PermissionAskedEvent: %v", err)
+	}
+	if flatAsked.Request.ID != "per_123" || flatAsked.Request.SessionID != "ses_123" {
+		t.Errorf("unexpected flat PermissionAskedEvent: %+v", flatAsked)
+	}
+
+	var wrappedAsked PermissionAskedEvent
+	if err := json.Unmarshal([]byte(`{"request":`+permJSON+`}`), &wrappedAsked); err != nil {
+		t.Fatalf("unmarshal wrapped PermissionAskedEvent: %v", err)
+	}
+	if wrappedAsked.Request.ID != "per_123" || wrappedAsked.Request.Action != "bash" {
+		t.Errorf("unexpected wrapped PermissionAskedEvent: %+v", wrappedAsked)
+	}
+
+	// Test permission.replied SSE payload.
+	var repliedEv PermissionRepliedEvent
+	if err := json.Unmarshal([]byte(`{"sessionID":"ses_123","requestID":"per_123","reply":"once"}`), &repliedEv); err != nil {
+		t.Fatalf("unmarshal PermissionRepliedEvent: %v", err)
+	}
+	if repliedEv.EffectiveRequestID() != "per_123" || repliedEv.SessionID != "ses_123" || repliedEv.Reply != PermissionOnce {
+		t.Errorf("unexpected PermissionRepliedEvent: %+v", repliedEv)
 	}
 }

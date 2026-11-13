@@ -5937,15 +5937,15 @@ func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messa
 	}
 
 	gtkutil.Async(w.ctx, func() func() {
-		sess, err := w.client.StageRevert(w.ctx, sessionID, messageID, true)
+		rev, err := w.client.StageRevert(w.ctx, sessionID, messageID, true)
 		return func() {
 			if err != nil {
 				slog.Error("failed to stage revert", "sessionID", sessionID, "messageID", messageID, "err", err)
 				app.Error(w.ctx, err)
 				return
 			}
-			if sess != nil && sess.Revert != nil {
-				conv.session.Revert = sess.Revert
+			if rev != nil && rev.MessageID != "" {
+				conv.session.Revert = rev
 			} else {
 				conv.session.Revert = &opencode.SessionRevert{
 					MessageID: messageID,

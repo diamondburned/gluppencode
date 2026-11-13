@@ -175,3 +175,50 @@ type FormCancelledEvent struct {
 	ID        string `json:"id"`
 	SessionID string `json:"sessionID"`
 }
+
+// PermissionAskedEvent is emitted on "permission.asked".
+type PermissionAskedEvent struct {
+	Request PermissionRequest
+}
+
+// UnmarshalJSON supports both flat PermissionRequest payloads and nested {"request": {...}} / {"permission": {...}} payloads.
+func (e *PermissionAskedEvent) UnmarshalJSON(data []byte) error {
+	var wrapper struct {
+		Request    *PermissionRequest `json:"request"`
+		Permission *PermissionRequest `json:"permission"`
+		Info       *PermissionRequest `json:"info"`
+	}
+	if err := json.Unmarshal(data, &wrapper); err != nil {
+		return err
+	}
+	if wrapper.Request != nil && wrapper.Request.ID != "" {
+		e.Request = *wrapper.Request
+		return nil
+	}
+	if wrapper.Permission != nil && wrapper.Permission.ID != "" {
+		e.Request = *wrapper.Permission
+		return nil
+	}
+	if wrapper.Info != nil && wrapper.Info.ID != "" {
+		e.Request = *wrapper.Info
+		return nil
+	}
+	return json.Unmarshal(data, &e.Request)
+}
+
+// PermissionRepliedEvent is emitted on "permission.replied".
+type PermissionRepliedEvent struct {
+	ID        string             `json:"id,omitempty"`
+	RequestID string             `json:"requestID"`
+	SessionID string             `json:"sessionID"`
+	Reply     PermissionDecision `json:"reply,omitempty"`
+	Decision  PermissionDecision `json:"decision,omitempty"`
+}
+
+// EffectiveRequestID returns the non-empty request ID from the event.
+func (e PermissionRepliedEvent) EffectiveRequestID() string {
+	if e.RequestID != "" {
+		return e.RequestID
+	}
+	return e.ID
+}

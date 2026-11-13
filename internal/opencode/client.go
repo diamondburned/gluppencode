@@ -19,46 +19,88 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 // Client is an HTTP and SSE client for the OpenCode V2 server.
 type Client struct {
-	BaseURL  string
-	Password string
-	HTTP     *http.Client
+	mu           sync.RWMutex
+	BaseURL      string
+	Password     string
+	HTTP         *http.Client
+	autoDiscover bool
 }
 
 type serviceConfig struct {
+	URL      string `json:"url"`
 	Password string `json:"password"`
 }
 
-// Discover discovers the running OpenCode V2 server URL and password.
-func Discover(ctx context.Context) (*Client, error) {
-	baseURL := "http://127.0.0.1:4096"
-	var password string
+func normalizeServerURL(u string) string {
+	u = strings.TrimSpace(u)
+	if strings.HasPrefix(u, "http://0.0.0.0:") {
+		u = "http://127.0.0.1:" + strings.TrimPrefix(u, "http://0.0.0.0:")
+	}
+	if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
+		return strings.TrimRight(u, "/")
+	}
+	return ""
+}
 
-	if envURL := os.Getenv("OPENCODE_SERVER_URL"); envURL != "" {
+func stateServiceFilePath() string {
+	if stateDir := os.Getenv("XDG_STATE_HOME"); stateDir != "" {
+		return filepath.Join(stateDir, "opencode", "service.json")
+	}
+	if homeDir, err := os.UserHomeDir(); err == nil && homeDir != "" {
+		return filepath.Join(homeDir, ".local", "state", "opencode", "service.json")
+	}
+	return ""
+}
+
+func readServiceConfigFile(path string) (urlStr, password string) {
+	if path == "" {
+		return "", ""
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var cfg serviceConfig
+	if json.Unmarshal(data, &cfg) != nil {
+		return "", ""
+	}
+	return normalizeServerURL(cfg.URL), cfg.Password
+}
+
+func discoverEndpoint(ctx context.Context) (baseURL, password string) {
+	baseURL = "http://127.0.0.1:4096"
+
+	if envURL := normalizeServerURL(os.Getenv("OPENCODE_SERVER_URL")); envURL != "" {
 		baseURL = envURL
 		password = os.Getenv("OPENCODE_SERVER_PASSWORD")
-	} else if out, err := exec.CommandContext(ctx, "opencode", "service", "status").Output(); err == nil {
-		u := strings.TrimSpace(string(out))
-		if strings.HasPrefix(u, "http://0.0.0.0:") {
-			u = "http://127.0.0.1:" + strings.TrimPrefix(u, "http://0.0.0.0:")
+	} else {
+		stateURL, statePass := readServiceConfigFile(stateServiceFilePath())
+		if stateURL != "" {
+			baseURL = stateURL
 		}
-		if strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://") {
-			baseURL = u
+		if statePass != "" {
+			password = statePass
+		}
+		if stateURL == "" {
+			if out, err := exec.CommandContext(ctx, "opencode", "service", "status").Output(); err == nil {
+				if u := normalizeServerURL(string(out)); u != "" {
+					baseURL = u
+				}
+			}
 		}
 	}
 
 	if password == "" {
 		if cfgDir, err := os.UserConfigDir(); err == nil {
-			data, err := os.ReadFile(filepath.Join(cfgDir, "opencode", "service.json"))
-			if err == nil {
-				var cfg serviceConfig
-				if json.Unmarshal(data, &cfg) == nil {
-					password = cfg.Password
-				}
+			_, cfgPass := readServiceConfigFile(filepath.Join(cfgDir, "opencode", "service.json"))
+			if cfgPass != "" {
+				password = cfgPass
 			}
 		}
 	}
@@ -66,11 +108,98 @@ func Discover(ctx context.Context) (*Client, error) {
 		password = os.Getenv("OPENCODE_SERVER_PASSWORD")
 	}
 
+	return strings.TrimRight(baseURL, "/"), password
+}
+
+// Discover discovers the running OpenCode V2 server URL and password.
+func Discover(ctx context.Context) (*Client, error) {
+	baseURL, password := discoverEndpoint(ctx)
 	return &Client{
-		BaseURL:  strings.TrimRight(baseURL, "/"),
-		Password: password,
-		HTTP:     &http.Client{},
+		BaseURL:      baseURL,
+		Password:     password,
+		HTTP:         &http.Client{},
+		autoDiscover: os.Getenv("OPENCODE_SERVER_URL") == "",
 	}, nil
+}
+
+// SetServerURL overrides the client's BaseURL. Passing an empty string
+// restores automatic service discovery and refreshes the endpoint immediately.
+func (c *Client) SetServerURL(ctx context.Context, rawURL string) {
+	if c == nil {
+		return
+	}
+	u := normalizeServerURL(rawURL)
+	if u == "" {
+		c.mu.Lock()
+		c.autoDiscover = os.Getenv("OPENCODE_SERVER_URL") == ""
+		c.mu.Unlock()
+		baseURL, password := discoverEndpoint(ctx)
+		c.mu.Lock()
+		c.BaseURL, c.Password = baseURL, password
+		c.mu.Unlock()
+		return
+	}
+	c.mu.Lock()
+	c.BaseURL = u
+	c.autoDiscover = false
+	c.mu.Unlock()
+}
+
+// Rediscover refreshes the client's BaseURL and Password from the active OpenCode
+// service state file or CLI when the client was created via Discover. It reports
+// whether the endpoint changed.
+func (c *Client) Rediscover(ctx context.Context) bool {
+	if !c.autoDiscover {
+		return false
+	}
+	baseURL, password := discoverEndpoint(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if baseURL == c.BaseURL && password == c.Password {
+		return false
+	}
+	c.BaseURL, c.Password = baseURL, password
+	return true
+}
+
+// do sends the request built by newReq. When the server is unreachable or
+// rejects the credentials and rediscovery finds a different endpoint (e.g. the
+// server restarted on a new port), it retries once against the new endpoint.
+// Requests are never replayed against the same endpoint, so a POST that may have
+// been processed is not duplicated.
+func (c *Client) do(ctx context.Context, newReq func() (*http.Request, error)) (*http.Response, error) {
+	req, err := newReq()
+	if err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient().Do(req)
+	stale := (err != nil && ctx.Err() == nil) || (err == nil && resp.StatusCode == http.StatusUnauthorized)
+	if !stale || !c.Rediscover(ctx) {
+		return resp, err
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	if req, err = newReq(); err != nil {
+		return nil, err
+	}
+	return c.httpClient().Do(req)
+}
+
+// ServerURL returns the current OpenCode server base URL.
+func (c *Client) ServerURL() string {
+	if c == nil {
+		return ""
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.BaseURL
+}
+
+func (c *Client) endpoint() (baseURL, password string) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.BaseURL, c.Password
 }
 
 func (c *Client) httpClient() *http.Client {
@@ -89,25 +218,24 @@ func (c *Client) newRequest(ctx context.Context, method, path string, body any) 
 		}
 		r = bytes.NewReader(b)
 	}
-	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(c.BaseURL, "/")+path, r)
+	baseURL, password := c.endpoint()
+	req, err := http.NewRequestWithContext(ctx, method, strings.TrimRight(baseURL, "/")+path, r)
 	if err != nil {
 		return nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	if c.Password != "" {
-		req.SetBasicAuth("opencode", c.Password)
+	if password != "" {
+		req.SetBasicAuth("opencode", password)
 	}
 	return req, nil
 }
 
 func (c *Client) doJSON(ctx context.Context, method, path string, body, out any) error {
-	req, err := c.newRequest(ctx, method, path, body)
-	if err != nil {
-		return err
-	}
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.do(ctx, func() (*http.Request, error) {
+		return c.newRequest(ctx, method, path, body)
+	})
 	if err != nil {
 		return err
 	}
@@ -181,13 +309,6 @@ type TokenUsage struct {
 
 // SessionTokens is an alias for TokenUsage on a Session.
 type SessionTokens = TokenUsage
-
-// SessionRevert describes a staged revert on a session.
-type SessionRevert struct {
-	MessageID string `json:"messageID"`
-	Snapshot  string `json:"snapshot,omitempty"`
-	Diff      string `json:"diff,omitempty"`
-}
 
 // Session represents an OpenCode V2 session.
 type Session struct {
@@ -317,8 +438,23 @@ func (c *Client) RenameSession(ctx context.Context, sessionID, title string) err
 	return c.doJSON(ctx, http.MethodPatch, path, body, nil)
 }
 
+// MoveSession moves a session to a different working directory (POST /api/session/{sessionID}/move).
+func (c *Client) MoveSession(ctx context.Context, sessionID, directory string) error {
+	path := fmt.Sprintf("/api/session/%s/move", url.PathEscape(sessionID))
+	body := map[string]string{"directory": directory}
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+// SessionRevert describes a staged revert on a session.
+type SessionRevert struct {
+	MessageID string     `json:"messageID"`
+	Snapshot  string     `json:"snapshot,omitempty"`
+	Diff      string     `json:"diff,omitempty"`
+	Files     []FileDiff `json:"files,omitempty"`
+}
+
 // StageRevert stages a revert to a specific message ID in a session (POST /api/session/{sessionID}/revert/stage).
-func (c *Client) StageRevert(ctx context.Context, sessionID, messageID string, revertFiles bool) (*Session, error) {
+func (c *Client) StageRevert(ctx context.Context, sessionID, messageID string, revertFiles bool) (*SessionRevert, error) {
 	path := fmt.Sprintf("/api/session/%s/revert/stage", url.PathEscape(sessionID))
 	body := map[string]any{
 		"messageID": messageID,
@@ -328,11 +464,11 @@ func (c *Client) StageRevert(ctx context.Context, sessionID, messageID string, r
 	if err := c.doJSON(ctx, http.MethodPost, path, body, &raw); err != nil {
 		return nil, err
 	}
-	var sess Session
-	if err := decodeDataOrDirect(raw, &sess); err != nil {
+	var rev SessionRevert
+	if err := decodeDataOrDirect(raw, &rev); err != nil {
 		return nil, err
 	}
-	return &sess, nil
+	return &rev, nil
 }
 
 // ClearRevert clears any staged revert for a session (DELETE /api/session/{sessionID}/revert).
@@ -395,6 +531,7 @@ type Agent struct {
 	Hidden      bool   `json:"hidden"`
 	Color       string `json:"color,omitempty"`
 	Description string `json:"description,omitempty"`
+	System      string `json:"system,omitempty"`
 }
 
 // ListAgents fetches registered agents from GET /api/agent.
@@ -515,6 +652,26 @@ func (c *Client) SwitchModel(ctx context.Context, sessionID string, model ModelR
 	path := fmt.Sprintf("/api/session/%s/model", url.PathEscape(sessionID))
 	body := map[string]ModelRef{"model": model}
 	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
+// GenerateText runs a stateless text generation request (POST /api/experimental/generate/text)
+// without creating a session or mutating conversation history.
+func (c *Client) GenerateText(ctx context.Context, prompt string, model *ModelRef) (string, error) {
+	body := map[string]any{"prompt": prompt}
+	if model != nil && model.ID != "" && model.ProviderID != "" {
+		body["model"] = *model
+	}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodPost, "/api/experimental/generate/text", body, &raw); err != nil {
+		return "", err
+	}
+	var res struct {
+		Text string `json:"text"`
+	}
+	if err := decodeDataOrDirect(raw, &res); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Text), nil
 }
 
 // CommandInfo describes an OpenCode slash command.
@@ -1053,6 +1210,7 @@ type PromptOptions struct {
 	Agents   []PromptAgentInput // @agent mentions
 	Skills   []PromptSkillInput // @skill mentions
 	Delivery InboxDelivery      // "queue" or "steer"
+	NoResume bool               // when true, enqueues without triggering immediate session resume
 }
 
 // PromptFileSource indicates how file content is provided in prompt inputs.
@@ -1120,7 +1278,7 @@ func (c *Client) SendPrompt(ctx context.Context, sessionID string, opts PromptOp
 		Agents:   opts.Agents,
 		Skills:   opts.Skills,
 		Delivery: opts.Delivery,
-		Resume:   true,
+		Resume:   !opts.NoResume,
 	}
 	path := fmt.Sprintf("/api/session/%s/prompt", url.PathEscape(sessionID))
 	var raw json.RawMessage
@@ -1279,6 +1437,80 @@ func (c *Client) CancelForm(ctx context.Context, sessionID, formID, message stri
 	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
 }
 
+// PermissionDecision represents the reply decision for a pending permission request.
+type PermissionDecision string
+
+const (
+	PermissionOnce   PermissionDecision = "once"
+	PermissionAlways PermissionDecision = "always"
+	PermissionReject PermissionDecision = "reject"
+)
+
+// PermissionSource links a permission request to a specific tool call.
+type PermissionSource struct {
+	Type      string `json:"type,omitempty"`
+	MessageID string `json:"messageID,omitempty"`
+	ID        string `json:"id,omitempty"`
+}
+
+// PermissionRequest represents a pending tool execution authorization request in OpenCode V2.
+type PermissionRequest struct {
+	ID        string            `json:"id"`
+	SessionID string            `json:"sessionID"`
+	Action    string            `json:"action"`
+	Resources []string          `json:"resources"`
+	Save      []string          `json:"save,omitempty"`
+	Metadata  map[string]any    `json:"metadata,omitempty"`
+	Source    *PermissionSource `json:"source,omitempty"`
+	Message   string            `json:"message,omitempty"`
+}
+
+// ListPermissions lists pending permission requests across a project directory (GET /api/permission/request).
+func (c *Client) ListPermissions(ctx context.Context, directory string) ([]PermissionRequest, error) {
+	path := "/api/permission/request"
+	if directory != "" {
+		v := url.Values{}
+		v.Set("location[directory]", directory)
+		path += "?" + v.Encode()
+	}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var reqs []PermissionRequest
+	if err := decodeDataOrDirect(raw, &reqs); err != nil {
+		return nil, err
+	}
+	return reqs, nil
+}
+
+// ListSessionPermissions lists pending permission requests for a session (GET /api/session/{sessionID}/permission).
+func (c *Client) ListSessionPermissions(ctx context.Context, sessionID string) ([]PermissionRequest, error) {
+	path := fmt.Sprintf("/api/session/%s/permission", url.PathEscape(sessionID))
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var reqs []PermissionRequest
+	if err := decodeDataOrDirect(raw, &reqs); err != nil {
+		return nil, err
+	}
+	return reqs, nil
+}
+
+// ReplyPermission submits a decision ("once", "always", or "reject") for a pending permission request
+// (POST /api/session/{sessionID}/permission/{requestID}/reply). The server answers 204 No Content.
+func (c *Client) ReplyPermission(ctx context.Context, sessionID, requestID string, decision PermissionDecision, message string) error {
+	path := fmt.Sprintf("/api/session/%s/permission/%s/reply", url.PathEscape(sessionID), url.PathEscape(requestID))
+	body := map[string]any{
+		"decision": string(decision),
+	}
+	if message != "" {
+		body["message"] = message
+	}
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
 // Event is an SSE event emitted by /api/event.
 type Event struct {
 	ID       string          `json:"id"`
@@ -1289,14 +1521,19 @@ type Event struct {
 
 // SubscribeEvents connects to /api/event and invokes fn for each decoded event.
 func (c *Client) SubscribeEvents(ctx context.Context, fn func(Event)) error {
-	req, err := c.newRequest(ctx, http.MethodGet, "/api/event", nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
+	return c.subscribeEvents(ctx, fn, nil)
+}
 
-	resp, err := c.httpClient().Do(req)
+func (c *Client) subscribeEvents(ctx context.Context, fn func(Event), onConnected func()) error {
+	resp, err := c.do(ctx, func() (*http.Request, error) {
+		req, err := c.newRequest(ctx, http.MethodGet, "/api/event", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		return req, nil
+	})
 	if err != nil {
 		return err
 	}
@@ -1305,6 +1542,9 @@ func (c *Client) SubscribeEvents(ctx context.Context, fn func(Event)) error {
 	if resp.StatusCode >= 400 {
 		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		return fmt.Errorf("sse http %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	if onConnected != nil {
+		onConnected()
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
@@ -1373,7 +1613,7 @@ func (c *Client) SubscribeEvents(ctx context.Context, fn func(Event)) error {
 
 // SubscribeEventsLoop continuously subscribes to /api/event, reconnecting after
 // retryDelay whenever the stream disconnects or fails until ctx is canceled.
-// Optional onReconnect callback is invoked each time a reconnection occurs.
+// Optional onReconnect callback is invoked each time a reconnection succeeds.
 func (c *Client) SubscribeEventsLoop(ctx context.Context, retryDelay time.Duration, fn func(Event), onReconnect func()) error {
 	if retryDelay <= 0 {
 		retryDelay = 2 * time.Second
@@ -1383,14 +1623,14 @@ func (c *Client) SubscribeEventsLoop(ctx context.Context, retryDelay time.Durati
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !first {
-			if onReconnect != nil {
-				onReconnect()
-			}
-		}
+		isReconnect := !first
 		first = false
 
-		_ = c.SubscribeEvents(ctx, fn)
+		_ = c.subscribeEvents(ctx, fn, func() {
+			if isReconnect && onReconnect != nil {
+				onReconnect()
+			}
+		})
 		if err := ctx.Err(); err != nil {
 			return err
 		}
