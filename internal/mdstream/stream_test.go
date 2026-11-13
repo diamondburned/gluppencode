@@ -535,7 +535,7 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 			t.Fatalf("ParseStatic returned %d blocks, want 1", len(blocks))
 		}
 		markup := renderInline(blocks[0].Node, blocks[0].Source)
-		wantSpan := `<tt><span background="#787c88" bgalpha="20%" size="92%">&#160;code&#160;</span></tt>`
+		wantSpan := `<tt><span background="#787c88" bgalpha="20%" size="86%">&#160;code&#160;</span></tt>`
 		if !strings.Contains(markup, wantSpan) {
 			t.Errorf("renderInline() = %q, want it to contain %q", markup, wantSpan)
 		}
@@ -689,6 +689,91 @@ func TestViewCodeTagAndTableRendering(t *testing.T) {
 			t.Errorf("renderInline() = %q, want it to contain %q", markup, wantNoAlt)
 		}
 	})
+
+	t.Run("website links render InlineBlock with earth-symbolic icon and direct links", func(t *testing.T) {
+		var activatedURI string
+		linkCtx := WithLinkHandler(context.Background(), func(uri string) bool {
+			activatedURI = uri
+			return true
+		})
+		linkView := NewView(linkCtx)
+		linkView.SetStatic("Visit [OpenCode](https://opencode.ai) or https://example.com/docs.")
+
+		widgets := linkView.CommittedWidgets()
+		if len(widgets) != 1 {
+			t.Fatalf("CommittedWidgets() = %d, want 1", len(widgets))
+		}
+		ib, ok := widgets[0].(*InlineBlock)
+		if !ok {
+			t.Fatalf("expected *InlineBlock for paragraph with website links, got %T", widgets[0])
+		}
+		if len(ib.LinkIcons) != 2 {
+			t.Fatalf("expected 2 website link icons, got %d", len(ib.LinkIcons))
+		}
+		for i, img := range ib.LinkIcons {
+			if got := img.IconName(); got != "earth-symbolic" {
+				t.Errorf("LinkIcons[%d].IconName() = %q, want earth-symbolic", i, got)
+			}
+		}
+		if len(ib.Links) != 2 || ib.Links[0] != "https://opencode.ai" || ib.Links[1] != "https://example.com/docs" {
+			t.Errorf("ib.Links = %v, want [https://opencode.ai https://example.com/docs]", ib.Links)
+		}
+		text := ib.Buffer.Slice(ib.Buffer.StartIter(), ib.Buffer.EndIter(), false)
+		if !strings.Contains(text, "OpenCode") || !strings.Contains(text, "https://example.com/docs.") {
+			t.Errorf("InlineBlock buffer text = %q", text)
+		}
+		if !ActivateLink(linkCtx, ib.Links[0]) || activatedURI != "https://opencode.ai" {
+			t.Errorf("ActivateLink did not invoke LinkHandler, activatedURI = %q", activatedURI)
+		}
+	})
+
+	t.Run("session ID links resolve to conversation title and activate session link", func(t *testing.T) {
+		var clickedURI string
+		sessCtx := WithSessionResolver(context.Background(), func(sessionID string) string {
+			if sessionID == "ses_e5234997bffeyWyTQ8JFHIPGnv" {
+				return "Fix SSE Reconnect & Links"
+			}
+			return ""
+		})
+		sessCtx = WithLinkHandler(sessCtx, func(uri string) bool {
+			clickedURI = uri
+			return true
+		})
+
+		sessView := NewView(sessCtx)
+		sessView.SetStatic("See session `ses_e5234997bffeyWyTQ8JFHIPGnv` and bare ses_unknown1234567890.")
+
+		widgets := sessView.CommittedWidgets()
+		if len(widgets) != 1 {
+			t.Fatalf("CommittedWidgets() = %d, want 1", len(widgets))
+		}
+		lbl, ok := widgets[0].(*gtk.Label)
+		if !ok {
+			t.Fatalf("expected *gtk.Label when no website links are present, got %T", widgets[0])
+		}
+		if !strings.Contains(lbl.Text(), "Fix SSE Reconnect & Links") {
+			t.Errorf("label text = %q, want it to contain resolved session title", lbl.Text())
+		}
+		if strings.Contains(lbl.Text(), "ses_e5234997bffeyWyTQ8JFHIPGnv") {
+			t.Errorf("label text = %q, expected resolved session ID to be replaced by title", lbl.Text())
+		}
+
+		blocks := ParseStatic("See session `ses_e5234997bffeyWyTQ8JFHIPGnv` and bare ses_unknown1234567890.")
+		markup := renderInlineWithContext(sessCtx, blocks[0].Node, blocks[0].Source)
+		wantResolvedLink := `<a href="opencode://session/ses_e5234997bffeyWyTQ8JFHIPGnv">Fix SSE Reconnect &amp; Links</a>`
+		if !strings.Contains(markup, wantResolvedLink) {
+			t.Errorf("markup = %q, want it to contain %q", markup, wantResolvedLink)
+		}
+		wantUnresolvedLink := `<a href="opencode://session/ses_unknown1234567890">ses_unknown1234567890</a>`
+		if !strings.Contains(markup, wantUnresolvedLink) {
+			t.Errorf("markup = %q, want it to contain %q", markup, wantUnresolvedLink)
+		}
+
+		ActivateLink(sessCtx, SessionLinkPrefix+"ses_e5234997bffeyWyTQ8JFHIPGnv")
+		if clickedURI != "opencode://session/ses_e5234997bffeyWyTQ8JFHIPGnv" {
+			t.Errorf("clickedURI = %q, want opencode://session/ses_e5234997bffeyWyTQ8JFHIPGnv", clickedURI)
+		}
+	})
 }
 
 func splitEveryN(s string, n int) []string {
@@ -769,4 +854,57 @@ func TestViewDedup(t *testing.T) {
 			t.Errorf("block 2 text = %q, want 'Third'", lbl2.Text())
 		}
 	})
+}
+
+func TestStreamingMatchesStaticParse(t *testing.T) {
+	tests := []struct {
+		name string
+		doc  string
+		want []string
+	}{
+		{
+			// The partial line "#" parses as an empty ATX heading until "#123" arrives.
+			name: "lazy continuation starting with hash",
+			doc:  "see issue\n#123 for details\n\nnext",
+			want: []string{"see issue\n#123 for details", "next"},
+		},
+		{
+			// A fence inside a list item is closed by the item ending; the unindented
+			// lines after it are siblings. This used to panic with inverted spans.
+			name: "fence opened in list item",
+			doc:  "- ```\nx\n```",
+			want: []string{"- ```", "x", "```"},
+		},
+		{
+			name: "fence opened in blockquote",
+			doc:  "> ```\nx\n```",
+			want: []string{"> ```", "x", "```"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var static []string
+			for _, b := range ParseStatic(tt.doc) {
+				static = append(static, b.Raw)
+			}
+			if !reflect.DeepEqual(static, tt.want) {
+				t.Fatalf("ParseStatic = %q, want %q", static, tt.want)
+			}
+
+			e := NewEngine()
+			var streamed []string
+			for i := range len(tt.doc) {
+				p, _ := e.Step(tt.doc[i : i+1])
+				for _, b := range p.Committed {
+					streamed = append(streamed, b.Raw)
+				}
+			}
+			for _, b := range e.Finalize("").Committed {
+				streamed = append(streamed, b.Raw)
+			}
+			if !reflect.DeepEqual(streamed, tt.want) {
+				t.Fatalf("streamed byte-by-byte = %q, want %q", streamed, tt.want)
+			}
+		})
+	}
 }

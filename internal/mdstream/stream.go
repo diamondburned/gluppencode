@@ -305,6 +305,14 @@ func computeBlockSpans(src []byte, nodes []ast.Node) []blockSpan {
 		}
 
 		end, closed := blockEndOffset(src, n, start)
+		// A container whose last child is a fence implicitly closed by the container
+		// ending (e.g. "- ```\nx\n```") scans to EOF; it cannot extend past the line
+		// where Goldmark started the next sibling.
+		if i+1 < len(nodes) {
+			if ns, ok := firstLineStart(src, nodes[i+1]); ok && ns > start && end > ns {
+				end, closed = ns, true
+			}
+		}
 		spans[i] = blockSpan{
 			node:   n,
 			start:  start,
@@ -322,6 +330,27 @@ func computeBlockSpans(src []byte, nodes []ast.Node) []blockSpan {
 	}
 
 	return spans
+}
+
+// firstLineStart returns the offset of the line on which n begins, as far as its
+// segments tell (the opening fence line for fenced code blocks).
+func firstLineStart(src []byte, n ast.Node) (int, bool) {
+	if f, ok := n.(*ast.FencedCodeBlock); ok {
+		switch {
+		case f.Info != nil:
+			return lineStart(src, f.Info.Segment.Start), true
+		case f.Lines().Len() > 0:
+			if first := lineStart(src, f.Lines().At(0).Start); first > 0 {
+				return lineStart(src, first-1), true
+			}
+		}
+		return 0, false
+	}
+	minSeg, _, ok := nodeSegmentBounds(n)
+	if !ok {
+		return 0, false
+	}
+	return lineStart(src, minSeg), true
 }
 
 func isContainerWithPreMarker(n ast.Node) bool {
@@ -351,10 +380,14 @@ func canCommitSpan(src []byte, spans []blockSpan, i int) bool {
 	nextRaw := bytes.TrimRight(src[next.start:next.end], "\r\n")
 	hasBlankBetween := hasBlankLineBetween(src, sp.end, next.start) || next.node.HasBlankPreviousLines()
 
-	// 1. If sp is a Paragraph and there is no blank line before next, check if next
-	// is a single-line Setext underline prefix (`-` or `=`) still being typed at EOF.
-	if sp.node.Kind() == ast.KindParagraph && !hasBlankBetween {
-		if isSetextUnderlineCandidate(src[next.start:]) {
+	// 1. If next directly follows a block that accepts lazy continuation lines and
+	// next's first line is still being typed at EOF, its interpretation is not final:
+	// `#` parses as an empty heading until `#123` arrives, `-` as a Setext underline
+	// until `-foo`, `<div` as an HTML block until `<divx`, all of which fold back
+	// into sp.
+	switch sp.node.Kind() {
+	case ast.KindParagraph, ast.KindList, ast.KindBlockquote:
+		if !hasBlankBetween && bytes.IndexByte(src[next.start:], '\n') == -1 {
 			return false
 		}
 	}
@@ -375,28 +408,6 @@ func hasBlankLineBetween(src []byte, aEnd, bStart int) bool {
 		return len(bytes.TrimSpace(src[aEnd:bStart])) == 0
 	}
 	return false
-}
-
-func isSetextUnderlineCandidate(tail []byte) bool {
-	// Only ambiguous if tail has no newline yet and consists solely of up to 3 leading spaces
-	// followed by '-' or '=' and optional trailing spaces.
-	if bytes.IndexByte(tail, '\n') != -1 {
-		return false
-	}
-	s := trimLeadingSpacesUpTo3(tail)
-	if len(s) == 0 {
-		return true
-	}
-	ch := s[0]
-	if ch != '-' && ch != '=' {
-		return false
-	}
-	for _, b := range s {
-		if b != ch && b != ' ' && b != '\t' && b != '\r' {
-			return false
-		}
-	}
-	return true
 }
 
 func isIncompleteContinuationMarker(nextRaw, tailFromNext []byte) bool {
