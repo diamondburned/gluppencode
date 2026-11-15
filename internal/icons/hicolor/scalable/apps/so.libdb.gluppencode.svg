@@ -3,22 +3,22 @@
   <defs>
     <clipPath id="star"><path d="M64.00 6.00 Q71.20 53.60 112.00 62.00 Q71.20 70.40 64.00 118.00 Q56.80 70.40 16.00 62.00 Q56.80 53.60 64.00 6.00 Z"/></clipPath>
     <!-- lower half of the ring's plane = the part in front of the sparkle -->
-    <clipPath id="front"><rect x="-64" y="78" width="256" height="128" transform="rotate(-10 64 78)"/></clipPath>
+    <clipPath id="front"><rect x="-64" y="64" width="256" height="128" transform="rotate(-16 64 64)"/></clipPath>
     <!-- same split, moved down with the shadow, so only the front half casts it -->
-    <clipPath id="front-shadow"><rect x="-64" y="78" width="256" height="128" transform="translate(0 6) rotate(-10 64 78)"/></clipPath>
+    <clipPath id="front-shadow"><rect x="-64" y="64" width="256" height="128" transform="translate(0 6) rotate(-16 64 64)"/></clipPath>
     <linearGradient id="tg" gradientUnits="userSpaceOnUse" x1="10" y1="0" x2="118" y2="0"><stop offset="0.000" stop-color="#f5a9b8"/><stop offset="0.062" stop-color="#f3a8c1"/><stop offset="0.125" stop-color="#f0a8cb"/><stop offset="0.188" stop-color="#eca9d5"/><stop offset="0.250" stop-color="#e6aade"/><stop offset="0.312" stop-color="#e0abe7"/><stop offset="0.375" stop-color="#d8adef"/><stop offset="0.438" stop-color="#d0aff6"/><stop offset="0.500" stop-color="#c6b2fd"/><stop offset="0.562" stop-color="#bcb5ff"/><stop offset="0.625" stop-color="#b0b8ff"/><stop offset="0.688" stop-color="#a4bcff"/><stop offset="0.750" stop-color="#96c0ff"/><stop offset="0.812" stop-color="#88c3ff"/><stop offset="0.875" stop-color="#7ac7ff"/><stop offset="0.938" stop-color="#6acbff"/><stop offset="1.000" stop-color="#5bcefa"/></linearGradient>
     <clipPath id="upper"><rect x="0" y="0" width="128" height="62"/></clipPath>
   </defs>
   <!-- back of the ring -->
-  <ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-10 64 78)"/><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-10 64 78)"/>
+  <ellipse cx="64" cy="64" rx="48" ry="12" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-16 64 64)"/><ellipse cx="64" cy="64" rx="48" ry="12" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-16 64 64)"/>
   <radialGradient id="blob" gradientUnits="userSpaceOnUse" cx="64" cy="45.2" r="53.2">
     <stop offset="0" stop-color="#f4f3ef"/><stop offset="0.45" stop-color="#dbd8cf"/><stop offset="1" stop-color="#959183"/>
   </radialGradient>
   <path d="M64.00 6.00 Q71.20 53.60 112.00 62.00 Q71.20 70.40 64.00 118.00 Q56.80 70.40 16.00 62.00 Q56.80 53.60 64.00 6.00 Z" fill="url(#blob)"/>
   <!-- shadow the front of the ring casts onto the sparkle (light from above) -->
   <g clip-path="url(#star)"><g clip-path="url(#front-shadow)">
-    <ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 6) rotate(-10 64 78)"/>
+    <ellipse cx="64" cy="64" rx="48" ry="12" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 6) rotate(-16 64 64)"/>
   </g></g>
   <!-- front of the ring -->
-  <g clip-path="url(#front)"><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-10 64 78)"/><ellipse cx="64" cy="78" rx="50" ry="11" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-10 64 78)"/></g>
+  <g clip-path="url(#front)"><ellipse cx="64" cy="64" rx="48" ry="12" fill="none" stroke-width="9" stroke="#9a9996" transform="translate(0 2) rotate(-16 64 64)"/><ellipse cx="64" cy="64" rx="48" ry="12" fill="none" stroke-width="7" stroke="url(#tg)" transform="rotate(-16 64 64)"/></g>
 </svg>
