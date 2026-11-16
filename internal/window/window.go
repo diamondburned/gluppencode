@@ -25,6 +25,7 @@ import (
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gio/v2"
 	"github.com/diamondburned/gotk4/pkg/glib/v2"
+	"github.com/diamondburned/gotk4/pkg/graphene"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
 	"github.com/diamondburned/gotkit/app"
@@ -314,8 +315,12 @@ func (c *convTimeline) keepPendingAtBottom() {
 }
 
 type switcherIndicator struct {
-	box      *gtk.Box
+	row      *gtk.ListBoxRow
+	hBox     *gtk.Box
 	spinner  *adw.Spinner
+	dot      *gtk.Box
+	titleLbl *gtk.Label
+	box      *gtk.Box
 	label    *gtk.Label
 	closeBtn *gtk.Button
 	rowPtr   uintptr
@@ -329,7 +334,56 @@ type sessionTab struct {
 	subTimelines     map[string]*convTimeline
 	activeSubID      string
 	gitBranch        string
+	title            string
+	needsAttention   bool
 	sidebarIndicator *switcherIndicator
+}
+
+func (t *sessionTab) Title() string {
+	if t == nil {
+		return ""
+	}
+	if strings.TrimSpace(t.title) != "" {
+		return strings.TrimSpace(t.title)
+	}
+	if t.main != nil && strings.TrimSpace(t.main.session.Title) != "" {
+		return strings.TrimSpace(t.main.session.Title)
+	}
+	if t.page != nil && strings.TrimSpace(t.page.Title()) != "" {
+		return strings.TrimSpace(t.page.Title())
+	}
+	return "Untitled"
+}
+
+func (t *sessionTab) setTitle(title string) {
+	if t == nil {
+		return
+	}
+	title = strings.TrimSpace(title)
+	if title == "" {
+		title = "Untitled"
+	}
+	t.title = title
+	if t.page != nil && t.page.Title() != title {
+		t.page.SetTitle(title)
+	}
+}
+
+func (t *sessionTab) NeedsAttention() bool {
+	if t == nil {
+		return false
+	}
+	return t.needsAttention
+}
+
+func (t *sessionTab) setNeedsAttention(needs bool) {
+	if t == nil {
+		return
+	}
+	t.needsAttention = needs
+	if t.page != nil && t.page.NeedsAttention() != needs {
+		t.page.SetNeedsAttention(needs)
+	}
 }
 
 func (t *sessionTab) activeConv() *convTimeline {
@@ -418,7 +472,8 @@ type Window struct {
 	hideSidebarBtn      *gtk.Button
 	appMenuSidebarBtn   *gtk.MenuButton
 	searchSessionsBtn   *gtk.Button
-	viewSwitcherSidebar *adw.ViewSwitcherSidebar
+	sidebarScroll       *gtk.ScrolledWindow
+	sidebarList         *gtk.ListBox
 
 	bottomSheet           *adw.BottomSheet
 	showSidebarBtn        *gtk.Button
@@ -527,14 +582,20 @@ type Window struct {
 	allSessions       []opencode.Session
 	projectSessions   map[string][]opencode.Session
 
-	closeBtnSessID   map[uintptr]string
-	hoveredRow       map[uintptr]bool
-	rowControllers   map[uintptr]bool
-	rowProjectDir    map[uintptr]string
-	headerProjectDir map[uintptr]string
-	headerWidgets    map[uintptr]*projectHeaderWidgets
-	fileOpener       func(string)
-	clipboardSetter  func(string)
+	closeBtnSessID       map[uintptr]string
+	hoveredRow           map[uintptr]bool
+	rowProjectDir        map[uintptr]string
+	sidebarRowSessID     map[uintptr]string
+	headerProjectDir     map[uintptr]string
+	headerWidgets        map[uintptr]*projectHeaderWidgets
+	projectHeaderRows    map[string]*gtk.ListBoxRow
+	projectShowMoreRows  map[string]*gtk.ListBoxRow
+	projectShowMoreLbls  map[string]*gtk.Label
+	projectShowMoreDirs  map[uintptr]string
+	sidebarSetupDone     bool
+	syncingSidebarSelect bool
+	fileOpener           func(string)
+	clipboardSetter      func(string)
 
 	takeCharge         bool
 	takeChargeInFlight map[string]bool
@@ -601,7 +662,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		hideSidebarBtn:        builder.GetObject("hideSidebarBtn").Cast().(*gtk.Button),
 		appMenuSidebarBtn:     builder.GetObject("appMenuSidebarBtn").Cast().(*gtk.MenuButton),
 		searchSessionsBtn:     builder.GetObject("searchSessionsBtn").Cast().(*gtk.Button),
-		viewSwitcherSidebar:   builder.GetObject("viewSwitcherSidebar").Cast().(*adw.ViewSwitcherSidebar),
+		sidebarScroll:         builder.GetObject("sidebarScroll").Cast().(*gtk.ScrolledWindow),
+		sidebarList:           builder.GetObject("sidebarList").Cast().(*gtk.ListBox),
 		bottomSheet:           builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
 		showSidebarBtn:        builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
 		appMenuTopBtn:         builder.GetObject("appMenuTopBtn").Cast().(*gtk.MenuButton),
@@ -676,10 +738,14 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		shellOutputLabels:     make(map[string]*gtk.Label),
 		closeBtnSessID:        make(map[uintptr]string),
 		hoveredRow:            make(map[uintptr]bool),
-		rowControllers:        make(map[uintptr]bool),
 		rowProjectDir:         make(map[uintptr]string),
+		sidebarRowSessID:      make(map[uintptr]string),
 		headerProjectDir:      make(map[uintptr]string),
 		headerWidgets:         make(map[uintptr]*projectHeaderWidgets),
+		projectHeaderRows:     make(map[string]*gtk.ListBoxRow),
+		projectShowMoreRows:   make(map[string]*gtk.ListBoxRow),
+		projectShowMoreLbls:   make(map[string]*gtk.Label),
+		projectShowMoreDirs:   make(map[uintptr]string),
 		takeChargeInFlight:    make(map[string]bool),
 		resolvedSessionTitles: make(map[string]string),
 		resolvingSessions:     make(map[string][]func(string)),
@@ -760,19 +826,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.backgroundCurrentSession()
 	})
 
-	// Wire AdwViewStack to vertical sidebar switcher.
-	w.viewSwitcherSidebar.SetStack(w.viewStack)
-
-	// Clicking an item in the sidebar returns to the main conversation if viewing a subagent,
-	// and closes the overlay sidebar if collapsed on mobile.
-	w.viewSwitcherSidebar.ConnectActivated(func() {
-		if tab := w.currentTab(); tab != nil && tab.activeSubID != "" {
-			w.closeSubagent(tab)
-		}
-		if w.rootContent.Collapsed() {
-			w.rootContent.SetShowSidebar(false)
-		}
-	})
+	// Wire custom GtkListBox sidebar selection/activation to viewStack.
+	w.setupSidebarList()
 
 	w.breadcrumbParentBtn.ConnectClicked(func() {
 		if tab := w.currentTab(); tab != nil {
@@ -1182,6 +1237,117 @@ func (w *Window) syncEmptyGreeterVisibility() {
 	}
 }
 
+func (w *Window) nextVisibleTabID(excludeID, preferDir string, excludeSet map[string]bool) string {
+	idx := slices.Index(w.tabOrder, excludeID)
+	isAllowed := func(id string) bool {
+		return id != "" && id != excludeID && !excludeSet[id] && w.tabs[id] != nil
+	}
+	if preferDir != "" {
+		for i := idx + 1; i < len(w.tabOrder); i++ {
+			id := w.tabOrder[i]
+			if isAllowed(id) && w.tabs[id].main != nil && normalizeProjectDir(w.tabs[id].main.session.Location.Directory) == preferDir {
+				return id
+			}
+		}
+		for i := idx - 1; i >= 0; i-- {
+			id := w.tabOrder[i]
+			if isAllowed(id) && w.tabs[id].main != nil && normalizeProjectDir(w.tabs[id].main.session.Location.Directory) == preferDir {
+				return id
+			}
+		}
+	}
+	for i := idx + 1; i < len(w.tabOrder); i++ {
+		if id := w.tabOrder[i]; isAllowed(id) {
+			return id
+		}
+	}
+	for i := idx - 1; i >= 0; i-- {
+		if id := w.tabOrder[i]; isAllowed(id) {
+			return id
+		}
+	}
+	return ""
+}
+
+func (w *Window) cleanupTabSidebarState(tab *sessionTab) {
+	if tab == nil || tab.sidebarIndicator == nil {
+		return
+	}
+	ind := tab.sidebarIndicator
+	if ind.closeBtn != nil {
+		delete(w.closeBtnSessID, ind.closeBtn.Object.Native())
+	}
+	if ind.rowPtr != 0 {
+		delete(w.hoveredRow, ind.rowPtr)
+		delete(w.sidebarRowSessID, ind.rowPtr)
+		delete(w.rowProjectDir, ind.rowPtr)
+	}
+	if ind.row != nil {
+		rp := ind.row.Object.Native()
+		delete(w.hoveredRow, rp)
+		delete(w.sidebarRowSessID, rp)
+		delete(w.rowProjectDir, rp)
+	}
+	tab.sidebarIndicator = nil
+}
+
+func (w *Window) moveSessionInProjectCache(sessID, oldRawDir, newRawDir string, updated *opencode.Session) {
+	if w.projectSessions == nil || sessID == "" {
+		return
+	}
+	oldDir := normalizeProjectDir(oldRawDir)
+	newDir := normalizeProjectDir(newRawDir)
+	var found *opencode.Session
+	for dir, list := range w.projectSessions {
+		if dir == newDir {
+			continue
+		}
+		filtered := list[:0]
+		for _, s := range list {
+			if s.ID == sessID {
+				sCopy := s
+				found = &sCopy
+				continue
+			}
+			filtered = append(filtered, s)
+		}
+		if len(filtered) == 0 {
+			delete(w.projectSessions, dir)
+		} else {
+			w.projectSessions[dir] = filtered
+		}
+	}
+	if oldDir != "" && oldDir != newDir && len(w.projectSessions[oldDir]) == 0 {
+		delete(w.projectSessions, oldDir)
+	}
+	if newDir == "" || w.archivedSessions[sessID] {
+		return
+	}
+	entry := updated
+	if entry == nil {
+		entry = found
+	}
+	if entry == nil || entry.ParentID != "" {
+		return
+	}
+	dest := w.projectSessions[newDir]
+	placed := false
+	for i := range dest {
+		if dest[i].ID == sessID {
+			dest[i] = *entry
+			placed = true
+			break
+		}
+	}
+	if !placed {
+		dest = append([]opencode.Session{*entry}, dest...)
+	}
+	slices.SortStableFunc(dest, func(a, b opencode.Session) int {
+		return cmp.Compare(sessionUpdatedTime(b), sessionUpdatedTime(a))
+	})
+	w.projectSessions[newDir] = dest
+}
+
 func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 	if sess.Time.Updated == 0 {
 		sess.Time.Updated = cmp.Or(sess.Time.Created, time.Now().UnixMilli())
@@ -1202,18 +1368,31 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		w.saveState()
 	}
 	if tab, ok := w.tabs[sess.ID]; ok {
+		needSync := false
 		if sess.Title != "" && tab.main.session.Title != sess.Title {
 			tab.main.session.Title = sess.Title
-			if tab.page != nil {
-				tab.page.SetTitle(sess.Title)
-			}
+			tab.setTitle(sess.Title)
+			w.updateSwitcherIndicators()
 		}
-		if sess.Location.Directory != "" && tab.main.session.Location.Directory == "" {
-			tab.main.session.Location = sess.Location
-			w.syncSectionStarts()
+		if sess.Location.Directory != "" {
+			oldDir := normalizeProjectDir(tab.main.session.Location.Directory)
+			if normDir != "" && normDir != oldDir {
+				tab.main.session.Location = sess.Location
+				for i := range w.allSessions {
+					if w.allSessions[i].ID == sess.ID {
+						w.allSessions[i].Location = sess.Location
+						break
+					}
+				}
+				w.moveSessionInProjectCache(sess.ID, oldDir, normDir, &tab.main.session)
+				needSync = true
+			}
 		}
 		if sess.Time.Updated > tab.main.session.Time.Updated {
 			w.touchSessionUpdated(tab, tab.main, sess.Time.Updated)
+		}
+		if needSync && !w.populating {
+			w.syncSidebar()
 		}
 		return tab
 	}
@@ -1252,9 +1431,7 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		w.tabOrder = append(w.tabOrder, sess.ID)
 	} else {
 		w.tabOrder = slices.Insert(w.tabOrder, insertIdx, sess.ID)
-		w.reattachViewStackFrom(insertIdx + 1)
 	}
-	w.syncSectionStarts()
 	if prevVisID != "" && w.tabs[prevVisID] != nil {
 		w.viewStack.SetVisibleChildName(prevVisID)
 	}
@@ -1285,26 +1462,10 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 			w.projectSessions[normDir] = append([]opencode.Session{sess}, w.projectSessions[normDir]...)
 		}
 	}
-	return tab
-}
-
-func (w *Window) syncSectionStarts() {
-	var lastDir string
-	for i, id := range w.tabOrder {
-		tab, ok := w.tabs[id]
-		if !ok {
-			continue
-		}
-		rawDir := tab.main.session.Location.Directory
-		dir := normalizeProjectDir(rawDir)
-		if i == 0 || dir != lastDir {
-			tab.page.SetStartsSection(true)
-			tab.page.SetSectionTitle(projectName(rawDir))
-			lastDir = dir
-		} else {
-			tab.page.SetStartsSection(false)
-		}
+	if !prevPopulating {
+		w.syncSidebar()
 	}
+	return tab
 }
 
 func (w *Window) revealActiveSession(sessionID string) {
@@ -1328,12 +1489,12 @@ func (w *Window) revealActiveSession(sessionID string) {
 			}
 			wasEmpty := len(w.tabs) == 0
 			w.ensureSessionTab(s)
-			w.syncProjectSessionVisibility()
 			if wasEmpty && w.viewStack != nil {
 				w.viewStack.SetVisibleChildName(s.ID)
 				w.onVisibleTabChanged()
+			} else {
+				w.syncSidebar()
 			}
-			w.syncSwitcherIndicators()
 			return
 		}
 	}
@@ -1361,10 +1522,9 @@ func (w *Window) selectSession(sess opencode.Session) {
 		w.saveState()
 	}
 	w.ensureSessionTab(sess)
-	w.syncProjectSessionVisibility()
 	w.viewStack.SetVisibleChildName(sess.ID)
 	w.onVisibleTabChanged()
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 }
 
 func (w *Window) archiveSession(sessID string) {
@@ -1399,7 +1559,11 @@ func (w *Window) archiveSession(sessID string) {
 				filtered = append(filtered, s)
 			}
 		}
-		w.projectSessions[normDir] = filtered
+		if len(filtered) == 0 {
+			delete(w.projectSessions, normDir)
+		} else {
+			w.projectSessions[normDir] = filtered
+		}
 
 		// If this project is not expanded and now has fewer than maxVisibleSessions open tabs in w.tabs,
 		// promote the next unarchived session from w.projectSessions[normDir] so up to maxVisibleSessions remain visible.
@@ -1424,46 +1588,14 @@ func (w *Window) archiveSession(sessID string) {
 	}
 
 	if !ok {
+		w.syncSidebar()
 		return
 	}
 
 	wasCurrent := (w.currentRootSessionID() == sessID)
 	var nextID string
 	if wasCurrent {
-		idx := slices.Index(w.tabOrder, sessID)
-		// Prefer another tab in the same project first, then any neighboring tab.
-		for i := idx + 1; i < len(w.tabOrder); i++ {
-			id := w.tabOrder[i]
-			if t := w.tabs[id]; t != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
-				nextID = id
-				break
-			}
-		}
-		if nextID == "" {
-			for i := idx - 1; i >= 0; i-- {
-				id := w.tabOrder[i]
-				if t := w.tabs[id]; t != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
-					nextID = id
-					break
-				}
-			}
-		}
-		if nextID == "" {
-			for i := idx + 1; i < len(w.tabOrder); i++ {
-				if id := w.tabOrder[i]; id != sessID && w.tabs[id] != nil {
-					nextID = id
-					break
-				}
-			}
-		}
-		if nextID == "" {
-			for i := idx - 1; i >= 0; i-- {
-				if id := w.tabOrder[i]; id != sessID && w.tabs[id] != nil {
-					nextID = id
-					break
-				}
-			}
-		}
+		nextID = w.nextVisibleTabID(sessID, normDir, nil)
 	}
 
 	prevPopulating := w.populating
@@ -1472,24 +1604,25 @@ func (w *Window) archiveSession(sessID string) {
 	for _, sub := range tab.subTimelines {
 		sub.closeStreams()
 	}
-	w.viewStack.Remove(tab.stack)
+	w.cleanupTabSidebarState(tab)
+	if w.viewStack != nil && tab.stack != nil {
+		w.viewStack.Remove(tab.stack)
+	}
 	delete(w.tabs, sessID)
 	if idx := slices.Index(w.tabOrder, sessID); idx >= 0 {
 		w.tabOrder = slices.Delete(w.tabOrder, idx, idx+1)
 	}
-	w.syncSectionStarts()
 	w.populating = prevPopulating
 
-	w.syncProjectSessionVisibility()
 	if wasCurrent {
-		if nextID != "" {
+		if nextID != "" && w.viewStack != nil {
 			w.viewStack.SetVisibleChildName(nextID)
 		}
 		w.onVisibleTabChanged()
 	} else {
 		w.updateWindowManagerTitle()
 	}
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 }
 
 func (w *Window) clearProjectSessions(rawDir string) {
@@ -1532,23 +1665,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 	wasInProject := toArchive[currentID]
 	var nextID string
 	if wasInProject {
-		idx := slices.Index(w.tabOrder, currentID)
-		for i := idx + 1; i < len(w.tabOrder); i++ {
-			id := w.tabOrder[i]
-			if !toArchive[id] && w.tabs[id] != nil {
-				nextID = id
-				break
-			}
-		}
-		if nextID == "" {
-			for i := idx - 1; i >= 0; i-- {
-				id := w.tabOrder[i]
-				if !toArchive[id] && w.tabs[id] != nil {
-					nextID = id
-					break
-				}
-			}
-		}
+		nextID = w.nextVisibleTabID(currentID, "", toArchive)
 	}
 
 	prevPopulating := w.populating
@@ -1564,6 +1681,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 			for _, sub := range tab.subTimelines {
 				sub.closeStreams()
 			}
+			w.cleanupTabSidebarState(tab)
 			if w.viewStack != nil && tab.stack != nil {
 				w.viewStack.Remove(tab.stack)
 			}
@@ -1571,10 +1689,8 @@ func (w *Window) clearProjectSessions(rawDir string) {
 		}
 	}
 	w.tabOrder = nextOrder
-	w.syncSectionStarts()
 	w.populating = prevPopulating
 
-	w.syncProjectSessionVisibility()
 	if wasInProject && w.viewStack != nil {
 		if nextID != "" {
 			w.viewStack.SetVisibleChildName(nextID)
@@ -1583,7 +1699,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 	} else {
 		w.updateWindowManagerTitle()
 	}
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 }
 
 func sessionUpdatedTime(sess opencode.Session) int64 {
@@ -2640,13 +2756,13 @@ func (w *Window) applySessionRename(sessionID, newTitle string) {
 		}
 	}
 	if tab != nil {
-		if conv == tab.main && tab.page != nil {
-			tab.page.SetTitle(newTitle)
+		if conv == tab.main {
+			tab.setTitle(newTitle)
 		}
 		if w.currentTab() == tab {
 			w.refreshHeaderAndBottomBar(tab)
 		}
-		w.syncSwitcherIndicators()
+		w.updateSwitcherIndicators()
 	}
 }
 
@@ -2762,233 +2878,9 @@ func formatRelativeTimemark(updatedMs int64) string {
 	}
 }
 
-func findFirstHorizontalBox(w gtk.Widgetter) *gtk.Box {
-	if w == nil {
-		return nil
-	}
-	base := gtk.BaseWidget(w)
-	if base == nil {
-		return nil
-	}
-	if box, ok := base.Cast().(*gtk.Box); ok && box.Orientation() == gtk.OrientationHorizontal {
-		return box
-	}
-	for child := base.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
-		if found := findFirstHorizontalBox(child); found != nil {
-			return found
-		}
-	}
-	return nil
-}
-
-func findListBox(w gtk.Widgetter) *gtk.ListBox {
-	if w == nil {
-		return nil
-	}
-	base := gtk.BaseWidget(w)
-	if base == nil {
-		return nil
-	}
-	if lb, ok := base.Cast().(*gtk.ListBox); ok {
-		return lb
-	}
-	for child := base.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
-		if found := findListBox(child); found != nil {
-			return found
-		}
-	}
-	return nil
-}
-
-func (w *Window) getOrCreateSwitcherIndicator(hBox *gtk.Box, row *gtk.ListBoxRow, sessID string) *switcherIndicator {
-	if hBox == nil {
-		return nil
-	}
-	hBoxPtr := hBox.Object.Native()
-	if row != nil {
-		if !w.rowControllers[hBoxPtr] {
-			w.rowControllers[hBoxPtr] = true
-			hp := hBoxPtr
-			motion := gtk.NewEventControllerMotion()
-			motion.ConnectEnter(func(_, _ float64) {
-				w.hoveredRow[hp] = true
-				w.updateSwitcherIndicators()
-			})
-			motion.ConnectLeave(func() {
-				delete(w.hoveredRow, hp)
-				w.updateSwitcherIndicators()
-			})
-			hBox.AddController(motion)
-		}
-
-		rowPtr := row.Object.Native()
-		if !w.rowControllers[rowPtr] {
-			w.rowControllers[rowPtr] = true
-			rp := rowPtr
-			dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
-			dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
-				row.AddCSSClass("glup-project-drop-target")
-				return gdk.ActionMove
-			})
-			dropTarget.ConnectLeave(func() {
-				row.RemoveCSSClass("glup-project-drop-target")
-			})
-			dropTarget.ConnectDrop(func(val *glib.Value, _, _ float64) bool {
-				row.RemoveCSSClass("glup-project-drop-target")
-				srcDir := val.String()
-				dstDir := w.rowProjectDir[rp]
-				if srcDir == "" || dstDir == "" || srcDir == dstDir {
-					return false
-				}
-				w.moveProjectInOrder(srcDir, dstDir)
-				return true
-			})
-			row.AddController(dropTarget)
-		}
-	}
-
-	var spinner *adw.Spinner
-	var suffixBox *gtk.Box
-	var label *gtk.Label
-	var closeBtn *gtk.Button
-
-	for child := hBox.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
-		childBase := gtk.BaseWidget(child)
-		if childBase == nil {
-			continue
-		}
-		if childBase.HasCSSClass("glup-switcher-prefix") {
-			if sp, ok := childBase.Cast().(*adw.Spinner); ok {
-				spinner = sp
-			}
-		}
-		if childBase.HasCSSClass("glup-switcher-suffix") {
-			for inner := childBase.FirstChild(); inner != nil; inner = gtk.BaseWidget(inner).NextSibling() {
-				innerBase := gtk.BaseWidget(inner)
-				if innerBase == nil {
-					continue
-				}
-				if lbl, ok := innerBase.Cast().(*gtk.Label); ok {
-					label = lbl
-				}
-				if btn, ok := innerBase.Cast().(*gtk.Button); ok {
-					closeBtn = btn
-				}
-			}
-			if box, ok := childBase.Cast().(*gtk.Box); ok {
-				suffixBox = box
-			}
-		}
-	}
-	if spinner != nil && suffixBox != nil && label != nil && closeBtn != nil {
-		w.closeBtnSessID[closeBtn.Object.Native()] = sessID
-		return &switcherIndicator{box: suffixBox, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
-	}
-
-	if spinner == nil {
-		spinner = adw.NewSpinner()
-		spinner.AddCSSClass("glup-switcher-prefix")
-		spinner.SetVAlign(gtk.AlignCenter)
-		spinner.SetVisible(false)
-		hBox.Prepend(spinner)
-	}
-
-	box := gtk.NewBox(gtk.OrientationHorizontal, 4)
-	box.AddCSSClass("glup-switcher-suffix")
-	box.SetHAlign(gtk.AlignEnd)
-	box.SetVAlign(gtk.AlignCenter)
-	box.SetHExpand(false)
-
-	label = gtk.NewLabel("")
-	label.AddCSSClass("caption")
-	label.AddCSSClass("dim-label")
-	label.SetVisible(false)
-	box.Append(label)
-
-	closeBtn = gtk.NewButtonFromIconName("window-close-symbolic")
-	closeBtn.AddCSSClass("flat")
-	closeBtn.AddCSSClass("circular")
-	closeBtn.AddCSSClass("glup-sidebar-close-btn")
-	closeBtn.SetTooltipText("Archive Session")
-	closeBtn.SetVAlign(gtk.AlignCenter)
-	closeBtn.SetVisible(false)
-	btnPtr := closeBtn.Object.Native()
-	w.closeBtnSessID[btnPtr] = sessID
-	closeBtn.ConnectClicked(func() {
-		if id := w.closeBtnSessID[btnPtr]; id != "" {
-			w.archiveSession(id)
-		}
-	})
-	box.Append(closeBtn)
-
-	hBox.SetVAlign(gtk.AlignCenter)
-	hBox.Append(box)
-	return &switcherIndicator{box: box, spinner: spinner, label: label, closeBtn: closeBtn, rowPtr: hBoxPtr}
-}
-
-func updateRowShowMore(row *gtk.ListBoxRow, hiddenCount int, onExpand func()) {
-	origChild := row.Child()
-	if origChild == nil {
-		return
-	}
-
-	var vBox *gtk.Box
-	if b, ok := origChild.(*gtk.Box); ok && b.Orientation() == gtk.OrientationVertical && b.HasCSSClass("glup-sidebar-row-vbox") {
-		vBox = b
-	} else if base := gtk.BaseWidget(origChild); base != nil {
-		if b, ok := base.Cast().(*gtk.Box); ok && b.Orientation() == gtk.OrientationVertical && b.HasCSSClass("glup-sidebar-row-vbox") {
-			vBox = b
-		}
-	}
-
-	if hiddenCount <= 0 || onExpand == nil {
-		row.RemoveCSSClass("glup-has-show-more")
-		if vBox == nil {
-			return
-		}
-		// Remove any existing footer button and unwrap the original horizontal box
-		for c := vBox.FirstChild(); c != nil; {
-			next := gtk.BaseWidget(c).NextSibling()
-			if gtk.BaseWidget(c).HasCSSClass("glup-sidebar-show-more") {
-				vBox.Remove(c)
-			}
-			c = next
-		}
-		if inner := vBox.FirstChild(); inner != nil {
-			vBox.Remove(inner)
-			row.SetChild(inner)
-		}
-		return
-	}
-
-	row.AddCSSClass("glup-has-show-more")
-	if vBox == nil {
-		vBox = gtk.NewBox(gtk.OrientationVertical, 0)
-		vBox.AddCSSClass("glup-sidebar-row-vbox")
-		row.SetChild(vBox)
-		vBox.Append(origChild)
-	}
-
-	// Remove any existing footer button
-	for c := vBox.FirstChild(); c != nil; c = gtk.BaseWidget(c).NextSibling() {
-		if gtk.BaseWidget(c).HasCSSClass("glup-sidebar-show-more") {
-			vBox.Remove(c)
-			break
-		}
-	}
-
-	btn := gtk.NewButtonWithLabel(fmt.Sprintf("Show %d more…", hiddenCount))
-	btn.AddCSSClass("flat")
-	btn.AddCSSClass("caption")
-	btn.AddCSSClass("dim-label")
-	btn.AddCSSClass("glup-sidebar-show-more")
-	btn.SetHAlign(gtk.AlignStart)
-	btn.ConnectClicked(onExpand)
-	vBox.Append(btn)
-}
-
 type projectHeaderWidgets struct {
 	outerBox      *gtk.Box
+	sep           *gtk.Separator
 	hBox          *gtk.Box
 	titleLabel    *gtk.Label
 	subtitleLabel *gtk.Label
@@ -3014,12 +2906,18 @@ func (hw *projectHeaderWidgets) openMenuAt(x, y float64) {
 		return
 	}
 	if x > 0 || y > 0 {
-		rect := gdk.NewRectangle(int(x), int(y), 1, 1)
+		px, py := float32(x), float32(y)
+		if hw.hBox != nil && hw.outerBox != nil {
+			if pt, ok := hw.hBox.ComputePoint(hw.outerBox, graphene.NewPointAlloc().Init(px, py)); ok {
+				px, py = pt.X(), pt.Y()
+			}
+		}
+		rect := gdk.NewRectangle(int(math.Round(float64(px))), int(math.Round(float64(py))), 1, 1)
 		hw.popover.SetPointingTo(&rect)
 	} else {
 		hw.popover.SetPointingTo(nil)
 	}
-	if hw.hBox != nil && hw.hBox.Root() != nil {
+	if hw.outerBox != nil && hw.outerBox.Root() != nil {
 		hw.popover.Popup()
 	}
 }
@@ -3139,14 +3037,13 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 	}
 	outerBox.SetMarginBottom(2)
 
-	if includeSeparator {
-		sep := gtk.NewSeparator(gtk.OrientationHorizontal)
-		sep.SetMarginTop(4)
-		sep.SetMarginBottom(6)
-		sep.SetMarginStart(6)
-		sep.SetMarginEnd(2)
-		outerBox.Append(sep)
-	}
+	sep := gtk.NewSeparator(gtk.OrientationHorizontal)
+	sep.SetMarginTop(4)
+	sep.SetMarginBottom(6)
+	sep.SetMarginStart(6)
+	sep.SetMarginEnd(2)
+	sep.SetVisible(includeSeparator)
+	outerBox.Append(sep)
 
 	hBox := gtk.NewBox(gtk.OrientationHorizontal, 6)
 	hBox.AddCSSClass("glup-sidebar-project-header-box")
@@ -3222,7 +3119,9 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 	popover.SetChild(menuBox)
 	popover.SetParent(outerBox)
 	outerBox.ConnectDestroy(func() {
-		popover.Unparent()
+		if popover.Parent() != nil {
+			popover.Unparent()
+		}
 	})
 
 	newSessBtn, _ := newProjectHeaderMenuButton("list-add-symbolic", "New Session")
@@ -3284,6 +3183,7 @@ func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.
 
 	hw := &projectHeaderWidgets{
 		outerBox:      outerBox,
+		sep:           sep,
 		hBox:          hBox,
 		titleLabel:    titleLabel,
 		subtitleLabel: subtitleLabel,
@@ -3484,72 +3384,32 @@ func (w *Window) updateProjectHeaderLabels(root gtk.Widgetter, rawDir string) {
 	}
 }
 
-func (w *Window) updateRowProjectHeader(row *gtk.ListBoxRow, dir string, sectionIdx int) {
-	header := row.Header()
-	if header == nil {
+func (w *Window) setProjectHeaderSeparator(outerBox *gtk.Box, includeSeparator bool) {
+	if outerBox == nil {
 		return
 	}
-	headerBase := gtk.BaseWidget(header)
-	if headerBase == nil {
-		return
+	if includeSeparator {
+		outerBox.SetMarginTop(2)
+	} else {
+		outerBox.SetMarginTop(6)
 	}
-
-	headerBase.AddCSSClass("glup-sidebar-project-header")
-	tooltip := fmt.Sprintf("%s (%s) — click to collapse/expand, right-click or hold for options, drag to reorder", projectName(dir), shortDir(dir))
-	headerBase.SetTooltipText(tooltip)
-
-	if stack, ok := headerBase.Cast().(*gtk.Stack); ok {
-		stack.SetHhomogeneous(false)
-		stack.SetVhomogeneous(false)
-		childName := "glup_header"
-		if sectionIdx > 0 {
-			childName = "glup_header_sep"
-		}
-		child := stack.ChildByName(childName)
-		if child != nil {
-			w.updateProjectHeaderLabels(child, dir)
-			stack.SetVisibleChildName(childName)
-			return
-		}
-
-		hBox := w.newProjectHeaderBox(dir, sectionIdx > 0)
-		w.updateProjectHeaderLabels(hBox, dir)
-		stack.AddNamed(hBox, childName)
-		stack.SetVisibleChildName(childName)
-		return
+	if hw := w.headerWidgets[outerBox.Object.Native()]; hw != nil && hw.sep != nil {
+		hw.sep.SetVisible(includeSeparator)
 	}
-
-	if headerBase.HasCSSClass("glup-sidebar-project-header") {
-		hasSep := false
-		if first := gtk.BaseWidget(headerBase).FirstChild(); first != nil {
-			if _, ok := first.(*gtk.Separator); ok {
-				hasSep = true
-			}
-		}
-		if hasSep == (sectionIdx > 0) {
-			w.updateProjectHeaderLabels(header, dir)
-			return
-		}
-	}
-
-	hBox := w.newProjectHeaderBox(dir, sectionIdx > 0)
-	w.updateProjectHeaderLabels(hBox, dir)
-	hBox.SetTooltipText(tooltip)
-	row.SetHeader(hBox)
 }
 
 func (w *Window) toggleProjectCollapsed(normDir string) {
 	if normDir == "" {
 		return
 	}
+	w.ensureSidebarMaps()
 	if w.collapsedProjects[normDir] {
 		delete(w.collapsedProjects, normDir)
 	} else {
 		w.collapsedProjects[normDir] = true
 	}
 	w.saveState()
-	w.syncProjectSessionVisibility()
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 }
 
 func (w *Window) moveProjectInOrder(srcDir, dstDir string) {
@@ -3562,47 +3422,7 @@ func (w *Window) moveProjectInOrder(srcDir, dstDir string) {
 	}
 	w.projectOrder = next
 	w.saveState()
-
-	prevPopulating := w.populating
-	w.populating = true
-	w.reorderTabsByProject()
-	w.syncSectionStarts()
-	w.populating = prevPopulating
-
-	w.syncProjectSessionVisibility()
-	w.syncSwitcherIndicators()
-}
-
-func (w *Window) syncProjectSessionVisibility() {
-	currentID := w.currentRootSessionID()
-
-	projectTabs := make(map[string][]*sessionTab)
-	for _, id := range w.tabOrder {
-		if tab, ok := w.tabs[id]; ok {
-			dir := normalizeProjectDir(tab.main.session.Location.Directory)
-			projectTabs[dir] = append(projectTabs[dir], tab)
-		}
-	}
-
-	for dir, tabs := range projectTabs {
-		if w.collapsedProjects[dir] {
-			// Keep the first tab page visible so AdwViewSwitcherSidebar's ListBox
-			// preserves the section header row, and hide its row body in syncSwitcherIndicators.
-			for i, tab := range tabs {
-				tab.page.SetVisible(i == 0)
-			}
-			continue
-		}
-		expanded := w.expandedProjects[dir]
-		maxVis := w.effectiveMaxVisibleSessions()
-		for i, tab := range tabs {
-			if expanded || i < maxVis || tab.main.session.ID == currentID {
-				tab.page.SetVisible(true)
-			} else {
-				tab.page.SetVisible(false)
-			}
-		}
-	}
+	w.syncSidebar()
 }
 
 func (w *Window) compareTabProjects(idA, idB string) int {
@@ -3611,8 +3431,16 @@ func (w *Window) compareTabProjects(idA, idB string) int {
 	}
 	tabA := w.tabs[idA]
 	tabB := w.tabs[idB]
-	if tabA == nil || tabB == nil {
+	okA := tabA != nil && tabA.main != nil
+	okB := tabB != nil && tabB.main != nil
+	if !okA && !okB {
 		return 0
+	}
+	if !okA {
+		return 1
+	}
+	if !okB {
+		return -1
 	}
 	dirA := normalizeProjectDir(tabA.main.session.Location.Directory)
 	dirB := normalizeProjectDir(tabB.main.session.Location.Directory)
@@ -3622,55 +3450,13 @@ func (w *Window) compareTabProjects(idA, idB string) int {
 	return 0
 }
 
-func (w *Window) reattachViewStackFrom(startIdx int) {
-	if w.viewStack == nil || startIdx < 0 || startIdx >= len(w.tabOrder) {
-		return
-	}
-	for _, id := range w.tabOrder[startIdx:] {
-		tab := w.tabs[id]
-		if tab == nil || tab.stack == nil {
-			continue
-		}
-		var needsAttention bool
-		if tab.page != nil {
-			needsAttention = tab.page.NeedsAttention()
-		}
-		w.viewStack.Remove(tab.stack)
-		title := strings.TrimSpace(tab.main.session.Title)
-		if title == "" {
-			title = "Untitled"
-		}
-		page := w.viewStack.AddTitled(tab.stack, id, title)
-		page.SetBadgeNumber(0)
-		page.SetNeedsAttention(needsAttention)
-		tab.page = page
-		tab.sidebarIndicator = nil
-	}
-}
-
 func (w *Window) reorderTabsByProject() bool {
 	if len(w.tabOrder) <= 1 || slices.IsSortedFunc(w.tabOrder, w.compareTabProjects) {
 		return false
 	}
 	oldOrder := slices.Clone(w.tabOrder)
 	slices.SortStableFunc(w.tabOrder, w.compareTabProjects)
-	firstDiff := 0
-	for firstDiff < len(w.tabOrder) && w.tabOrder[firstDiff] == oldOrder[firstDiff] {
-		firstDiff++
-	}
-	if firstDiff >= len(w.tabOrder) || w.viewStack == nil {
-		return firstDiff < len(w.tabOrder)
-	}
-
-	prevPopulating := w.populating
-	w.populating = true
-	currID := w.viewStack.VisibleChildName()
-	w.reattachViewStackFrom(firstDiff)
-	if currID != "" && w.tabs[currID] != nil {
-		w.viewStack.SetVisibleChildName(currID)
-	}
-	w.populating = prevPopulating
-	return true
+	return !slices.Equal(oldOrder, w.tabOrder)
 }
 
 func (w *Window) bumpSessionToTop(tab *sessionTab) {
@@ -3678,9 +3464,10 @@ func (w *Window) bumpSessionToTop(tab *sessionTab) {
 		return
 	}
 	w.touchSessionUpdated(tab, tab.main, time.Now().UnixMilli())
+	w.reorderTabsByProject()
 	sessID := tab.main.session.ID
 	currIdx := slices.Index(w.tabOrder, sessID)
-	if currIdx <= 0 {
+	if currIdx < 0 {
 		return
 	}
 	targetDir := normalizeProjectDir(tab.main.session.Location.Directory)
@@ -3695,35 +3482,22 @@ func (w *Window) bumpSessionToTop(tab *sessionTab) {
 			break
 		}
 	}
-	if currIdx <= firstInProj {
-		return
+	if currIdx > firstInProj {
+		copy(w.tabOrder[firstInProj+1:currIdx+1], w.tabOrder[firstInProj:currIdx])
+		w.tabOrder[firstInProj] = sessID
 	}
-	copy(w.tabOrder[firstInProj+1:currIdx+1], w.tabOrder[firstInProj:currIdx])
-	w.tabOrder[firstInProj] = sessID
-
-	if w.viewStack != nil {
-		prevPopulating := w.populating
-		w.populating = true
-		currID := w.viewStack.VisibleChildName()
-		w.reattachViewStackFrom(firstInProj)
-		if currID != "" && w.tabs[currID] != nil {
-			w.viewStack.SetVisibleChildName(currID)
-		}
-		w.populating = prevPopulating
-	}
-	w.syncSectionStarts()
-	w.syncProjectSessionVisibility()
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 }
 
 func (w *Window) markTabNeedsAttention(tab *sessionTab, forceBump bool) {
 	if tab == nil || tab.main == nil || tab.main.session.ID == w.currentRootSessionID() {
 		return
 	}
-	wasAttention := tab.page != nil && tab.page.NeedsAttention()
-	if tab.page != nil && !wasAttention {
-		tab.page.SetNeedsAttention(true)
+	wasAttention := tab.NeedsAttention()
+	if !wasAttention {
+		tab.setNeedsAttention(true)
 		w.updateWindowManagerTitle()
+		w.updateSwitcherIndicators()
 	}
 	if !wasAttention || forceBump {
 		w.bumpSessionToTop(tab)
@@ -3766,6 +3540,8 @@ func (w *Window) touchSessionUpdated(tab *sessionTab, conv *convTimeline, update
 }
 
 func (w *Window) expandProjectSessions(dir string) {
+	w.ensureSidebarMaps()
+	dir = normalizeProjectDir(dir)
 	w.expandedProjects[dir] = true
 	all := w.projectSessions[dir]
 	var pending []opencode.Session
@@ -3775,8 +3551,7 @@ func (w *Window) expandProjectSessions(dir string) {
 		}
 	}
 	if len(pending) == 0 {
-		w.syncProjectSessionVisibility()
-		w.syncSwitcherIndicators()
+		w.syncSidebar()
 		return
 	}
 
@@ -3787,13 +3562,13 @@ func (w *Window) expandProjectSessions(dir string) {
 		if end > len(pending) {
 			end = len(pending)
 		}
+		prevPopulating := w.populating
+		w.populating = true
 		for i := idx; i < end; i++ {
 			w.ensureSessionTab(pending[i])
 		}
-		w.reorderTabsByProject()
-		w.syncSectionStarts()
-		w.syncProjectSessionVisibility()
-		w.syncSwitcherIndicators()
+		w.populating = prevPopulating
+		w.syncSidebar()
 		if end < len(pending) {
 			glib.IdleAdd(func() bool {
 				step(end)
@@ -3804,135 +3579,481 @@ func (w *Window) expandProjectSessions(dir string) {
 	step(0)
 }
 
-func (w *Window) syncSwitcherIndicators() {
-	if len(w.tabOrder) == 0 {
+func (w *Window) ensureSidebarMaps() {
+	if w.expandedProjects == nil {
+		w.expandedProjects = make(map[string]bool)
+	}
+	if w.collapsedProjects == nil {
+		w.collapsedProjects = make(map[string]bool)
+	}
+	if w.closeBtnSessID == nil {
+		w.closeBtnSessID = make(map[uintptr]string)
+	}
+	if w.hoveredRow == nil {
+		w.hoveredRow = make(map[uintptr]bool)
+	}
+	if w.rowProjectDir == nil {
+		w.rowProjectDir = make(map[uintptr]string)
+	}
+	if w.sidebarRowSessID == nil {
+		w.sidebarRowSessID = make(map[uintptr]string)
+	}
+	if w.headerProjectDir == nil {
+		w.headerProjectDir = make(map[uintptr]string)
+	}
+	if w.headerWidgets == nil {
+		w.headerWidgets = make(map[uintptr]*projectHeaderWidgets)
+	}
+	if w.projectHeaderRows == nil {
+		w.projectHeaderRows = make(map[string]*gtk.ListBoxRow)
+	}
+	if w.projectShowMoreRows == nil {
+		w.projectShowMoreRows = make(map[string]*gtk.ListBoxRow)
+	}
+	if w.projectShowMoreLbls == nil {
+		w.projectShowMoreLbls = make(map[string]*gtk.Label)
+	}
+	if w.projectShowMoreDirs == nil {
+		w.projectShowMoreDirs = make(map[uintptr]string)
+	}
+}
+
+func (w *Window) setupSidebarList() {
+	if w.sidebarList == nil || w.sidebarSetupDone {
 		return
 	}
+	w.sidebarSetupDone = true
+	w.ensureSidebarMaps()
 
-	currentID := w.currentRootSessionID()
-
-	// Compute hidden sessions and last visible tab for each project
-	projectTabs := make(map[string][]*sessionTab)
-	for _, id := range w.tabOrder {
-		if tab, ok := w.tabs[id]; ok {
-			dir := normalizeProjectDir(tab.main.session.Location.Directory)
-			projectTabs[dir] = append(projectTabs[dir], tab)
+	w.sidebarList.ConnectRowSelected(func(row *gtk.ListBoxRow) {
+		if w.syncingSidebarSelect || w.populating || row == nil || w.viewStack == nil {
+			return
 		}
-	}
-
-	lastVisibleID := make(map[string]string)
-	hiddenCounts := make(map[string]int)
-	for dir, tabs := range projectTabs {
-		if w.expandedProjects[dir] || w.collapsedProjects[dir] {
-			continue
+		sessID := w.sidebarRowSessID[row.Object.Native()]
+		if sessID == "" {
+			return
 		}
-		var visibleCount int
-		var lastID string
-		for _, tab := range tabs {
-			if tab.page.Visible() {
-				visibleCount++
-				lastID = tab.main.session.ID
+		if tab := w.tabs[sessID]; tab != nil {
+			if w.currentRootSessionID() != sessID {
+				w.viewStack.SetVisibleChildName(sessID)
 			}
 		}
-		totalSessions := len(w.projectSessions[dir])
-		if totalSessions == 0 {
-			totalSessions = len(tabs)
+	})
+
+	w.sidebarList.ConnectRowActivated(func(row *gtk.ListBoxRow) {
+		if row == nil {
+			return
 		}
-		hidden := totalSessions - visibleCount
-		if hidden > 0 && lastID != "" {
-			lastVisibleID[dir] = lastID
-			hiddenCounts[dir] = hidden
+		rp := row.Object.Native()
+		if dir := w.projectShowMoreDirs[rp]; dir != "" {
+			w.expandProjectSessions(dir)
+			return
 		}
-	}
-
-	var visibleTabOrder []string
-	for _, id := range w.tabOrder {
-		if tab, ok := w.tabs[id]; ok && tab.page.Visible() {
-			visibleTabOrder = append(visibleTabOrder, id)
-		}
-	}
-
-	// 1. In AdwViewSwitcherSidebar: walk listbox rows.
-	var lb *gtk.ListBox
-	if w.viewSwitcherSidebar != nil {
-		lb = findListBox(w.viewSwitcherSidebar)
-	}
-	if lb != nil {
-		var rowIdx int
-		var activeRow *gtk.ListBoxRow
-		var sectionIdx int
-		for child := lb.FirstChild(); child != nil; child = gtk.BaseWidget(child).NextSibling() {
-			childBase := gtk.BaseWidget(child)
-			if childBase == nil {
-				continue
-			}
-			row, ok := childBase.Cast().(*gtk.ListBoxRow)
-			if !ok {
-				continue
-			}
-			if !row.Visible() || !row.ChildVisible() {
-				updateRowShowMore(row, 0, nil)
-				continue
-			}
-			if rowIdx < len(visibleTabOrder) {
-				sessID := visibleTabOrder[rowIdx]
-				if tab, ok := w.tabs[sessID]; ok {
-					rawDir := tab.main.session.Location.Directory
-					dir := normalizeProjectDir(rawDir)
-					w.rowProjectDir[row.Object.Native()] = dir
-					collapsed := w.collapsedProjects[dir]
-
-					if tab.page.StartsSection() {
-						w.updateRowProjectHeader(row, rawDir, sectionIdx)
-						sectionIdx++
-					} else if hdr := row.Header(); hdr != nil {
-						if hb := gtk.BaseWidget(hdr); hb != nil && hb.HasCSSClass("glup-sidebar-project-header") {
-							row.SetHeader(nil)
-						}
-					}
-
-					if collapsed {
-						updateRowShowMore(row, 0, nil)
-						row.RemoveCSSClass("glup-sidebar-conversation-row")
-						row.AddCSSClass("glup-sidebar-row-collapsed")
-						row.SetActivatable(false)
-						row.SetSelectable(false)
-						if rc := row.Child(); rc != nil {
-							gtk.BaseWidget(rc).SetVisible(false)
-						}
-					} else {
-						row.RemoveCSSClass("glup-sidebar-row-collapsed")
-						row.AddCSSClass("glup-sidebar-conversation-row")
-						row.SetActivatable(true)
-						row.SetSelectable(true)
-						if rc := row.Child(); rc != nil {
-							gtk.BaseWidget(rc).SetVisible(true)
-						}
-						if sessID == currentID {
-							activeRow = row
-						}
-						if hBox := findFirstHorizontalBox(row.Child()); hBox != nil {
-							hBox.AddCSSClass("glup-sidebar-conversation-box")
-							tab.sidebarIndicator = w.getOrCreateSwitcherIndicator(hBox, row, sessID)
-						}
-
-						if lastVisibleID[dir] == sessID {
-							dirKey := dir
-							updateRowShowMore(row, hiddenCounts[dir], func() {
-								w.expandProjectSessions(dirKey)
-							})
-						} else {
-							updateRowShowMore(row, 0, nil)
-						}
-					}
+		if sessID := w.sidebarRowSessID[rp]; sessID != "" {
+			if tab := w.tabs[sessID]; tab != nil {
+				if tab.activeSubID != "" {
+					w.closeSubagent(tab)
+				}
+				if w.viewStack != nil && w.currentRootSessionID() != sessID {
+					w.viewStack.SetVisibleChildName(sessID)
+				}
+				if w.rootContent != nil && w.rootContent.Collapsed() {
+					w.rootContent.SetShowSidebar(false)
 				}
 			}
-			rowIdx++
 		}
-		if activeRow != nil {
-			lb.SelectRow(activeRow)
-		} else {
-			lb.UnselectAll()
+	})
+}
+
+func (w *Window) attachProjectDropTarget(row *gtk.ListBoxRow) {
+	if row == nil {
+		return
+	}
+	rp := row.Object.Native()
+	dropTarget := gtk.NewDropTarget(glib.TypeString, gdk.ActionMove)
+	dropTarget.ConnectEnter(func(_, _ float64) gdk.DragAction {
+		row.AddCSSClass("glup-project-drop-target")
+		return gdk.ActionMove
+	})
+	dropTarget.ConnectLeave(func() {
+		row.RemoveCSSClass("glup-project-drop-target")
+	})
+	dropTarget.ConnectDrop(func(val *glib.Value, _, _ float64) bool {
+		row.RemoveCSSClass("glup-project-drop-target")
+		srcDir := val.String()
+		dstDir := w.rowProjectDir[rp]
+		if srcDir == "" || dstDir == "" || srcDir == dstDir {
+			return false
+		}
+		w.moveProjectInOrder(srcDir, dstDir)
+		return true
+	})
+	row.AddController(dropTarget)
+}
+
+func (w *Window) buildConversationRow(sessID string, tab *sessionTab) *switcherIndicator {
+	w.ensureSidebarMaps()
+
+	row := gtk.NewListBoxRow()
+	row.AddCSSClass("glup-sidebar-conversation-row")
+	row.SetSelectable(true)
+	row.SetActivatable(true)
+
+	hBox := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	hBox.AddCSSClass("glup-sidebar-conversation-box")
+	hBox.SetVAlign(gtk.AlignCenter)
+
+	spinner := adw.NewSpinner()
+	spinner.AddCSSClass("glup-switcher-prefix")
+	spinner.SetVAlign(gtk.AlignCenter)
+	spinner.SetVisible(false)
+	hBox.Append(spinner)
+
+	titleLbl := gtk.NewLabel(tab.Title())
+	titleLbl.AddCSSClass("glup-sidebar-conversation-title")
+	titleLbl.SetXAlign(0)
+	titleLbl.SetHExpand(true)
+	titleLbl.SetSingleLineMode(true)
+	titleLbl.SetEllipsize(pango.EllipsizeEnd)
+	hBox.Append(titleLbl)
+
+	dot := gtk.NewBox(gtk.OrientationHorizontal, 0)
+	dot.AddCSSClass("glup-sidebar-attention-dot")
+	dot.SetVAlign(gtk.AlignCenter)
+	dot.SetHAlign(gtk.AlignCenter)
+	dot.SetVisible(false)
+	hBox.Append(dot)
+
+	suffixBox := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	suffixBox.AddCSSClass("glup-switcher-suffix")
+	suffixBox.SetHAlign(gtk.AlignEnd)
+	suffixBox.SetVAlign(gtk.AlignCenter)
+	suffixBox.SetHExpand(false)
+
+	label := gtk.NewLabel("")
+	label.AddCSSClass("caption")
+	label.AddCSSClass("dim-label")
+	label.SetVisible(false)
+	suffixBox.Append(label)
+
+	closeBtn := gtk.NewButtonFromIconName("window-close-symbolic")
+	closeBtn.AddCSSClass("flat")
+	closeBtn.AddCSSClass("circular")
+	closeBtn.AddCSSClass("glup-sidebar-close-btn")
+	closeBtn.SetTooltipText("Archive Session")
+	closeBtn.SetVAlign(gtk.AlignCenter)
+	closeBtn.SetVisible(false)
+	btnPtr := closeBtn.Object.Native()
+	w.closeBtnSessID[btnPtr] = sessID
+	closeBtn.ConnectClicked(func() {
+		if id := w.closeBtnSessID[btnPtr]; id != "" {
+			w.archiveSession(id)
+		}
+	})
+	suffixBox.Append(closeBtn)
+
+	hBox.Append(suffixBox)
+	row.SetChild(hBox)
+
+	rp := row.Object.Native()
+	w.sidebarRowSessID[rp] = sessID
+
+	motion := gtk.NewEventControllerMotion()
+	motion.ConnectEnter(func(_, _ float64) {
+		w.hoveredRow[rp] = true
+		w.updateSwitcherIndicators()
+	})
+	motion.ConnectLeave(func() {
+		delete(w.hoveredRow, rp)
+		w.updateSwitcherIndicators()
+	})
+	row.AddController(motion)
+	w.attachProjectDropTarget(row)
+
+	return &switcherIndicator{
+		row:      row,
+		hBox:     hBox,
+		spinner:  spinner,
+		dot:      dot,
+		titleLbl: titleLbl,
+		box:      suffixBox,
+		label:    label,
+		closeBtn: closeBtn,
+		rowPtr:   rp,
+	}
+}
+
+func (w *Window) ensureProjectHeaderRow(rawDir string, includeSeparator bool) *gtk.ListBoxRow {
+	w.ensureSidebarMaps()
+	normDir := normalizeProjectDir(rawDir)
+	if row := w.projectHeaderRows[normDir]; row != nil {
+		if child := row.Child(); child != nil {
+			if box, ok := gtk.BaseWidget(child).Cast().(*gtk.Box); ok {
+				w.setProjectHeaderSeparator(box, includeSeparator)
+			}
+			w.updateProjectHeaderLabels(child, rawDir)
+		}
+		w.rowProjectDir[row.Object.Native()] = normDir
+		return row
+	}
+
+	row := gtk.NewListBoxRow()
+	row.AddCSSClass("glup-sidebar-header-row")
+	row.SetSelectable(false)
+	row.SetActivatable(false)
+	row.SetFocusable(false)
+
+	hBox := w.newProjectHeaderBox(rawDir, includeSeparator)
+	w.updateProjectHeaderLabels(hBox, rawDir)
+	tooltip := fmt.Sprintf("%s (%s) — click to collapse/expand, right-click or hold for options, drag to reorder", projectName(rawDir), shortDir(rawDir))
+	hBox.SetTooltipText(tooltip)
+	row.SetChild(hBox)
+
+	w.rowProjectDir[row.Object.Native()] = normDir
+	w.projectHeaderRows[normDir] = row
+	return row
+}
+
+func (w *Window) ensureProjectShowMoreRow(dir string, hiddenCount int) *gtk.ListBoxRow {
+	w.ensureSidebarMaps()
+	normDir := normalizeProjectDir(dir)
+	text := fmt.Sprintf("Show %d more…", hiddenCount)
+	if row := w.projectShowMoreRows[normDir]; row != nil {
+		if lbl := w.projectShowMoreLbls[normDir]; lbl != nil && lbl.Text() != text {
+			lbl.SetText(text)
+		}
+		rp := row.Object.Native()
+		w.projectShowMoreDirs[rp] = normDir
+		w.rowProjectDir[rp] = normDir
+		return row
+	}
+
+	row := gtk.NewListBoxRow()
+	row.AddCSSClass("glup-sidebar-show-more-row")
+	row.SetSelectable(false)
+	row.SetActivatable(true)
+
+	lbl := gtk.NewLabel(text)
+	lbl.AddCSSClass("caption")
+	lbl.AddCSSClass("dim-label")
+	lbl.SetXAlign(0)
+	lbl.SetHAlign(gtk.AlignStart)
+	row.SetChild(lbl)
+
+	rp := row.Object.Native()
+	w.projectShowMoreRows[normDir] = row
+	w.projectShowMoreLbls[normDir] = lbl
+	w.projectShowMoreDirs[rp] = normDir
+	w.rowProjectDir[rp] = normDir
+	w.attachProjectDropTarget(row)
+	return row
+}
+
+func (w *Window) retireProjectHeader(dir string) {
+	row := w.projectHeaderRows[dir]
+	if row == nil {
+		return
+	}
+	delete(w.projectHeaderRows, dir)
+	rp := row.Object.Native()
+	delete(w.rowProjectDir, rp)
+	delete(w.hoveredRow, rp)
+
+	var hw *projectHeaderWidgets
+	if child := row.Child(); child != nil {
+		ptr := gtk.BaseWidget(child).Object.Native()
+		hw = w.headerWidgets[ptr]
+		delete(w.headerWidgets, ptr)
+		delete(w.headerProjectDir, ptr)
+	}
+	if hw != nil && hw.popover != nil {
+		hw.popover.Popdown()
+	}
+	glib.IdleAdd(func() {
+		if hw != nil && hw.popover != nil && hw.popover.Parent() != nil {
+			hw.popover.Unparent()
+		}
+		if row.Parent() == nil {
+			row.SetChild(nil)
+		}
+	})
+}
+
+func (w *Window) retireProjectShowMore(dir string) {
+	row := w.projectShowMoreRows[dir]
+	if row == nil {
+		return
+	}
+	delete(w.projectShowMoreRows, dir)
+	delete(w.projectShowMoreLbls, dir)
+	rp := row.Object.Native()
+	delete(w.projectShowMoreDirs, rp)
+	delete(w.rowProjectDir, rp)
+	delete(w.hoveredRow, rp)
+	if row.Parent() == nil {
+		row.SetChild(nil)
+	}
+}
+
+func (w *Window) syncSidebar() {
+	if w == nil {
+		return
+	}
+	w.reorderTabsByProject()
+	if w.sidebarList == nil {
+		return
+	}
+	w.ensureSidebarMaps()
+	w.setupSidebarList()
+
+	currentID := w.currentRootSessionID()
+	maxVis := w.effectiveMaxVisibleSessions()
+
+	type projectGroup struct {
+		dir    string
+		rawDir string
+		tabs   []*sessionTab
+	}
+	var groups []*projectGroup
+	groupMap := make(map[string]*projectGroup)
+	seenTabs := make(map[string]bool, len(w.tabOrder))
+
+	for _, id := range w.tabOrder {
+		if id == "" || seenTabs[id] {
+			continue
+		}
+		tab := w.tabs[id]
+		if tab == nil || tab.main == nil {
+			continue
+		}
+		seenTabs[id] = true
+		rawDir := tab.main.session.Location.Directory
+		normDir := normalizeProjectDir(rawDir)
+		g := groupMap[normDir]
+		if g == nil {
+			g = &projectGroup{dir: normDir, rawDir: rawDir}
+			groupMap[normDir] = g
+			groups = append(groups, g)
+		}
+		g.tabs = append(g.tabs, tab)
+	}
+
+	var desiredRows []*gtk.ListBoxRow
+	desiredHeaderDirs := make(map[string]bool, len(groups))
+	desiredShowMoreDirs := make(map[string]bool)
+	desiredSet := make(map[uintptr]bool)
+	var activeRow *gtk.ListBoxRow
+
+	for gIdx, g := range groups {
+		desiredHeaderDirs[g.dir] = true
+		hdrRow := w.ensureProjectHeaderRow(g.rawDir, gIdx > 0)
+		desiredRows = append(desiredRows, hdrRow)
+		desiredSet[hdrRow.Object.Native()] = true
+
+		if w.collapsedProjects[g.dir] {
+			continue
+		}
+
+		expanded := w.expandedProjects[g.dir]
+		visibleCount := 0
+		for i, tab := range g.tabs {
+			sessID := tab.main.session.ID
+			if !expanded && i >= maxVis && sessID != currentID {
+				continue
+			}
+			visibleCount++
+			if tab.sidebarIndicator == nil || tab.sidebarIndicator.row == nil {
+				tab.sidebarIndicator = w.buildConversationRow(sessID, tab)
+			}
+			row := tab.sidebarIndicator.row
+			rp := row.Object.Native()
+			w.sidebarRowSessID[rp] = sessID
+			w.rowProjectDir[rp] = g.dir
+			desiredRows = append(desiredRows, row)
+			desiredSet[rp] = true
+			if sessID == currentID {
+				activeRow = row
+			}
+		}
+
+		if !expanded {
+			total := len(w.projectSessions[g.dir])
+			if len(g.tabs) > total {
+				total = len(g.tabs)
+			}
+			if hidden := total - visibleCount; hidden > 0 {
+				desiredShowMoreDirs[g.dir] = true
+				moreRow := w.ensureProjectShowMoreRow(g.dir, hidden)
+				desiredRows = append(desiredRows, moreRow)
+				desiredSet[moreRow.Object.Native()] = true
+			}
+		}
+	}
+
+	unselectIfSelected := func(row *gtk.ListBoxRow) {
+		if row != nil && row.IsSelected() {
+			w.sidebarList.UnselectRow(row)
+		}
+	}
+
+	prevSyncing := w.syncingSidebarSelect
+	w.syncingSidebarSelect = true
+
+	// Pass 1: remove rows no longer in desiredRows.
+	var toRemove []*gtk.ListBoxRow
+	for i := 0; ; i++ {
+		row := w.sidebarList.RowAtIndex(i)
+		if row == nil {
+			break
+		}
+		if !desiredSet[row.Object.Native()] {
+			toRemove = append(toRemove, row)
+		}
+	}
+	for _, row := range toRemove {
+		delete(w.hoveredRow, row.Object.Native())
+		unselectIfSelected(row)
+		w.sidebarList.Remove(row)
+	}
+
+	// Pass 2: align remaining/new rows to desiredRows order.
+	for i, desired := range desiredRows {
+		cur := w.sidebarList.RowAtIndex(i)
+		if cur != nil && cur.Object.Native() == desired.Object.Native() {
+			continue
+		}
+		if desired.Parent() != nil {
+			delete(w.hoveredRow, desired.Object.Native())
+			if child := desired.Child(); child != nil {
+				if hw := w.headerWidgets[gtk.BaseWidget(child).Object.Native()]; hw != nil && hw.popover != nil {
+					hw.popover.Popdown()
+				}
+			}
+			unselectIfSelected(desired)
+			w.sidebarList.Remove(desired)
+		}
+		w.sidebarList.Insert(desired, i)
+	}
+
+	if activeRow != nil {
+		if !activeRow.IsSelected() {
+			w.sidebarList.SelectRow(activeRow)
+		}
+	} else {
+		w.sidebarList.UnselectAll()
+	}
+
+	w.syncingSidebarSelect = prevSyncing
+
+	// Retire unused headers and show-more rows.
+	for dir := range w.projectHeaderRows {
+		if !desiredHeaderDirs[dir] {
+			w.retireProjectHeader(dir)
+		}
+	}
+	for dir := range w.projectShowMoreRows {
+		if !desiredShowMoreDirs[dir] {
+			w.retireProjectShowMore(dir)
 		}
 	}
 
@@ -3964,6 +4085,7 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		return
 	}
 	if ind.closeBtn != nil {
+		w.ensureSidebarMaps()
 		w.closeBtnSessID[ind.closeBtn.Object.Native()] = sessID
 	}
 	focused := (sessID == w.currentRootSessionID())
@@ -3976,6 +4098,18 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 	if ind.spinner != nil {
 		ind.spinner.SetVisible(active)
 	}
+	if ind.titleLbl != nil {
+		title := tab.Title()
+		if ind.titleLbl.Text() != title {
+			ind.titleLbl.SetText(title)
+		}
+	}
+	if ind.dot != nil {
+		ind.dot.SetVisible(tab.NeedsAttention() && !focused)
+	}
+	if ind.label == nil || ind.box == nil {
+		return
+	}
 
 	switch {
 	case showClose:
@@ -3985,7 +4119,11 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		ind.label.SetVisible(false)
 		ind.box.SetVisible(false)
 	default:
-		timemark := formatRelativeTimemark(tab.main.session.Time.Updated)
+		var updatedMs int64
+		if tab.main != nil {
+			updatedMs = tab.main.session.Time.Updated
+		}
+		timemark := formatRelativeTimemark(updatedMs)
 		if timemark != "" {
 			ind.label.SetLabel(timemark)
 			ind.label.SetVisible(true)
@@ -4130,11 +4268,13 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 
 	var topSessions []opencode.Session
 	var discoveredDirs, awakeDirs []string
+	seenIDs := make(map[string]bool, len(sessions))
 	stateChanged := false
 	for _, s := range sessions {
-		if s.ParentID != "" {
+		if s.ParentID != "" || s.ID == "" || seenIDs[s.ID] {
 			continue
 		}
+		seenIDs[s.ID] = true
 		if s.Location.Directory != "" {
 			discoveredDirs = append(discoveredDirs, s.Location.Directory)
 		}
@@ -4191,6 +4331,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		for _, sub := range tab.subTimelines {
 			sub.closeStreams()
 		}
+		w.cleanupTabSidebarState(tab)
 		w.viewStack.Remove(tab.stack)
 	}
 	w.tabs = make(map[string]*sessionTab)
@@ -4219,7 +4360,6 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 			projCount[dir] = count + 1
 		}
 	}
-	w.syncSectionStarts()
 
 	targetID := prevSelected
 	if _, ok := w.tabs[targetID]; !ok {
@@ -4231,16 +4371,13 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	}
 	w.populating = false
 	if targetID != "" {
-		w.syncProjectSessionVisibility()
 		w.viewStack.SetVisibleChildName(targetID)
-		w.onVisibleTabChanged()
-	} else {
-		w.onVisibleTabChanged()
 	}
+	w.onVisibleTabChanged()
+	w.syncSidebar()
 
 	glib.IdleAdd(func() {
-		w.syncProjectSessionVisibility()
-		w.syncSwitcherIndicators()
+		w.syncSidebar()
 		if w.inputView != nil {
 			w.inputView.GrabFocus()
 		}
@@ -4746,12 +4883,12 @@ func (w *Window) addSessionTab(sess opencode.Session) *sessionTab {
 	}
 
 	page := w.viewStack.AddTitled(stack, sess.ID, title)
-	page.SetBadgeNumber(0)
 
 	tab := &sessionTab{
 		page:         page,
 		stack:        stack,
 		main:         mainConv,
+		title:        title,
 		subTimelines: make(map[string]*convTimeline),
 	}
 	w.tabs[sess.ID] = tab
@@ -4778,8 +4915,7 @@ func (w *Window) onVisibleTabChanged() {
 		w.updateBottomBar(nil)
 		w.rebuildSubagentList(nil)
 		w.rebuildShellList()
-		w.syncProjectSessionVisibility()
-		w.syncSwitcherIndicators()
+		w.syncSidebar()
 		w.updateWindowManagerTitle()
 		return
 	}
@@ -4792,13 +4928,12 @@ func (w *Window) onVisibleTabChanged() {
 			w.saveState()
 		}
 	}
-	tab.page.SetNeedsAttention(false)
+	tab.setNeedsAttention(false)
 
 	w.refreshHeaderAndBottomBar(tab)
 	w.rebuildShellList()
 	w.ensureShellOutputPoller()
-	w.syncProjectSessionVisibility()
-	w.syncSwitcherIndicators()
+	w.syncSidebar()
 	w.refreshShells()
 	if w.inputView != nil {
 		w.inputView.GrabFocus()
@@ -4866,7 +5001,7 @@ func formatWindowManagerTitle(sessionTitle string, attentionCount int) string {
 func (w *Window) countNeedsAttention() int {
 	count := 0
 	for _, tab := range w.tabs {
-		if tab != nil && tab.page != nil && tab.page.NeedsAttention() {
+		if tab != nil && tab.NeedsAttention() {
 			count++
 		}
 	}
@@ -5223,7 +5358,6 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				w.upsertPendingPermission(perm)
 			}
 
-			tab.page.SetBadgeNumber(0)
 			w.applyRevertState(tab, conv)
 			conv.keepPendingAtBottom()
 			conv.scroll.ScrollToBottom()
@@ -7013,14 +7147,13 @@ func (w *Window) createNewSessionInDirAndThen(dir string, onReady func()) {
 			tab := w.ensureSessionTab(*sess)
 			tab.main.loaded = true
 			tab.main.updateGreeterVisibility()
-			w.syncProjectSessionVisibility()
 			w.viewStack.SetVisibleChildName(sess.ID)
 			w.onVisibleTabChanged()
 			if w.inputView != nil {
 				w.inputView.GrabFocus()
 			}
 			glib.IdleAdd(func() {
-				w.syncSwitcherIndicators()
+				w.syncSidebar()
 			})
 			if onReady != nil {
 				onReady()
@@ -8792,9 +8925,6 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 			conv.scroll.ScrollToBottomIfBottomed()
 		}
 	}
-	if conv == tab.main {
-		tab.page.SetBadgeNumber(0)
-	}
 	if w.currentTab() == tab {
 		if tab.activeConv() == conv {
 			w.updateBusyState(active)
@@ -8897,12 +9027,11 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					}
 					wasEmpty := len(w.tabs) == 0
 					w.ensureSessionTab(sess)
-					w.syncProjectSessionVisibility()
 					if wasEmpty && w.viewStack != nil {
 						w.viewStack.SetVisibleChildName(sess.ID)
 						w.onVisibleTabChanged()
 					}
-					w.syncSwitcherIndicators()
+					w.syncSidebar()
 				}
 			}
 			if w.client != nil && d.Session.ID != "" && d.Session.Location.Directory == "" && d.Session.ParentID == "" && d.Session.Title == "" {
@@ -8964,9 +9093,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			if tab, ok := w.tabs[sess.ID]; ok {
 				if sess.Title != "" && tab.main.session.Title != sess.Title {
 					tab.main.session.Title = sess.Title
-					if tab.page != nil {
-						tab.page.SetTitle(sess.Title)
-					}
+					tab.setTitle(sess.Title)
 				}
 				if sess.Agent != "" {
 					tab.main.session.Agent = sess.Agent
@@ -8990,13 +9117,26 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					tab.main.session.Tokens = sess.Tokens
 				}
 				tab.main.session.Revert = sess.Revert
+				dirChanged := false
 				if sess.Location.Directory != "" {
+					oldDir := normalizeProjectDir(tab.main.session.Location.Directory)
+					newDir := normalizeProjectDir(sess.Location.Directory)
 					tab.main.session.Location = sess.Location
+					if newDir != "" && newDir != oldDir {
+						dirChanged = true
+						if w.ensureProjectOrder(newDir) {
+							w.saveState()
+						}
+						w.moveSessionInProjectCache(sess.ID, oldDir, newDir, &tab.main.session)
+					}
 				}
 				if sess.Time.Updated != 0 {
 					w.touchSessionUpdated(tab, tab.main, sess.Time.Updated)
+				}
+				if dirChanged {
+					w.syncSidebar()
 				} else {
-					w.syncSwitcherIndicators()
+					w.updateSwitcherIndicators()
 				}
 				if w.currentTab() == tab {
 					w.refreshHeaderAndBottomBar(tab)
@@ -9034,22 +9174,117 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						w.rebuildSubagentList(parentTab)
 					}
 				}
-			} else if tab, ok := w.tabs[delID]; ok {
-				tab.main.closeStreams()
-				for _, c := range tab.subTimelines {
-					c.closeStreams()
+			} else {
+				var normDir string
+				allFiltered := w.allSessions[:0]
+				for _, s := range w.allSessions {
+					if s.ID == delID {
+						if normDir == "" {
+							normDir = normalizeProjectDir(s.Location.Directory)
+						}
+						continue
+					}
+					allFiltered = append(allFiltered, s)
 				}
-				w.viewStack.Remove(tab.stack)
-				delete(w.tabs, delID)
-				for i, id := range w.tabOrder {
-					if id == delID {
-						w.tabOrder = append(w.tabOrder[:i], w.tabOrder[i+1:]...)
-						break
+				w.allSessions = allFiltered
+
+				if tab, ok := w.tabs[delID]; ok && normDir == "" && tab.main != nil {
+					normDir = normalizeProjectDir(tab.main.session.Location.Directory)
+				}
+				if w.projectSessions != nil {
+					for dir, list := range w.projectSessions {
+						filtered := list[:0]
+						removed := false
+						for _, s := range list {
+							if s.ID == delID {
+								removed = true
+								if normDir == "" {
+									normDir = dir
+								}
+								continue
+							}
+							filtered = append(filtered, s)
+						}
+						if removed {
+							if len(filtered) == 0 {
+								delete(w.projectSessions, dir)
+							} else {
+								w.projectSessions[dir] = filtered
+							}
+						}
 					}
 				}
-				w.syncSectionStarts()
-				w.syncProjectSessionVisibility()
-				w.syncSwitcherIndicators()
+				stateDirty := false
+				if w.visibleSessions[delID] {
+					delete(w.visibleSessions, delID)
+					stateDirty = true
+				}
+				if w.archivedSessions[delID] {
+					delete(w.archivedSessions, delID)
+					stateDirty = true
+				}
+				if stateDirty {
+					w.saveState()
+				}
+
+				if tab, ok := w.tabs[delID]; ok {
+					wasCurrent := (w.currentRootSessionID() == delID)
+					var nextID string
+					if wasCurrent {
+						nextID = w.nextVisibleTabID(delID, normDir, nil)
+					}
+
+					prevPopulating := w.populating
+					w.populating = true
+					tab.main.closeStreams()
+					for subID, c := range tab.subTimelines {
+						c.closeStreams()
+						delete(w.childToRoot, subID)
+					}
+					for _, sub := range tab.subagents {
+						delete(w.childToRoot, sub.ID)
+					}
+					w.cleanupTabSidebarState(tab)
+					if w.viewStack != nil && tab.stack != nil {
+						w.viewStack.Remove(tab.stack)
+					}
+					delete(w.tabs, delID)
+					if idx := slices.Index(w.tabOrder, delID); idx >= 0 {
+						w.tabOrder = slices.Delete(w.tabOrder, idx, idx+1)
+					}
+					if normDir != "" && w.projectSessions != nil && !w.expandedProjects[normDir] {
+						maxVis := w.effectiveMaxVisibleSessions()
+						openCount := 0
+						for _, id := range w.tabOrder {
+							if t := w.tabs[id]; t != nil && t.main != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
+								openCount++
+							}
+						}
+						for _, candidate := range w.projectSessions[normDir] {
+							if openCount >= maxVis {
+								break
+							}
+							if _, exists := w.tabs[candidate.ID]; !exists {
+								w.ensureSessionTab(candidate)
+								openCount++
+							}
+						}
+					}
+					if wasCurrent && nextID == "" {
+						nextID = w.nextVisibleTabID(delID, normDir, nil)
+					}
+					w.populating = prevPopulating
+
+					if wasCurrent {
+						if nextID != "" && w.viewStack != nil {
+							w.viewStack.SetVisibleChildName(nextID)
+						}
+						w.onVisibleTabChanged()
+					} else {
+						w.updateWindowManagerTitle()
+					}
+				}
+				w.syncSidebar()
 			}
 		}
 

@@ -53,8 +53,20 @@
               </object>
             </child>
             <property name="content">
-              <object class="AdwViewSwitcherSidebar" id="viewSwitcherSidebar">
+              <object class="GtkScrolledWindow" id="sidebarScroll">
+                <property name="hscrollbar-policy">never</property>
                 <property name="vexpand">true</property>
+                <property name="child">
+                  <object class="GtkListBox" id="sidebarList">
+                    <property name="selection-mode">single</property>
+                    <property name="activate-on-single-click">true</property>
+                    <property name="tab-behavior">item</property>
+                    <style>
+                      <class name="navigation-sidebar"/>
+                      <class name="glup-sidebar-list"/>
+                    </style>
+                  </object>
+                </property>
               </object>
             </property>
           </object>

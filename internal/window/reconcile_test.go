@@ -1121,7 +1121,7 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 	vs.SetVisibleChildName("ses_fg")
 
 	win.setConvActive("ses_bg", true)
-	if bgTab.page.NeedsAttention() {
+	if bgTab.NeedsAttention() {
 		t.Fatal("setConvActive(true) should not set NeedsAttention before text or question")
 	}
 
@@ -1129,7 +1129,7 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		Type: "session.reasoning.delta",
 		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","ordinal":0,"delta":"thinking..."}`),
 	})
-	if bgTab.page.NeedsAttention() {
+	if bgTab.NeedsAttention() {
 		t.Fatal("session.reasoning.delta should not set NeedsAttention")
 	}
 
@@ -1137,7 +1137,7 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		Type: "session.tool.called",
 		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","id":"t1","name":"read","input":{"path":"a.go"}}`),
 	})
-	if bgTab.page.NeedsAttention() {
+	if bgTab.NeedsAttention() {
 		t.Fatal("session.tool.called should not set NeedsAttention")
 	}
 
@@ -1145,18 +1145,18 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		Type: "session.text.delta",
 		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","ordinal":1,"delta":"Hello user"}`),
 	})
-	if !bgTab.page.NeedsAttention() {
+	if !bgTab.NeedsAttention() {
 		t.Fatal("session.text.delta with non-empty text should set NeedsAttention on background tab")
 	}
 
 	// Reset and test form.created
-	bgTab.page.SetNeedsAttention(false)
+	bgTab.setNeedsAttention(false)
 	bgTab.main.loaded = true
 	win.handleEvent(opencode.Event{
 		Type: "form.created",
 		Data: json.RawMessage(`{"form":{"id":"frm_99","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"Choice","description":"Pick one","type":"string","options":[{"value":"A","label":"A"}]}]}}`),
 	})
-	if !bgTab.page.NeedsAttention() {
+	if !bgTab.NeedsAttention() {
 		t.Fatal("form.created should set NeedsAttention on background tab")
 	}
 	if len(bgTab.main.pendingForms) != 1 || bgTab.main.formWidgets["frm_99"] == nil {
@@ -1735,8 +1735,8 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 	if tab.main.session.Title != "Updated Dissent Session Title" {
 		t.Errorf("tab.main.session.Title = %q, want Updated Dissent Session Title", tab.main.session.Title)
 	}
-	if tab.page.Title() != "Updated Dissent Session Title" {
-		t.Errorf("tab.page.Title() = %q, want Updated Dissent Session Title", tab.page.Title())
+	if tab.Title() != "Updated Dissent Session Title" {
+		t.Errorf("tab.Title() = %q, want Updated Dissent Session Title", tab.Title())
 	}
 	if win.windowTitle.Title() != "Updated Dissent Session Title" {
 		t.Errorf("win.windowTitle.Title() = %q, want Updated Dissent Session Title", win.windowTitle.Title())
@@ -1802,7 +1802,7 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 
 	// Permission asked (attention needed) on background tab ses_root -> bumps ses_root to the top of tabOrder.
 	vs.SetVisibleChildName("ses_older_13m")
-	win.tabs["ses_root"].page.SetNeedsAttention(false)
+	win.tabs["ses_root"].setNeedsAttention(false)
 	win.tabs["ses_root"].main.loaded = false
 	win.handleEvent(opencode.Event{
 		Type: "permission.asked",
@@ -1949,12 +1949,12 @@ func TestTakeChargeAutoReply(t *testing.T) {
 	}
 
 	// 3. While Take Charge is ON, a new form.created arrives -> immediately auto-answered without setting NeedsAttention.
-	bgTab.page.SetNeedsAttention(false)
+	bgTab.setNeedsAttention(false)
 	win.handleEvent(opencode.Event{
 		Type: "form.created",
 		Data: json.RawMessage(`{"form":{"id":"frm_incoming","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"Deploy","description":"Deploy now?","type":"string","custom":true}]}}`),
 	})
-	if bgTab.page.NeedsAttention() {
+	if bgTab.NeedsAttention() {
 		t.Errorf("expected form.created while Take Charge is active NOT to set NeedsAttention")
 	}
 
@@ -3273,20 +3273,24 @@ func TestPreferencesPersistenceAndLiveApply(t *testing.T) {
 
 	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
 	vs := adw.NewViewStack()
+	sidebarList := gtk.NewListBox()
 	composerClamp := adw.NewClamp()
 	sendBtn := gtk.NewButton()
 
 	win := &Window{
-		ctx:             t.Context(),
-		statePath:       stateFile,
-		viewStack:       vs,
-		composerClamp:   composerClamp,
-		sendBtn:         sendBtn,
-		tabs:            make(map[string]*sessionTab),
-		childToRoot:     make(map[string]string),
-		visibleSessions: make(map[string]bool),
-		projectSessions: make(map[string][]opencode.Session),
-		shellOutputs:    make(map[string]string),
+		ctx:               t.Context(),
+		statePath:         stateFile,
+		sidebarList:       sidebarList,
+		viewStack:         vs,
+		composerClamp:     composerClamp,
+		sendBtn:           sendBtn,
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+		visibleSessions:   make(map[string]bool),
+		collapsedProjects: make(map[string]bool),
+		expandedProjects:  make(map[string]bool),
+		projectSessions:   make(map[string][]opencode.Session),
+		shellOutputs:      make(map[string]string),
 		greeterProfile: &GreeterProfile{
 			Title:    "Generated Title",
 			Subtitle: "Generated Subtitle",
@@ -3359,14 +3363,31 @@ func TestPreferencesPersistenceAndLiveApply(t *testing.T) {
 		t.Fatalf("expected ses_4 to be promoted when MaxVisibleSessions increased to 4")
 	}
 
-	// 4. Decreasing MaxVisibleSessions from 4 to 2 hides tabs beyond the first 2.
+	// 4. Decreasing MaxVisibleSessions from 4 to 2 hides tabs beyond the first 2 in the sidebar
+	// while keeping their viewStack pages visible so active sessions stay selectable.
 	win.prefs.MaxVisibleSessions = 2
 	win.applyMaxVisibleSessions()
-	if !win.tabs["ses_1"].page.Visible() || !win.tabs["ses_2"].page.Visible() {
-		t.Fatalf("expected first 2 tabs to remain visible")
+	for _, id := range []string{"ses_1", "ses_2", "ses_3", "ses_4"} {
+		if !win.tabs[id].page.Visible() {
+			t.Fatalf("expected %s viewStack page to remain visible", id)
+		}
 	}
-	if win.tabs["ses_3"].page.Visible() || win.tabs["ses_4"].page.Visible() {
-		t.Fatalf("expected tabs 3 and 4 to be hidden when MaxVisibleSessions=2")
+	for _, id := range []string{"ses_1", "ses_2"} {
+		ind := win.tabs[id].sidebarIndicator
+		if ind == nil || ind.row == nil || ind.row.Parent() == nil {
+			t.Fatalf("expected %s sidebar row to remain attached in sidebarList", id)
+		}
+	}
+	for _, id := range []string{"ses_3", "ses_4"} {
+		ind := win.tabs[id].sidebarIndicator
+		if ind != nil && ind.row != nil && ind.row.Parent() != nil {
+			t.Fatalf("expected %s sidebar row to be detached from sidebarList when MaxVisibleSessions=2", id)
+		}
+	}
+	showMoreRow := win.projectShowMoreRows[dir]
+	showMoreLbl := win.projectShowMoreLbls[dir]
+	if showMoreRow == nil || showMoreRow.Parent() == nil || showMoreLbl == nil || showMoreLbl.Text() != "Show 3 more…" {
+		t.Fatalf("expected attached 'Show 3 more…' row for %s, got row=%v lbl=%v", dir, showMoreRow, showMoreLbl)
 	}
 
 	// 5. Verify Take Charge custom directive and ToolWidget diff truncation limit.
@@ -3623,8 +3644,8 @@ func TestPermissionPromptWidgetAndTakeCharge(t *testing.T) {
 		}`),
 	})
 
-	if !tab2.page.NeedsAttention() {
-		t.Fatalf("expected tab2.page.NeedsAttention() = true when permission is asked on background tab")
+	if !tab2.NeedsAttention() {
+		t.Fatalf("expected tab2.NeedsAttention() = true when permission is asked on background tab")
 	}
 	if len(tab2.main.pendingPermissions) != 1 {
 		t.Fatalf("expected 1 pending permission in tab2, got %d", len(tab2.main.pendingPermissions))

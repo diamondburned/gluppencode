@@ -124,6 +124,8 @@ func (w *Window) applyChatWidth() {
 
 func (w *Window) applyMaxVisibleSessions() {
 	maxVis := w.effectiveMaxVisibleSessions()
+	prevPopulating := w.populating
+	w.populating = true
 	for dir, list := range w.projectSessions {
 		if w.expandedProjects[dir] {
 			continue
@@ -147,8 +149,8 @@ func (w *Window) applyMaxVisibleSessions() {
 			}
 		}
 	}
-	w.syncProjectSessionVisibility()
-	w.syncSwitcherIndicators()
+	w.populating = prevPopulating
+	w.syncSidebar()
 }
 
 func (w *Window) applyShellTailLines() {
@@ -652,9 +654,11 @@ func (w *Window) applySessionMoved(sessionID, newRawDir string) {
 		w.saveState()
 	}
 
+	var oldRawDir string
 	var movedSess *opencode.Session
 	for i := range w.allSessions {
 		if w.allSessions[i].ID == sessionID {
+			oldRawDir = w.allSessions[i].Location.Directory
 			w.allSessions[i].Location = loc
 			s := w.allSessions[i]
 			movedSess = &s
@@ -664,6 +668,9 @@ func (w *Window) applySessionMoved(sessionID, newRawDir string) {
 
 	tab, conv := w.resolveConv(sessionID)
 	if conv != nil {
+		if oldRawDir == "" {
+			oldRawDir = conv.session.Location.Directory
+		}
 		conv.session.Location = loc
 		if movedSess == nil && conv == tab.main {
 			s := conv.session
@@ -674,48 +681,16 @@ func (w *Window) applySessionMoved(sessionID, newRawDir string) {
 		}
 	}
 
-	if w.projectSessions != nil && movedSess != nil && movedSess.ParentID == "" && !w.archivedSessions[sessionID] {
-		for dir, list := range w.projectSessions {
-			if dir == newDir {
-				continue
-			}
-			filtered := list[:0]
-			for _, s := range list {
-				if s.ID != sessionID {
-					filtered = append(filtered, s)
-				}
-			}
-			if len(filtered) == 0 {
-				delete(w.projectSessions, dir)
-			} else {
-				w.projectSessions[dir] = filtered
-			}
-		}
-		dest := w.projectSessions[newDir]
-		found := false
-		for i := range dest {
-			if dest[i].ID == sessionID {
-				dest[i] = *movedSess
-				found = true
-				break
-			}
-		}
-		if !found {
-			dest = append([]opencode.Session{*movedSess}, dest...)
-		}
-		w.projectSessions[newDir] = dest
-	}
+	w.moveSessionInProjectCache(sessionID, oldRawDir, newDir, movedSess)
 
 	if tab != nil {
 		if conv == tab.main {
-			w.reorderTabsByProject()
 			w.bumpSessionToTop(tab)
-			w.syncSectionStarts()
-			w.syncProjectSessionVisibility()
-			w.syncSwitcherIndicators()
 		}
 		if w.currentTab() == tab {
 			w.refreshHeaderAndBottomBar(tab)
 		}
+	} else {
+		w.syncSidebar()
 	}
 }
