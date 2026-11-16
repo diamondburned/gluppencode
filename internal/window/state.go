@@ -94,23 +94,43 @@ func clampDiffTruncationLines(n int) int {
 	return n
 }
 
-// Preferences stores user-configurable appearance, layout, greeter, composer, and server settings.
+// Preferences stores user-configurable appearance, layout, greeter, composer, notification, and server settings.
 type Preferences struct {
-	ChatWidth            int    `json:"chatWidth,omitempty"`
-	MaxVisibleSessions   int    `json:"maxVisibleSessions,omitempty"`
-	ColorScheme          string `json:"colorScheme,omitempty"` // "" ("system"), "light", "dark"
-	SyntaxTheme          string `json:"syntaxTheme,omitempty"` // "" (auto), or GtkSourceView scheme ID
-	ShellTailLines       int    `json:"shellTailLines,omitempty"`
-	DiffTruncationLines  int    `json:"diffTruncationLines,omitempty"`
-	CtrlEnterToSend      bool   `json:"ctrlEnterToSend,omitempty"`
-	TakeChargeDirective  string `json:"takeChargeDirective,omitempty"`
-	GreeterModelOverride string `json:"greeterModelOverride,omitempty"` // "" (auto), or "providerID/modelID"
-	GreeterTitleOverride string `json:"greeterTitleOverride,omitempty"`
-	GreeterSubOverride   string `json:"greeterSubOverride,omitempty"`
-	ServerURL            string `json:"serverURL,omitempty"`
+	ChatWidth             int    `json:"chatWidth,omitempty"`
+	MaxVisibleSessions    int    `json:"maxVisibleSessions,omitempty"`
+	ColorScheme           string `json:"colorScheme,omitempty"` // "" ("system"), "light", "dark"
+	SyntaxTheme           string `json:"syntaxTheme,omitempty"` // "" (auto), or GtkSourceView scheme ID
+	ShellTailLines        int    `json:"shellTailLines,omitempty"`
+	DiffTruncationLines   int    `json:"diffTruncationLines,omitempty"`
+	CtrlEnterToSend       bool   `json:"ctrlEnterToSend,omitempty"`
+	TakeChargeDirective   string `json:"takeChargeDirective,omitempty"`
+	GreeterModelOverride  string `json:"greeterModelOverride,omitempty"` // "" (auto), or "providerID/modelID"
+	GreeterTitleOverride  string `json:"greeterTitleOverride,omitempty"`
+	GreeterSubOverride    string `json:"greeterSubOverride,omitempty"`
+	NotifyOnFinished      *bool  `json:"notifyOnFinished,omitempty"`     // nil => true
+	NotifyOnActionNeeded  *bool  `json:"notifyOnActionNeeded,omitempty"` // nil => true
+	NotifyOnActiveSession bool   `json:"notifyOnActiveSession,omitempty"`
+	ServerURL             string `json:"serverURL,omitempty"`
+}
+
+func boolPtr(v bool) *bool {
+	return &v
+}
+
+func clonePreferences(p Preferences) Preferences {
+	if p.NotifyOnFinished != nil {
+		v := *p.NotifyOnFinished
+		p.NotifyOnFinished = &v
+	}
+	if p.NotifyOnActionNeeded != nil {
+		v := *p.NotifyOnActionNeeded
+		p.NotifyOnActionNeeded = &v
+	}
+	return p
 }
 
 func normalizePreferences(p Preferences) Preferences {
+	p = clonePreferences(p)
 	if p.ChatWidth != 0 {
 		p.ChatWidth = clampChatWidth(p.ChatWidth)
 	}

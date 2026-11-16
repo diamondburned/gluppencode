@@ -209,6 +209,14 @@ list.glup-sidebar-list > row.glup-sidebar-show-more-row:hover {
 	background-color: var(--accent-bg-color, @accent_bg_color);
 }
 
+.glup-sidebar-question-icon {
+	color: @warning_color;
+}
+
+.glup-sidebar-shell-icon {
+	opacity: 0.62;
+}
+
 .glup-user-images {
 	padding: 4px 0 2px 0;
 }
@@ -908,9 +916,8 @@ menubutton.glup-window-title-btn windowtitle .subtitle {
 }
 
 .glup-switcher-prefix {
-	min-width: 14px;
-	min-height: 14px;
-	margin-right: 4px;
+	min-width: 16px;
+	min-height: 16px;
 }
 
 .glup-switcher-suffix {

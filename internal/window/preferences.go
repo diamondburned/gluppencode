@@ -43,6 +43,58 @@ func (w *Window) effectiveTakeChargeDirective() string {
 	return TakeChargeDirective
 }
 
+func (w *Window) effectiveNotifyOnFinished() bool {
+	return w.prefs.NotifyOnFinished == nil || *w.prefs.NotifyOnFinished
+}
+
+func (w *Window) effectiveNotifyOnActionNeeded() bool {
+	return w.prefs.NotifyOnActionNeeded == nil || *w.prefs.NotifyOnActionNeeded
+}
+
+func (w *Window) effectiveNotifyOnActiveSession() bool {
+	return w.prefs.NotifyOnActiveSession
+}
+
+func (w *Window) saveAndSyncPreferences(prev Preferences) {
+	w.saveState()
+	if w.notifyCoord != nil {
+		w.notifyCoord.syncPreferences(w, prev, w.prefs)
+	}
+}
+
+func (w *Window) applyPreferenceDelta(prev, next Preferences) {
+	if w == nil {
+		return
+	}
+	w.prefs = clonePreferences(next)
+	if prev.ColorScheme != next.ColorScheme {
+		w.applyColorScheme()
+	}
+	if prev.SyntaxTheme != next.SyntaxTheme {
+		w.applySyntaxTheme()
+	}
+	if prev.ChatWidth != next.ChatWidth {
+		w.applyChatWidth()
+	}
+	if prev.MaxVisibleSessions != next.MaxVisibleSessions {
+		w.applyMaxVisibleSessions()
+	}
+	if prev.ShellTailLines != next.ShellTailLines {
+		w.applyShellTailLines()
+	}
+	if prev.DiffTruncationLines != next.DiffTruncationLines {
+		w.applyDiffTruncationLines()
+	}
+	if prev.CtrlEnterToSend != next.CtrlEnterToSend {
+		w.applySendShortcutUI()
+	}
+	if prev.GreeterModelOverride != next.GreeterModelOverride ||
+		prev.GreeterTitleOverride != next.GreeterTitleOverride ||
+		prev.GreeterSubOverride != next.GreeterSubOverride {
+		w.applyGreeterProfileToAllConvs()
+	}
+}
+
 func (w *Window) applyAllPreferences() {
 	w.applyColorScheme()
 	w.applySyntaxTheme()
@@ -229,6 +281,7 @@ func (w *Window) openPreferencesDialog() {
 		colorRow.SetSelected(0)
 	}
 	colorRow.NotifyProperty("selected", func() {
+		prev := clonePreferences(w.prefs)
 		switch colorRow.Selected() {
 		case 1:
 			w.prefs.ColorScheme = "light"
@@ -237,7 +290,7 @@ func (w *Window) openPreferencesDialog() {
 		default:
 			w.prefs.ColorScheme = ""
 		}
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyColorScheme()
 	})
 	themeGroup.Add(colorRow)
@@ -271,8 +324,9 @@ func (w *Window) openPreferencesDialog() {
 	syntaxRow.NotifyProperty("selected", func() {
 		idx := int(syntaxRow.Selected())
 		if idx >= 0 && idx < len(schemeIDs) {
+			prev := clonePreferences(w.prefs)
 			w.prefs.SyntaxTheme = schemeIDs[idx]
-			w.saveState()
+			w.saveAndSyncPreferences(prev)
 			w.applySyntaxTheme()
 		}
 	})
@@ -292,8 +346,9 @@ func (w *Window) openPreferencesDialog() {
 		if w.effectiveChatWidth() == val && w.prefs.ChatWidth != 0 {
 			return
 		}
+		prev := clonePreferences(w.prefs)
 		w.prefs.ChatWidth = val
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyChatWidth()
 	})
 	layoutGroup.Add(chatWidthRow)
@@ -307,8 +362,9 @@ func (w *Window) openPreferencesDialog() {
 		if w.effectiveMaxVisibleSessions() == val && w.prefs.MaxVisibleSessions != 0 {
 			return
 		}
+		prev := clonePreferences(w.prefs)
 		w.prefs.MaxVisibleSessions = val
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyMaxVisibleSessions()
 	})
 	layoutGroup.Add(maxSessRow)
@@ -322,8 +378,9 @@ func (w *Window) openPreferencesDialog() {
 		if w.effectiveShellTailLines() == val && w.prefs.ShellTailLines != 0 {
 			return
 		}
+		prev := clonePreferences(w.prefs)
 		w.prefs.ShellTailLines = val
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyShellTailLines()
 	})
 	layoutGroup.Add(shellLinesRow)
@@ -337,8 +394,9 @@ func (w *Window) openPreferencesDialog() {
 		if w.effectiveDiffTruncationLines() == val && w.prefs.DiffTruncationLines != 0 {
 			return
 		}
+		prev := clonePreferences(w.prefs)
 		w.prefs.DiffTruncationLines = val
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyDiffTruncationLines()
 	})
 	layoutGroup.Add(diffLinesRow)
@@ -411,8 +469,9 @@ func (w *Window) openPreferencesDialog() {
 	greeterModelRow.NotifyProperty("selected", func() {
 		idx := int(greeterModelRow.Selected())
 		if idx >= 0 && idx < len(modelIDs) {
+			prev := clonePreferences(w.prefs)
 			w.prefs.GreeterModelOverride = modelIDs[idx]
-			w.saveState()
+			w.saveAndSyncPreferences(prev)
 		}
 	})
 	greeterGroup.Add(greeterModelRow)
@@ -421,8 +480,9 @@ func (w *Window) openPreferencesDialog() {
 	titleOverrideRow.SetTitle("Custom Greeting Title (Optional)")
 	titleOverrideRow.SetText(w.prefs.GreeterTitleOverride)
 	titleOverrideRow.ConnectChanged(func() {
+		prev := clonePreferences(w.prefs)
 		w.prefs.GreeterTitleOverride = strings.TrimSpace(titleOverrideRow.Text())
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyGreeterProfileToAllConvs()
 		updatePreviewRow()
 	})
@@ -432,8 +492,9 @@ func (w *Window) openPreferencesDialog() {
 	subOverrideRow.SetTitle("Custom Greeting Subtitle (Optional)")
 	subOverrideRow.SetText(w.prefs.GreeterSubOverride)
 	subOverrideRow.ConnectChanged(func() {
+		prev := clonePreferences(w.prefs)
 		w.prefs.GreeterSubOverride = strings.TrimSpace(subOverrideRow.Text())
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applyGreeterProfileToAllConvs()
 		updatePreviewRow()
 	})
@@ -462,8 +523,9 @@ func (w *Window) openPreferencesDialog() {
 		sendKeyRow.SetSelected(0)
 	}
 	sendKeyRow.NotifyProperty("selected", func() {
+		prev := clonePreferences(w.prefs)
 		w.prefs.CtrlEnterToSend = sendKeyRow.Selected() == 1
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		w.applySendShortcutUI()
 	})
 	composerGroup.Add(sendKeyRow)
@@ -472,8 +534,9 @@ func (w *Window) openPreferencesDialog() {
 	takeChargeRow.SetTitle("Take Charge Auto-Reply Text")
 	takeChargeRow.SetText(w.prefs.TakeChargeDirective)
 	takeChargeRow.ConnectChanged(func() {
+		prev := clonePreferences(w.prefs)
 		w.prefs.TakeChargeDirective = strings.TrimSpace(takeChargeRow.Text())
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 	})
 	resetDirectiveBtn := gtk.NewButtonFromIconName("edit-undo-symbolic")
 	resetDirectiveBtn.SetVAlign(gtk.AlignCenter)
@@ -486,6 +549,56 @@ func (w *Window) openPreferencesDialog() {
 	composerGroup.Add(takeChargeRow)
 	behaviorPage.Add(composerGroup)
 
+	notifyGroup := adw.NewPreferencesGroup()
+	notifyGroup.SetTitle("Notifications")
+	notifyGroup.SetDescription("Desktop notifications when sessions finish or wait for your input")
+
+	notifyFinishedRow := adw.NewSwitchRow()
+	notifyFinishedRow.SetTitle("Session Finished")
+	notifyFinishedRow.SetSubtitle("Notify when an assistant turn finishes with a reply")
+	notifyFinishedRow.SetActive(w.effectiveNotifyOnFinished())
+	notifyFinishedRow.NotifyProperty("active", func() {
+		val := notifyFinishedRow.Active()
+		if w.effectiveNotifyOnFinished() == val && w.prefs.NotifyOnFinished != nil {
+			return
+		}
+		prev := clonePreferences(w.prefs)
+		w.prefs.NotifyOnFinished = boolPtr(val)
+		w.saveAndSyncPreferences(prev)
+	})
+	notifyGroup.Add(notifyFinishedRow)
+
+	notifyActionRow := adw.NewSwitchRow()
+	notifyActionRow.SetTitle("Action Required")
+	notifyActionRow.SetSubtitle("Notify when a session asks a question or requests permission")
+	notifyActionRow.SetActive(w.effectiveNotifyOnActionNeeded())
+	notifyActionRow.NotifyProperty("active", func() {
+		val := notifyActionRow.Active()
+		if w.effectiveNotifyOnActionNeeded() == val && w.prefs.NotifyOnActionNeeded != nil {
+			return
+		}
+		prev := clonePreferences(w.prefs)
+		w.prefs.NotifyOnActionNeeded = boolPtr(val)
+		w.saveAndSyncPreferences(prev)
+	})
+	notifyGroup.Add(notifyActionRow)
+
+	notifyActiveRow := adw.NewSwitchRow()
+	notifyActiveRow.SetTitle("Notify for Active Tab")
+	notifyActiveRow.SetSubtitle("Also send desktop notifications for the currently focused session")
+	notifyActiveRow.SetActive(w.effectiveNotifyOnActiveSession())
+	notifyActiveRow.NotifyProperty("active", func() {
+		val := notifyActiveRow.Active()
+		if w.effectiveNotifyOnActiveSession() == val {
+			return
+		}
+		prev := clonePreferences(w.prefs)
+		w.prefs.NotifyOnActiveSession = val
+		w.saveAndSyncPreferences(prev)
+	})
+	notifyGroup.Add(notifyActiveRow)
+	behaviorPage.Add(notifyGroup)
+
 	serverGroup := adw.NewPreferencesGroup()
 	serverGroup.SetTitle("OpenCode Server")
 	serverGroup.SetDescription("Leave blank to automatically discover the local OpenCode service")
@@ -495,8 +608,9 @@ func (w *Window) openPreferencesDialog() {
 	serverURLRow.SetText(w.prefs.ServerURL)
 	serverURLRow.SetShowApplyButton(true)
 	applyServerURL := func() {
+		prev := clonePreferences(w.prefs)
 		w.prefs.ServerURL = strings.TrimSpace(serverURLRow.Text())
-		w.saveState()
+		w.saveAndSyncPreferences(prev)
 		if w.client != nil {
 			w.client.SetServerURL(w.ctx, w.prefs.ServerURL)
 			w.retryConnection()

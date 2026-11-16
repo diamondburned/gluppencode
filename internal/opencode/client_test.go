@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2474,6 +2475,15 @@ func TestActivityStatusEventDecoding(t *testing.T) {
 				t.Errorf("unexpected Message.Retry: %+v", msg.Retry)
 			}
 		},
+		"SessionErrorEvent": func(t *testing.T) {
+			var ev SessionErrorEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","error":{"name":"APIError","message":"boom"}}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.Error == nil {
+				t.Errorf("unexpected SessionErrorEvent: %+v", ev)
+			}
+		},
 	}
 
 	for name, fn := range tests {
@@ -2481,5 +2491,107 @@ func TestActivityStatusEventDecoding(t *testing.T) {
 			t.Parallel()
 			fn(t)
 		})
+	}
+}
+
+func TestListJobs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var capturedPath string
+	var capturedQuery url.Values
+	var respBody string
+
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				capturedPath = req.URL.Path
+				capturedQuery = req.URL.Query()
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/json"}},
+					Body:       io.NopCloser(strings.NewReader(respBody)),
+				}, nil
+			}),
+		},
+	}
+
+	respBody = `{
+		"data": [
+			{
+				"id": "job_sub_1",
+				"kind": "subagent",
+				"sessionID": "ses_root",
+				"status": "running",
+				"title": "Explore repo",
+				"childSessionID": "ses_child_1",
+				"agent": "explore",
+				"description": "Search codebase",
+				"time": {"started": 1700000000000}
+			},
+			{
+				"id": "job_sh_1",
+				"kind": "shell",
+				"sessionID": "ses_root",
+				"status": "running",
+				"shellID": "sh_1",
+				"command": "npm run dev",
+				"time": {"started": 1700000001000}
+			},
+			{
+				"id": "job_img_1",
+				"kind": "image",
+				"sessionID": "ses_child_1",
+				"status": "completed",
+				"path": "/tmp/out.png",
+				"model": "imagen-3",
+				"time": {"started": 1700000002000, "completed": 1700000005000}
+			}
+		]
+	}`
+
+	jobs, err := client.ListJobs(ctx, ListJobsOptions{
+		SessionID:   "ses_root",
+		Kind:        "subagent",
+		Status:      "running",
+		Descendants: true,
+	})
+	if err != nil {
+		t.Fatalf("ListJobs failed: %v", err)
+	}
+	if capturedPath != "/api/experimental/job" {
+		t.Fatalf("path = %q, want /api/experimental/job", capturedPath)
+	}
+	if capturedQuery.Get("sessionID") != "ses_root" ||
+		capturedQuery.Get("kind") != "subagent" ||
+		capturedQuery.Get("status") != "running" ||
+		capturedQuery.Get("descendants") != "true" {
+		t.Fatalf("unexpected query params: %v", capturedQuery)
+	}
+	if len(jobs) != 3 {
+		t.Fatalf("len(jobs) = %d, want 3", len(jobs))
+	}
+	if jobs[0].Kind != "subagent" || jobs[0].ChildSessionID != "ses_child_1" || jobs[0].Agent != "explore" {
+		t.Errorf("unexpected job[0]: %+v", jobs[0])
+	}
+	if jobs[1].Kind != "shell" || jobs[1].ShellID != "sh_1" || jobs[1].Command != "npm run dev" {
+		t.Errorf("unexpected job[1]: %+v", jobs[1])
+	}
+	if jobs[2].Kind != "image" || jobs[2].Status != "completed" || jobs[2].Time.Completed != 1700000005000 {
+		t.Errorf("unexpected job[2]: %+v", jobs[2])
+	}
+
+	// Direct array response without data envelope and empty options.
+	respBody = `[{"id":"job_direct","kind":"subagent","sessionID":"ses_1","status":"error","time":{"started":100}}]`
+	directJobs, err := client.ListJobs(ctx, ListJobsOptions{})
+	if err != nil {
+		t.Fatalf("ListJobs direct array failed: %v", err)
+	}
+	if len(capturedQuery) != 0 {
+		t.Errorf("expected empty query params, got %v", capturedQuery)
+	}
+	if len(directJobs) != 1 || directJobs[0].ID != "job_direct" || directJobs[0].Status != "error" {
+		t.Errorf("unexpected direct jobs: %+v", directJobs)
 	}
 }

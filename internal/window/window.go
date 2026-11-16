@@ -517,28 +517,41 @@ func (c *convTimeline) keepPendingAtBottom() {
 }
 
 type switcherIndicator struct {
-	row      *gtk.ListBoxRow
-	hBox     *gtk.Box
-	spinner  *adw.Spinner
-	dot      *gtk.Box
-	titleLbl *gtk.Label
-	box      *gtk.Box
-	label    *gtk.Label
-	closeBtn *gtk.Button
-	rowPtr   uintptr
+	row          *gtk.ListBoxRow
+	hBox         *gtk.Box
+	spinner      *adw.Spinner
+	questionIcon *gtk.Image
+	shellIcon    *gtk.Image
+	dot          *gtk.Box
+	titleLbl     *gtk.Label
+	box          *gtk.Box
+	label        *gtk.Label
+	closeBtn     *gtk.Button
+	rowPtr       uintptr
 }
 
 type sessionTab struct {
-	page             *adw.ViewStackPage
-	stack            *gtk.Stack
-	main             *convTimeline
-	subagents        []opencode.Session
-	subTimelines     map[string]*convTimeline
-	activeSubID      string
-	gitBranch        string
-	title            string
-	needsAttention   bool
-	sidebarIndicator *switcherIndicator
+	page                *adw.ViewStackPage
+	stack               *gtk.Stack
+	main                *convTimeline
+	subagents           []opencode.Session
+	subTimelines        map[string]*convTimeline
+	activeSubID         string
+	gitBranch           string
+	title               string
+	needsAttention      bool
+	finishedAttention   bool
+	actionAttention     bool
+	sidebarIndicator    *switcherIndicator
+	turnSeq             uint64
+	turnSettled         bool
+	turnHasReply        bool
+	turnFailed          bool
+	turnReplyMsgID      string
+	turnReplyPreview    string
+	turnReplyByMsgID    map[string]string
+	completionSettleGen uint64
+	completionTimer     *time.Timer
 }
 
 func (t *sessionTab) Title() string {
@@ -575,17 +588,29 @@ func (t *sessionTab) NeedsAttention() bool {
 	if t == nil {
 		return false
 	}
-	return t.needsAttention
+	return t.needsAttention || t.finishedAttention || t.actionAttention
+}
+
+func (t *sessionTab) syncNeedsAttention() {
+	if t == nil {
+		return
+	}
+	needs := t.finishedAttention || t.actionAttention
+	t.needsAttention = needs
+	if t.page != nil && t.page.NeedsAttention() != needs {
+		t.page.SetNeedsAttention(needs)
+	}
 }
 
 func (t *sessionTab) setNeedsAttention(needs bool) {
 	if t == nil {
 		return
 	}
-	t.needsAttention = needs
-	if t.page != nil && t.page.NeedsAttention() != needs {
-		t.page.SetNeedsAttention(needs)
+	t.finishedAttention = needs
+	if !needs {
+		t.actionAttention = false
 	}
+	t.syncNeedsAttention()
 }
 
 func (t *sessionTab) activeConv() *convTimeline {
@@ -842,6 +867,9 @@ type Window struct {
 	greeterRefreshing bool
 	prefs             Preferences
 
+	notifyCoord           *notificationCoordinator
+	completionSettleDelay time.Duration
+
 	populating bool
 }
 
@@ -1006,6 +1034,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 	})
 	w.loadState()
+	w.initNotificationCoordinator(a.Application)
 	w.emptyGreeter = NewGreeterWidget(w.effectiveGreeterProfile(), w.populateComposerSuggestion)
 	w.contentMainBox.Prepend(w.emptyGreeter)
 	w.syncEmptyGreeterVisibility()
@@ -1110,11 +1139,27 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	bp.AddSetter(w.rootContent, "collapsed", true)
 	adwWin.AddBreakpoint(bp)
 
+	adwWin.NotifyProperty("is-active", func() {
+		if adwWin.IsActive() {
+			if rootID := w.currentRootSessionID(); rootID != "" {
+				if tab := w.tabs[rootID]; tab != nil && tab.finishedAttention {
+					tab.finishedAttention = false
+					tab.syncNeedsAttention()
+					w.updateWindowManagerTitle()
+					w.updateSwitcherIndicators()
+				}
+				w.withdrawFinishedNotification(rootID)
+			}
+		}
+	})
+
 	adwWin.ConnectCloseRequest(func() bool {
 		if w.mcpMgr != nil {
 			w.mcpMgr.closeAuthDialog()
 			w.mcpMgr.stopLogPoller()
 		}
+		w.cancelAllCompletionSettles()
+		w.unregisterFromNotifications()
 		cancel()
 		for _, tab := range w.tabs {
 			tab.main.closeStreams()
@@ -1838,6 +1883,7 @@ func (w *Window) archiveSession(sessID string) {
 	}
 
 	if !ok {
+		w.withdrawSessionNotifications(sessID)
 		w.syncSidebar()
 		return
 	}
@@ -1850,6 +1896,8 @@ func (w *Window) archiveSession(sessID string) {
 
 	prevPopulating := w.populating
 	w.populating = true
+	w.cancelCompletionSettle(tab)
+	w.withdrawSessionNotifications(sessID)
 	tab.main.closeStreams()
 	for _, sub := range tab.subTimelines {
 		sub.closeStreams()
@@ -1927,6 +1975,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 			continue
 		}
 		if tab, ok := w.tabs[id]; ok {
+			w.cancelCompletionSettle(tab)
 			tab.main.closeStreams()
 			for _, sub := range tab.subTimelines {
 				sub.closeStreams()
@@ -1937,6 +1986,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 			}
 			delete(w.tabs, id)
 		}
+		w.withdrawSessionNotifications(id)
 	}
 	w.tabOrder = nextOrder
 	w.populating = prevPopulating
@@ -1971,8 +2021,11 @@ func (w *Window) isSessionActiveForSearch(sess opencode.Session, pool []opencode
 	if sess.ID == "" {
 		return false
 	}
-	if tab, ok := w.tabs[sess.ID]; ok && w.isTabWorking(tab) {
-		return true
+	if tab, ok := w.tabs[sess.ID]; ok && tab != nil {
+		if tabHasPendingInput(tab) {
+			return false
+		}
+		return w.isTabAgentWorking(tab)
 	}
 	if sess.Time.Busy > 0 && sess.Time.Busy > sess.Time.Idle {
 		return true
@@ -1982,20 +2035,12 @@ func (w *Window) isSessionActiveForSearch(sess opencode.Session, pool []opencode
 	}
 	for _, s := range pool {
 		if s.ParentID == sess.ID {
-			if s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle {
+			if s.Time.Busy > 0 && s.Time.Busy > sess.Time.Idle {
 				return true
 			}
 			if _, ok := activeMap[s.ID]; ok {
 				return true
 			}
-		}
-	}
-	for _, sh := range w.activeShells {
-		if sh.Status != "" && sh.Status != "running" {
-			continue
-		}
-		if sh.SessionID == sess.ID || w.childToRoot[sh.SessionID] == sess.ID {
-			return true
 		}
 	}
 	return false
@@ -3774,19 +3819,304 @@ func (w *Window) bumpSessionToTop(tab *sessionTab) {
 	w.syncSidebar()
 }
 
+const defaultCompletionSettleDelay = 1500 * time.Millisecond
+
+func (w *Window) effectiveCompletionSettleDelay() time.Duration {
+	if w != nil && w.completionSettleDelay > 0 {
+		return w.completionSettleDelay
+	}
+	return defaultCompletionSettleDelay
+}
+
 func (w *Window) markTabNeedsAttention(tab *sessionTab, forceBump bool) {
 	if tab == nil || tab.main == nil || tab.main.session.ID == w.currentRootSessionID() {
 		return
 	}
 	wasAttention := tab.NeedsAttention()
-	if !wasAttention {
-		tab.setNeedsAttention(true)
+	if !tab.finishedAttention {
+		tab.finishedAttention = true
+		tab.syncNeedsAttention()
 		w.updateWindowManagerTitle()
 		w.updateSwitcherIndicators()
 	}
 	if !wasAttention || forceBump {
 		w.bumpSessionToTop(tab)
 	}
+}
+
+func (w *Window) markTabActionAttention(tab *sessionTab, forceBump bool) {
+	if tab == nil || tab.main == nil || tab.main.session.ID == w.currentRootSessionID() {
+		return
+	}
+	wasAttention := tab.NeedsAttention()
+	if !tab.actionAttention {
+		tab.actionAttention = true
+		tab.syncNeedsAttention()
+		w.updateWindowManagerTitle()
+		w.updateSwitcherIndicators()
+	}
+	if !wasAttention || forceBump {
+		w.bumpSessionToTop(tab)
+	}
+}
+
+func (w *Window) refreshTabActionAttention(tab *sessionTab) {
+	if w == nil || tab == nil {
+		return
+	}
+	if !tabHasPendingInput(tab) && tab.actionAttention {
+		tab.actionAttention = false
+		tab.syncNeedsAttention()
+		w.updateWindowManagerTitle()
+	}
+	w.updateSwitcherIndicators()
+}
+
+func (w *Window) resetRootTurn(tab *sessionTab) {
+	if tab == nil {
+		return
+	}
+	tab.turnSeq++
+	tab.turnSettled = false
+	tab.turnHasReply = false
+	tab.turnFailed = false
+	tab.turnReplyMsgID = ""
+	tab.turnReplyPreview = ""
+	if tab.turnReplyByMsgID != nil {
+		clear(tab.turnReplyByMsgID)
+	}
+}
+
+func (w *Window) recordRootReplyDelta(tab *sessionTab, msgID, delta string) {
+	if tab == nil || delta == "" {
+		return
+	}
+	if strings.TrimSpace(delta) != "" {
+		tab.turnHasReply = true
+	}
+	if msgID != "" {
+		if tab.turnReplyByMsgID == nil {
+			tab.turnReplyByMsgID = make(map[string]string)
+		}
+		tab.turnReplyByMsgID[msgID] += delta
+		tab.turnReplyMsgID = msgID
+		tab.turnReplyPreview = tab.turnReplyByMsgID[msgID]
+	} else {
+		tab.turnReplyPreview += delta
+	}
+}
+
+func (w *Window) recordRootReplyEnded(tab *sessionTab, msgID, text string) {
+	if tab == nil || strings.TrimSpace(text) == "" {
+		return
+	}
+	tab.turnHasReply = true
+	if msgID != "" {
+		if tab.turnReplyByMsgID == nil {
+			tab.turnReplyByMsgID = make(map[string]string)
+		}
+		tab.turnReplyByMsgID[msgID] = text
+		tab.turnReplyMsgID = msgID
+	}
+	tab.turnReplyPreview = text
+}
+
+func (w *Window) cancelCompletionSettle(tab *sessionTab) {
+	if tab == nil {
+		return
+	}
+	tab.completionSettleGen++
+	if tab.completionTimer != nil {
+		tab.completionTimer.Stop()
+		tab.completionTimer = nil
+	}
+}
+
+func (w *Window) cancelAllCompletionSettles() {
+	if w == nil {
+		return
+	}
+	for _, tab := range w.tabs {
+		w.cancelCompletionSettle(tab)
+	}
+}
+
+func (w *Window) hasRunningSubagentLocal(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	for _, sub := range tab.subagents {
+		if sub.IsRunning() {
+			return true
+		}
+	}
+	for _, subConv := range tab.subTimelines {
+		if subConv != nil && subConv.active {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) canCompleteRootTurnLocal(tab *sessionTab) bool {
+	if tab == nil || tab.main == nil {
+		return false
+	}
+	if tab.main.active {
+		return false
+	}
+	if !tab.turnHasReply || tab.turnFailed || tab.turnSettled {
+		return false
+	}
+	if tabHasPendingInput(tab) {
+		return false
+	}
+	if w.hasRunningSubagentLocal(tab) {
+		return false
+	}
+	return true
+}
+
+func (w *Window) maybeScheduleRootTurnCompletion(tab *sessionTab) {
+	if w == nil || !w.canCompleteRootTurnLocal(tab) {
+		return
+	}
+	if tab.completionTimer != nil {
+		tab.completionTimer.Stop()
+		tab.completionTimer = nil
+	}
+	tab.completionSettleGen++
+	gen := tab.completionSettleGen
+	turnSeq := tab.turnSeq
+	rootID := tab.main.session.ID
+	delay := w.effectiveCompletionSettleDelay()
+
+	tab.completionTimer = time.AfterFunc(delay, func() {
+		glib.IdleAdd(func() {
+			if w.ctx != nil && w.ctx.Err() != nil {
+				return
+			}
+			curTab := w.tabs[rootID]
+			if curTab == nil || curTab != tab {
+				return
+			}
+			if curTab.completionSettleGen != gen || curTab.turnSeq != turnSeq {
+				return
+			}
+			curTab.completionTimer = nil
+			if !w.canCompleteRootTurnLocal(curTab) {
+				return
+			}
+			w.verifyAndFinalizeRootTurn(curTab, gen, turnSeq)
+		})
+	})
+}
+
+func (w *Window) verifyAndFinalizeRootTurn(tab *sessionTab, gen, turnSeq uint64) {
+	if w == nil || tab == nil || tab.main == nil {
+		return
+	}
+	if w.client == nil {
+		w.finalizeRootTurnCompletion(tab, gen, turnSeq)
+		return
+	}
+	rootID := tab.main.session.ID
+	childIDs := make(map[string]bool)
+	for _, sub := range tab.subagents {
+		if sub.ID != "" {
+			childIDs[sub.ID] = true
+		}
+	}
+	for id := range tab.subTimelines {
+		if id != "" {
+			childIDs[id] = true
+		}
+	}
+	for cid, rid := range w.childToRoot {
+		if rid == rootID && cid != "" {
+			childIDs[cid] = true
+		}
+	}
+
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gtkutil.Async(ctx, func() func() {
+		checkCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		defer cancel()
+
+		var (
+			jobs      []opencode.JobInfo
+			jobsErr   error
+			active    map[string]opencode.ActiveStatus
+			activeErr error
+			wg        sync.WaitGroup
+		)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			jobs, jobsErr = w.client.ListJobs(checkCtx, opencode.ListJobsOptions{
+				SessionID:   rootID,
+				Descendants: true,
+			})
+		}()
+		go func() {
+			defer wg.Done()
+			active, activeErr = w.client.ActiveSessions(checkCtx)
+		}()
+		wg.Wait()
+
+		return func() {
+			curTab := w.tabs[rootID]
+			if curTab == nil || curTab != tab {
+				return
+			}
+			if curTab.completionSettleGen != gen || curTab.turnSeq != turnSeq {
+				return
+			}
+			if !w.canCompleteRootTurnLocal(curTab) {
+				return
+			}
+			if jobsErr == nil {
+				for _, job := range jobs {
+					if job.Kind == "shell" || job.Status == "cancelled" {
+						continue
+					}
+					return
+				}
+			}
+			if activeErr == nil && active != nil {
+				if _, ok := active[rootID]; ok {
+					return
+				}
+				for cid := range childIDs {
+					if _, ok := active[cid]; ok {
+						return
+					}
+				}
+			}
+			w.finalizeRootTurnCompletion(curTab, gen, turnSeq)
+		}
+	})
+}
+
+func (w *Window) finalizeRootTurnCompletion(tab *sessionTab, gen, turnSeq uint64) {
+	if w == nil || tab == nil || tab.main == nil {
+		return
+	}
+	if tab.completionSettleGen != gen || tab.turnSeq != turnSeq {
+		return
+	}
+	if !w.canCompleteRootTurnLocal(tab) {
+		return
+	}
+	tab.turnSettled = true
+	rootID := tab.main.session.ID
+	if rootID != w.currentRootSessionID() {
+		w.markTabNeedsAttention(tab, false)
+	}
+	w.notifySessionFinished(tab)
 }
 
 func (w *Window) touchSessionUpdated(tab *sessionTab, conv *convTimeline, updatedMs int64) {
@@ -3994,6 +4324,24 @@ func (w *Window) buildConversationRow(sessID string, tab *sessionTab) *switcherI
 	spinner.SetVisible(false)
 	hBox.Append(spinner)
 
+	questionIcon := gtk.NewImageFromIconName("dialog-question-symbolic")
+	questionIcon.SetPixelSize(16)
+	questionIcon.AddCSSClass("glup-switcher-prefix")
+	questionIcon.AddCSSClass("glup-sidebar-question-icon")
+	questionIcon.SetTooltipText("Waiting for your input")
+	questionIcon.SetVAlign(gtk.AlignCenter)
+	questionIcon.SetVisible(false)
+	hBox.Append(questionIcon)
+
+	shellIcon := gtk.NewImageFromIconName("terminal-symbolic")
+	shellIcon.SetPixelSize(16)
+	shellIcon.AddCSSClass("glup-switcher-prefix")
+	shellIcon.AddCSSClass("glup-sidebar-shell-icon")
+	shellIcon.SetTooltipText("Background shell running")
+	shellIcon.SetVAlign(gtk.AlignCenter)
+	shellIcon.SetVisible(false)
+	hBox.Append(shellIcon)
+
 	titleLbl := gtk.NewLabel(tab.Title())
 	titleLbl.AddCSSClass("glup-sidebar-conversation-title")
 	titleLbl.SetXAlign(0)
@@ -4056,15 +4404,17 @@ func (w *Window) buildConversationRow(sessID string, tab *sessionTab) *switcherI
 	w.attachProjectDropTarget(row)
 
 	return &switcherIndicator{
-		row:      row,
-		hBox:     hBox,
-		spinner:  spinner,
-		dot:      dot,
-		titleLbl: titleLbl,
-		box:      suffixBox,
-		label:    label,
-		closeBtn: closeBtn,
-		rowPtr:   rp,
+		row:          row,
+		hBox:         hBox,
+		spinner:      spinner,
+		questionIcon: questionIcon,
+		shellIcon:    shellIcon,
+		dot:          dot,
+		titleLbl:     titleLbl,
+		box:          suffixBox,
+		label:        label,
+		closeBtn:     closeBtn,
+		rowPtr:       rp,
 	}
 }
 
@@ -4345,8 +4695,8 @@ func (w *Window) syncSidebar() {
 	w.updateSwitcherIndicators()
 }
 
-func (w *Window) isTabWorking(tab *sessionTab) bool {
-	if tab == nil {
+func (w *Window) isTabAgentWorking(tab *sessionTab) bool {
+	if tab == nil || tabHasPendingInput(tab) {
 		return false
 	}
 	if tab.main != nil && tab.main.active {
@@ -4362,7 +4712,14 @@ func (w *Window) isTabWorking(tab *sessionTab) bool {
 			return true
 		}
 	}
-	return len(w.visibleBackgroundShellsForTab(tab)) > 0
+	return false
+}
+
+func (w *Window) isTabWorking(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	return w.isTabAgentWorking(tab) || len(w.visibleBackgroundShellsForTab(tab)) > 0
 }
 
 func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *sessionTab) {
@@ -4374,14 +4731,22 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		w.closeBtnSessID[ind.closeBtn.Object.Native()] = sessID
 	}
 	focused := (sessID == w.currentRootSessionID())
-	active := w.isTabWorking(tab)
+	hasPendingInput := tabHasPendingInput(tab)
+	agentWorking := !hasPendingInput && w.isTabAgentWorking(tab)
+	hasBgShells := !hasPendingInput && !agentWorking && len(w.visibleBackgroundShellsForTab(tab)) > 0
 	hovered := ind.rowPtr != 0 && w.hoveredRow[ind.rowPtr]
 	showClose := ind.closeBtn != nil && (hovered || focused)
 	if ind.closeBtn != nil {
 		ind.closeBtn.SetVisible(showClose)
 	}
 	if ind.spinner != nil {
-		ind.spinner.SetVisible(active)
+		ind.spinner.SetVisible(agentWorking)
+	}
+	if ind.questionIcon != nil {
+		ind.questionIcon.SetVisible(hasPendingInput)
+	}
+	if ind.shellIcon != nil {
+		ind.shellIcon.SetVisible(hasBgShells)
 	}
 	if ind.titleLbl != nil {
 		title := tab.Title()
@@ -4390,7 +4755,7 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		}
 	}
 	if ind.dot != nil {
-		ind.dot.SetVisible(tab.NeedsAttention() && !focused)
+		ind.dot.SetVisible(tab.finishedAttention && !focused)
 	}
 	if ind.label == nil || ind.box == nil {
 		return
@@ -4615,6 +4980,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	}
 
 	for _, tab := range w.tabs {
+		w.cancelCompletionSettle(tab)
 		tab.main.closeStreams()
 		for _, sub := range tab.subTimelines {
 			sub.closeStreams()
@@ -4649,7 +5015,14 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		}
 	}
 
+	pendingOpenID := w.notifyCoord.consumePendingOpenSessionID()
 	targetID := prevSelected
+	if pendingOpenID != "" {
+		if _, ok := w.tabs[pendingOpenID]; ok {
+			targetID = pendingOpenID
+			pendingOpenID = ""
+		}
+	}
 	if _, ok := w.tabs[targetID]; !ok {
 		if firstUncollapsedID != "" {
 			targetID = firstUncollapsedID
@@ -4663,6 +5036,9 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	}
 	w.onVisibleTabChanged()
 	w.syncSidebar()
+	if pendingOpenID != "" {
+		w.openSessionByID(pendingOpenID)
+	}
 
 	glib.IdleAdd(func() {
 		w.syncSidebar()
@@ -4723,10 +5099,10 @@ func (w *Window) loadPendingFormsForAllDirs(dirs []string) {
 		wg.Wait()
 		return func() {
 			for _, f := range allForms {
-				w.upsertPendingForm(f)
+				w.upsertPendingForm(f, false)
 			}
 			for _, p := range allPerms {
-				w.upsertPendingPermission(p)
+				w.upsertPendingPermission(p, false)
 			}
 		}
 	})
@@ -4866,7 +5242,23 @@ func (w *Window) replyFormTakeCharge(form opencode.FormInfo) {
 	})
 }
 
-func (w *Window) upsertPendingForm(form opencode.FormInfo) {
+func (w *Window) resolveOrEnsureConv(sessionID string, wake bool) (*sessionTab, *convTimeline) {
+	var tab *sessionTab
+	var conv *convTimeline
+	if wake {
+		tab, conv = w.resolveEventConv(sessionID)
+	} else {
+		tab, conv = w.resolveConv(sessionID)
+	}
+	if tab != nil && conv == nil {
+		if rootID, ok := w.childToRoot[sessionID]; ok && rootID != "" {
+			conv = w.ensureSubagentConv(tab, sessionID)
+		}
+	}
+	return tab, conv
+}
+
+func (w *Window) upsertPendingForm(form opencode.FormInfo, live bool) {
 	if form.ID == "" || form.SessionID == "" {
 		return
 	}
@@ -4876,7 +5268,7 @@ func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 			return
 		}
 	}
-	tab, conv := w.resolveEventConv(form.SessionID)
+	tab, conv := w.resolveOrEnsureConv(form.SessionID, live)
 	if tab == nil || conv == nil {
 		return
 	}
@@ -4888,10 +5280,18 @@ func (w *Window) upsertPendingForm(form opencode.FormInfo) {
 			break
 		}
 	}
-	if !found {
+	isNew := !found
+	if isNew {
 		conv.pendingForms = append(conv.pendingForms, form)
 	}
-	w.markTabNeedsAttention(tab, !found)
+	if live {
+		w.cancelCompletionSettle(tab)
+		w.markTabActionAttention(tab, isNew)
+		if isNew {
+			w.notifyFormActionNeeded(tab, form)
+		}
+	}
+	w.updateSwitcherIndicators()
 	if conv.loaded {
 		w.ensureFormWidget(tab, conv, form)
 		conv.keepPendingAtBottom()
@@ -4905,22 +5305,56 @@ func (w *Window) removePendingForm(sessionID, formID string) {
 	if formID == "" {
 		return
 	}
-	_, conv := w.resolveConv(sessionID)
+	tab, conv := w.resolveConv(sessionID)
 	if conv == nil {
 		// Search across all tabs if sessionID wasn't resolved directly.
 		for _, t := range w.tabs {
-			if _, ok := t.main.formWidgets[formID]; ok {
-				conv = t.main
-				break
+			if t == nil {
+				continue
 			}
-			for _, sub := range t.subTimelines {
-				if _, ok := sub.formWidgets[formID]; ok {
-					conv = sub
+			if t.main != nil {
+				if _, ok := t.main.formWidgets[formID]; ok {
+					tab, conv = t, t.main
+					break
+				}
+				for _, f := range t.main.pendingForms {
+					if f.ID == formID {
+						tab, conv = t, t.main
+						break
+					}
+				}
+				if conv != nil {
 					break
 				}
 			}
+			for _, sub := range t.subTimelines {
+				if sub == nil {
+					continue
+				}
+				if _, ok := sub.formWidgets[formID]; ok {
+					tab, conv = t, sub
+					break
+				}
+				for _, f := range sub.pendingForms {
+					if f.ID == formID {
+						tab, conv = t, sub
+						break
+					}
+				}
+				if conv != nil {
+					break
+				}
+			}
+			if conv != nil {
+				break
+			}
 		}
 	}
+	var rootID string
+	if tab != nil && tab.main != nil {
+		rootID = tab.main.session.ID
+	}
+	w.withdrawActionNotification(rootID, formNotificationID(formID))
 	if conv == nil {
 		return
 	}
@@ -4938,6 +5372,7 @@ func (w *Window) removePendingForm(sessionID, formID string) {
 		}
 	}
 	conv.keepPendingAtBottom()
+	w.refreshTabActionAttention(tab)
 }
 
 func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form opencode.FormInfo) *QuestionFormWidget {
@@ -5038,7 +5473,7 @@ func (w *Window) replyPermissionTakeCharge(perm opencode.PermissionRequest) {
 	})
 }
 
-func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest) {
+func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest, live bool) {
 	if perm.ID == "" || perm.SessionID == "" {
 		return
 	}
@@ -5048,7 +5483,7 @@ func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest) {
 			return
 		}
 	}
-	tab, conv := w.resolveEventConv(perm.SessionID)
+	tab, conv := w.resolveOrEnsureConv(perm.SessionID, live)
 	if tab == nil || conv == nil {
 		return
 	}
@@ -5060,10 +5495,18 @@ func (w *Window) upsertPendingPermission(perm opencode.PermissionRequest) {
 			break
 		}
 	}
-	if !found {
+	isNew := !found
+	if isNew {
 		conv.pendingPermissions = append(conv.pendingPermissions, perm)
 	}
-	w.markTabNeedsAttention(tab, !found)
+	if live {
+		w.cancelCompletionSettle(tab)
+		w.markTabActionAttention(tab, isNew)
+		if isNew {
+			w.notifyPermissionActionNeeded(tab, perm)
+		}
+	}
+	w.updateSwitcherIndicators()
 	if conv.loaded {
 		w.ensurePermissionWidget(tab, conv, perm)
 		conv.keepPendingAtBottom()
@@ -5077,21 +5520,55 @@ func (w *Window) removePendingPermission(sessionID, requestID string) {
 	if requestID == "" {
 		return
 	}
-	_, conv := w.resolveConv(sessionID)
+	tab, conv := w.resolveConv(sessionID)
 	if conv == nil {
 		for _, t := range w.tabs {
-			if _, ok := t.main.permissionWidgets[requestID]; ok {
-				conv = t.main
-				break
+			if t == nil {
+				continue
 			}
-			for _, sub := range t.subTimelines {
-				if _, ok := sub.permissionWidgets[requestID]; ok {
-					conv = sub
+			if t.main != nil {
+				if _, ok := t.main.permissionWidgets[requestID]; ok {
+					tab, conv = t, t.main
+					break
+				}
+				for _, p := range t.main.pendingPermissions {
+					if p.ID == requestID {
+						tab, conv = t, t.main
+						break
+					}
+				}
+				if conv != nil {
 					break
 				}
 			}
+			for _, sub := range t.subTimelines {
+				if sub == nil {
+					continue
+				}
+				if _, ok := sub.permissionWidgets[requestID]; ok {
+					tab, conv = t, sub
+					break
+				}
+				for _, p := range sub.pendingPermissions {
+					if p.ID == requestID {
+						tab, conv = t, sub
+						break
+					}
+				}
+				if conv != nil {
+					break
+				}
+			}
+			if conv != nil {
+				break
+			}
 		}
 	}
+	var rootID string
+	if tab != nil && tab.main != nil {
+		rootID = tab.main.session.ID
+	}
+	w.withdrawActionNotification(rootID, permNotificationID(requestID))
 	if conv == nil {
 		return
 	}
@@ -5109,6 +5586,7 @@ func (w *Window) removePendingPermission(sessionID, requestID string) {
 		}
 	}
 	conv.keepPendingAtBottom()
+	w.refreshTabActionAttention(tab)
 }
 
 func (w *Window) ensurePermissionWidget(tab *sessionTab, conv *convTimeline, perm opencode.PermissionRequest) *PermissionPromptWidget {
@@ -5216,6 +5694,9 @@ func (w *Window) onVisibleTabChanged() {
 			w.saveState()
 		}
 	}
+	if tab.main != nil {
+		w.withdrawFinishedNotification(tab.main.session.ID)
+	}
 	tab.setNeedsAttention(false)
 
 	w.refreshHeaderAndBottomBar(tab)
@@ -5309,19 +5790,48 @@ func (w *Window) updateWindowManagerTitle() {
 	}
 }
 
+func (w *Window) ensureSubagentConv(tab *sessionTab, childID string) *convTimeline {
+	if tab == nil || childID == "" || tab.main == nil {
+		return nil
+	}
+	if w.childToRoot == nil {
+		w.childToRoot = make(map[string]string)
+	}
+	w.childToRoot[childID] = tab.main.session.ID
+	if tab.subTimelines == nil {
+		tab.subTimelines = make(map[string]*convTimeline)
+	}
+	if subConv, ok := tab.subTimelines[childID]; ok && subConv != nil {
+		return subConv
+	}
+	subSess := opencode.Session{
+		ID:       childID,
+		ParentID: tab.main.session.ID,
+		Location: tab.main.session.Location,
+	}
+	for _, s := range tab.subagents {
+		if s.ID == childID {
+			subSess = s
+			break
+		}
+	}
+	subConv := w.newConvTimeline(subSess)
+	tab.subTimelines[childID] = subConv
+	if tab.stack != nil {
+		tab.stack.AddNamed(subConv.scroll, "sub_"+childID)
+	}
+	return subConv
+}
+
 func (w *Window) openSubagent(tab *sessionTab, subSess opencode.Session) {
 	if tab == nil {
 		return
 	}
-	w.childToRoot[subSess.ID] = tab.main.session.ID
-	subConv, ok := tab.subTimelines[subSess.ID]
-	if !ok {
-		subConv = w.newConvTimeline(subSess)
-		tab.subTimelines[subSess.ID] = subConv
-		tab.stack.AddNamed(subConv.scroll, "sub_"+subSess.ID)
-	} else {
-		subConv.session = subSess
+	subConv := w.ensureSubagentConv(tab, subSess.ID)
+	if subConv == nil {
+		return
 	}
+	subConv.session = subSess
 	if subSess.IsRunning() && !subConv.active {
 		subConv.active = true
 		subConv.syncActivityLabel()
@@ -5384,9 +5894,15 @@ func (w *Window) upsertSubagent(tab *sessionTab, sess opencode.Session) {
 				s.Time.Idle = sess.Time.Idle
 			}
 			tab.subagents[i] = s
+			if s.IsRunning() {
+				w.cancelCompletionSettle(tab)
+			}
 			w.updateSwitcherIndicators()
 			return
 		}
+	}
+	if sess.IsRunning() {
+		w.cancelCompletionSettle(tab)
 	}
 	tab.subagents = append([]opencode.Session{sess}, tab.subagents...)
 	w.updateSwitcherIndicators()
@@ -5403,6 +5919,9 @@ func (w *Window) setSubagentActive(childID string, active bool, outcome string) 
 	tab, ok := w.tabs[rootID]
 	if !ok || tab == nil {
 		return
+	}
+	if active {
+		w.cancelCompletionSettle(tab)
 	}
 	now := time.Now().UnixMilli()
 	for i, s := range tab.subagents {
@@ -5655,11 +6174,12 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			}
 
 			for _, form := range forms {
-				w.upsertPendingForm(form)
+				w.upsertPendingForm(form, false)
 			}
 			for _, perm := range perms {
-				w.upsertPendingPermission(perm)
+				w.upsertPendingPermission(perm, false)
 			}
+			w.refreshTabActionAttention(tab)
 
 			w.applyRevertState(tab, conv)
 			conv.keepPendingAtBottom()
@@ -5868,7 +6388,7 @@ func (w *Window) reconcileTail(sessionID string) {
 			activeFormIDs := make(map[string]bool, len(forms))
 			for _, f := range forms {
 				activeFormIDs[f.ID] = true
-				w.upsertPendingForm(f)
+				w.upsertPendingForm(f, false)
 			}
 			for i := len(conv.pendingForms) - 1; i >= 0; i-- {
 				if id := conv.pendingForms[i].ID; !activeFormIDs[id] {
@@ -5878,13 +6398,14 @@ func (w *Window) reconcileTail(sessionID string) {
 			activePermIDs := make(map[string]bool, len(perms))
 			for _, p := range perms {
 				activePermIDs[p.ID] = true
-				w.upsertPendingPermission(p)
+				w.upsertPendingPermission(p, false)
 			}
 			for i := len(conv.pendingPermissions) - 1; i >= 0; i-- {
 				if id := conv.pendingPermissions[i].ID; !activePermIDs[id] {
 					w.removePendingPermission(sessionID, id)
 				}
 			}
+			w.refreshTabActionAttention(tab)
 			var appended bool
 			findPrevWidget := func(idx int) gtk.Widgetter {
 				for i := idx - 1; i >= 0; i-- {
@@ -9267,6 +9788,13 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 	if tab == nil {
 		return
 	}
+	wasActive := conv != nil && conv.active
+	if active {
+		w.cancelCompletionSettle(tab)
+		if conv != nil && conv == tab.main && !wasActive {
+			w.resetRootTurn(tab)
+		}
+	}
 	if conv != nil {
 		conv.active = active
 		if !active {
@@ -9539,9 +10067,15 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						}
 					}
 					parentTab.subagents = filtered
+					if subConv, ok := parentTab.subTimelines[delID]; ok {
+						subConv.closeStreams()
+						delete(parentTab.subTimelines, delID)
+					}
 					if parentTab.activeConv() != nil && parentTab.activeConv().session.ID == delID {
 						w.closeSubagent(parentTab)
 					}
+					w.refreshTabActionAttention(parentTab)
+					w.maybeScheduleRootTurnCompletion(parentTab)
 					if w.currentTab() == parentTab {
 						w.updateBottomBar(parentTab)
 						w.rebuildSubagentList(parentTab)
@@ -9609,6 +10143,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 
 					prevPopulating := w.populating
 					w.populating = true
+					w.cancelCompletionSettle(tab)
 					tab.main.closeStreams()
 					for subID, c := range tab.subTimelines {
 						c.closeStreams()
@@ -9657,6 +10192,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						w.updateWindowManagerTitle()
 					}
 				}
+				w.withdrawSessionNotifications(delID)
 				w.syncSidebar()
 			}
 		}
@@ -9695,6 +10231,27 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			if rootID, ok := w.childToRoot[d.SessionID]; ok {
 				w.loadChildSubagents(rootID)
 			}
+			if tab != nil {
+				if conv != nil && conv == tab.main {
+					if ev.Type == "session.execution.failed" || ev.Type == "session.execution.interrupted" {
+						tab.turnFailed = true
+						w.cancelCompletionSettle(tab)
+					} else {
+						w.maybeScheduleRootTurnCompletion(tab)
+					}
+				} else if _, isChild := w.childToRoot[d.SessionID]; isChild {
+					w.maybeScheduleRootTurnCompletion(tab)
+				}
+			}
+		}
+
+	case "session.error":
+		var d opencode.SessionErrorEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if tab, conv := w.resolveEventConv(d.SessionID); tab != nil && conv != nil && conv == tab.main {
+				tab.turnFailed = true
+				w.cancelCompletionSettle(tab)
+			}
 		}
 
 	case "session.status":
@@ -9725,10 +10282,14 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				w.setSubagentActive(d.SessionID, true, "")
 			case "idle":
 				w.updateSessionActivityState(d.SessionID, false)
+				tab, conv := w.resolveEventConv(d.SessionID)
 				w.setConvActive(d.SessionID, false)
 				w.setSubagentActive(d.SessionID, false, "succeeded")
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
 					w.loadChildSubagents(rootID)
+				}
+				if tab != nil && ((conv != nil && conv == tab.main) || w.childToRoot[d.SessionID] != "") {
+					w.maybeScheduleRootTurnCompletion(tab)
 				}
 			}
 		}
@@ -10090,8 +10651,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				conv.retryAttempt = 0
 				conv.syncActivityLabel()
 				w.onStreamDelta(tab, conv, len(d.Delta))
-				if strings.TrimSpace(d.Delta) != "" {
-					w.markTabNeedsAttention(tab, false)
+				if tab != nil && conv == tab.main {
+					w.recordRootReplyDelta(tab, d.AssistantMessageID, d.Delta)
 				}
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
@@ -10104,8 +10665,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.TextEndedEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveEventConv(d.SessionID)
-			if strings.TrimSpace(d.Text) != "" {
-				w.markTabNeedsAttention(tab, false)
+			if tab != nil && conv != nil && conv == tab.main {
+				w.recordRootReplyEnded(tab, d.AssistantMessageID, d.Text)
 			}
 			if conv != nil && conv.loaded {
 				aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
@@ -10513,7 +11074,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "form.created":
 		var d opencode.FormCreatedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.Form.ID != "" {
-			w.upsertPendingForm(d.Form)
+			w.upsertPendingForm(d.Form, true)
 		}
 
 	case "form.replied":
@@ -10531,7 +11092,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "permission.asked":
 		var d opencode.PermissionAskedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.Request.ID != "" {
-			w.upsertPendingPermission(d.Request)
+			w.upsertPendingPermission(d.Request, true)
 		}
 
 	case "permission.replied":

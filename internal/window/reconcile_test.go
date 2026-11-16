@@ -1082,14 +1082,15 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 	}
 
 	// Verify NeedsAttention behavior on background tab:
-	// 1. setConvActive(true), reasoning delta, and tool call must NOT set NeedsAttention.
-	// 2. text delta or form.created MUST set NeedsAttention.
+	// 1. setConvActive(true), reasoning delta, tool call, and mid-turn text delta must NOT set NeedsAttention.
+	// 2. Root turn completion after settle delay OR live form.created MUST set NeedsAttention.
 	vs := adw.NewViewStack()
 	win := &Window{
-		viewStack:   vs,
-		stopBtn:     gtk.NewButton(),
-		tabs:        make(map[string]*sessionTab),
-		childToRoot: make(map[string]string),
+		viewStack:             vs,
+		stopBtn:               gtk.NewButton(),
+		tabs:                  make(map[string]*sessionTab),
+		childToRoot:           make(map[string]string),
+		completionSettleDelay: 20 * time.Millisecond,
 	}
 	fgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_fg", "Foreground")
 	bgPage := vs.AddTitled(gtk.NewBox(gtk.OrientationVertical, 0), "ses_bg", "Background")
@@ -1145,8 +1146,21 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		Type: "session.text.delta",
 		Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"m1","ordinal":1,"delta":"Hello user"}`),
 	})
-	if !bgTab.NeedsAttention() {
-		t.Fatal("session.text.delta with non-empty text should set NeedsAttention on background tab")
+	if bgTab.NeedsAttention() {
+		t.Fatal("mid-turn session.text.delta must not set NeedsAttention before turn ends")
+	}
+
+	win.handleEvent(opencode.Event{
+		Type: "session.execution.succeeded",
+		Data: json.RawMessage(`{"sessionID":"ses_bg"}`),
+	})
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) && !bgTab.NeedsAttention() {
+		glib.MainContextDefault().Iteration(false)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !bgTab.NeedsAttention() || !bgTab.finishedAttention {
+		t.Fatalf("expected finishedAttention + NeedsAttention on background tab after turn settled (finished=%v)", bgTab.finishedAttention)
 	}
 
 	// Reset and test form.created
@@ -1156,8 +1170,8 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 		Type: "form.created",
 		Data: json.RawMessage(`{"form":{"id":"frm_99","sessionID":"ses_bg","title":"Questions","fields":[{"key":"q0","title":"Choice","description":"Pick one","type":"string","options":[{"value":"A","label":"A"}]}]}}`),
 	})
-	if !bgTab.NeedsAttention() {
-		t.Fatal("form.created should set NeedsAttention on background tab")
+	if !bgTab.NeedsAttention() || !bgTab.actionAttention {
+		t.Fatalf("form.created should set actionAttention + NeedsAttention on background tab (action=%v)", bgTab.actionAttention)
 	}
 	if len(bgTab.main.pendingForms) != 1 || bgTab.main.formWidgets["frm_99"] == nil {
 		t.Fatalf("expected pending form frm_99 to be added to bgTab, got %+v", bgTab.main.pendingForms)
@@ -1169,6 +1183,9 @@ func TestQuestionFormWidgetAndNeedsAttention(t *testing.T) {
 	})
 	if len(bgTab.main.pendingForms) != 0 || bgTab.main.formWidgets["frm_99"] != nil {
 		t.Fatalf("expected pending form frm_99 to be removed after form.replied, got %+v", bgTab.main.pendingForms)
+	}
+	if bgTab.actionAttention || bgTab.NeedsAttention() {
+		t.Fatalf("expected actionAttention cleared after form.replied, got action=%v needs=%v", bgTab.actionAttention, bgTab.NeedsAttention())
 	}
 }
 
@@ -1785,13 +1802,26 @@ func TestSubagentSpawnBottomBarAndSheet(t *testing.T) {
 		}
 	}
 
-	// Attention needed (pink dot) on background tab ses_older_20m -> bumps it to the top of tabOrder.
+	// Mid-turn text delta must NOT bump ses_older_20m; settling after completion DOES bump it to the top of tabOrder.
+	win.completionSettleDelay = 20 * time.Millisecond
 	win.handleEvent(opencode.Event{
 		Type: "session.text.delta",
 		Data: json.RawMessage(`{"sessionID":"ses_older_20m","assistantMessageID":"msg_a1","delta":"Here is the answer."}`),
 	})
+	if !slices.Equal(win.tabOrder, []string{"ses_root", "ses_older_13m", "ses_older_20m"}) {
+		t.Fatalf("tabOrder after mid-turn text delta on ses_older_20m = %v, want unchanged [ses_root ses_older_13m ses_older_20m]", win.tabOrder)
+	}
+	win.handleEvent(opencode.Event{
+		Type: "session.execution.succeeded",
+		Data: json.RawMessage(`{"sessionID":"ses_older_20m"}`),
+	})
+	bumpDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(bumpDeadline) && !win.tabs["ses_older_20m"].finishedAttention {
+		glib.MainContextDefault().Iteration(false)
+		time.Sleep(5 * time.Millisecond)
+	}
 	if !slices.Equal(win.tabOrder, []string{"ses_older_20m", "ses_root", "ses_older_13m"}) {
-		t.Fatalf("tabOrder after text delta (attention needed) on ses_older_20m = %v, want [ses_older_20m ses_root ses_older_13m]", win.tabOrder)
+		t.Fatalf("tabOrder after completion settle on ses_older_20m = %v, want [ses_older_20m ses_root ses_older_13m]", win.tabOrder)
 	}
 
 	// User sends a message into ses_older_13m -> bumps ses_older_13m to the top of tabOrder.
@@ -2038,14 +2068,18 @@ func TestReorderPendingPrompts(t *testing.T) {
 	conv.thinkingLabel.SetVisible(false)
 	win.tabs["ses_q"] = &sessionTab{main: conv}
 
-	// Verify sidebar indicator spinner shows when background subshells or subagents are running,
-	// without showing Thinking... in the main conversation when the main agent is idle.
+	// Verify sidebar indicator spinner shows for running subagents, while background shells show
+	// a static shellIcon without spinner or Thinking... in the main conversation.
 	ind := &switcherIndicator{
-		box:     gtk.NewBox(gtk.OrientationHorizontal, 0),
-		spinner: adw.NewSpinner(),
-		label:   gtk.NewLabel(""),
+		box:          gtk.NewBox(gtk.OrientationHorizontal, 0),
+		spinner:      adw.NewSpinner(),
+		questionIcon: gtk.NewImageFromIconName("dialog-question-symbolic"),
+		shellIcon:    gtk.NewImageFromIconName("terminal-symbolic"),
+		label:        gtk.NewLabel(""),
 	}
 	ind.spinner.SetVisible(false)
+	ind.questionIcon.SetVisible(false)
+	ind.shellIcon.SetVisible(false)
 	win.tabs["ses_q"].sidebarIndicator = ind
 	win.activeShells = make(map[string]opencode.ShellItem)
 	win.childToRoot = make(map[string]string)
@@ -2072,16 +2106,19 @@ func TestReorderPendingPrompts(t *testing.T) {
 		Status:    "running",
 	}
 	win.updateShellStatus()
-	if !ind.spinner.Visible() {
-		t.Errorf("expected sidebar spinner visible while background shell is running")
+	if ind.spinner.Visible() {
+		t.Errorf("expected sidebar spinner hidden when only background shell is running")
+	}
+	if !ind.shellIcon.Visible() {
+		t.Errorf("expected sidebar shellIcon visible while background shell is running")
 	}
 	if conv.thinkingLabel.Visible() {
 		t.Errorf("expected main thinkingLabel hidden when only background shell is running")
 	}
 	delete(win.activeShells, "sh_bg_spin")
 	win.updateShellStatus()
-	if ind.spinner.Visible() {
-		t.Errorf("expected sidebar spinner hidden after background shell completes")
+	if ind.spinner.Visible() || ind.shellIcon.Visible() {
+		t.Errorf("expected sidebar spinner and shellIcon hidden after background shell completes (spinner=%v shellIcon=%v)", ind.spinner.Visible(), ind.shellIcon.Visible())
 	}
 
 	p1 := &pendingPrompt{inboxID: "inb_1", text: "first", delivery: opencode.DeliveryQueue}
@@ -2964,28 +3001,39 @@ func TestEmptyWindowGreeterSessionPersistenceAndOfflineScreen(t *testing.T) {
 		t.Fatalf("windowStack visible child after recovery = %q, want main", got)
 	}
 
-	// 4. Session search marks active sessions (direct busy, activeMap, running child subagent, or background shell).
+	// 4. Session search marks agent-active sessions (direct busy, activeMap, running child subagent),
+	// while background-shell-only and pending-input tabs do NOT show loading spinners.
 	win.activeShells = map[string]opencode.ShellItem{
 		"sh_bg_1": {ID: "sh_bg_1", SessionID: "ses_shell_active", Status: "running"},
 	}
+	win.tabs["ses_pending_input"] = &sessionTab{
+		main: &convTimeline{
+			session:      opencode.Session{ID: "ses_pending_input"},
+			active:       true,
+			pendingForms: []opencode.FormInfo{{ID: "frm_srch_1", SessionID: "ses_pending_input"}},
+		},
+	}
 	searchPool := []opencode.Session{
-		{ID: "ses_idle", Title: "Idle Session", Time: opencode.SessionTime{Updated: 4000}},
-		{ID: "ses_map_active", Title: "Active Map Session", Time: opencode.SessionTime{Updated: 3000}},
-		{ID: "ses_parent_active", Title: "Parent With Busy Child", Time: opencode.SessionTime{Updated: 2000}},
+		{ID: "ses_idle", Title: "Idle Session", Time: opencode.SessionTime{Updated: 5000}},
+		{ID: "ses_map_active", Title: "Active Map Session", Time: opencode.SessionTime{Updated: 4000}},
+		{ID: "ses_parent_active", Title: "Parent With Busy Child", Time: opencode.SessionTime{Updated: 3000}},
 		{ID: "ses_child_1", ParentID: "ses_parent_active", Time: opencode.SessionTime{Busy: 500, Idle: 100}},
-		{ID: "ses_shell_active", Title: "Shell Active Session", Time: opencode.SessionTime{Updated: 1000}},
+		{ID: "ses_shell_active", Title: "Shell Active Session", Time: opencode.SessionTime{Updated: 2000}},
+		{ID: "ses_pending_input", Title: "Pending Input Session", Time: opencode.SessionTime{Updated: 1000}},
 	}
 	matches := win.matchAndSortSessionsWithActive(searchPool, "", map[string]opencode.ActiveStatus{
-		"ses_map_active": {Type: "busy"},
+		"ses_map_active":    {Type: "busy"},
+		"ses_pending_input": {Type: "busy"},
 	})
-	if len(matches) != 4 {
-		t.Fatalf("len(matches) = %d, want 4 root sessions", len(matches))
+	if len(matches) != 5 {
+		t.Fatalf("len(matches) = %d, want 5 root sessions", len(matches))
 	}
 	wantActive := map[string]bool{
 		"ses_idle":          false,
 		"ses_map_active":    true,
 		"ses_parent_active": true,
-		"ses_shell_active":  true,
+		"ses_shell_active":  false,
+		"ses_pending_input": false,
 	}
 	for _, m := range matches {
 		if m.active != wantActive[m.sess.ID] {

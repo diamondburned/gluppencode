@@ -23,6 +23,7 @@ func main() {
 
 	a := app.New(context.Background(), appID, "Gluppencode")
 	a.SetResourceBasePath("/so/libdb/gluppencode")
+	window.RegisterAppActions(a)
 	a.ConnectActivate(func() {
 		ctx := a.Context()
 		client, err := opencode.Discover(ctx)

@@ -262,3 +262,9 @@ type RetryScheduledEvent struct {
 	Attempt            int    `json:"attempt,omitempty"`
 	At                 int64  `json:"at,omitempty"`
 }
+
+// SessionErrorEvent is emitted on "session.error".
+type SessionErrorEvent struct {
+	SessionID string `json:"sessionID,omitempty"`
+	Error     any    `json:"error,omitempty"`
+}

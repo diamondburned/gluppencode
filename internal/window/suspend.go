@@ -65,6 +65,26 @@ func tabHasPending(tab *sessionTab) bool {
 	return false
 }
 
+// tabHasPendingInput reports whether any timeline in the tab awaits user input
+// for a pending form (question) or permission request.
+func tabHasPendingInput(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	pending := func(c *convTimeline) bool {
+		return c != nil && (len(c.pendingForms) > 0 || len(c.pendingPermissions) > 0)
+	}
+	if pending(tab.main) {
+		return true
+	}
+	for _, sub := range tab.subTimelines {
+		if pending(sub) {
+			return true
+		}
+	}
+	return false
+}
+
 // isTabSuspended reports whether a tab is idle and unvisited long enough to be
 // skipped by background polling.
 func (w *Window) isTabSuspended(tab *sessionTab) bool {

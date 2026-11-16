@@ -523,6 +523,67 @@ func (c *Client) ActiveSessions(ctx context.Context) (map[string]ActiveStatus, e
 	return data, nil
 }
 
+// JobTime holds timestamps (in epoch milliseconds) for a background job.
+type JobTime struct {
+	Started   int64 `json:"started"`
+	Completed int64 `json:"completed,omitempty"`
+}
+
+// JobInfo describes an active or unconsumed background job from GET /api/experimental/job.
+type JobInfo struct {
+	ID             string  `json:"id"`
+	Kind           string  `json:"kind"` // "shell", "subagent", "image"
+	SessionID      string  `json:"sessionID"`
+	Status         string  `json:"status"` // "running", "completed", "error", "cancelled"
+	Title          string  `json:"title,omitempty"`
+	Time           JobTime `json:"time"`
+	ShellID        string  `json:"shellID,omitempty"`
+	Command        string  `json:"command,omitempty"`
+	ChildSessionID string  `json:"childSessionID,omitempty"`
+	Agent          string  `json:"agent,omitempty"`
+	Description    string  `json:"description,omitempty"`
+	Path           string  `json:"path,omitempty"`
+	Model          string  `json:"model,omitempty"`
+}
+
+// ListJobsOptions filters GET /api/experimental/job.
+type ListJobsOptions struct {
+	SessionID   string
+	Kind        string
+	Status      string
+	Descendants bool
+}
+
+// ListJobs fetches active and unconsumed background jobs from GET /api/experimental/job.
+func (c *Client) ListJobs(ctx context.Context, opts ListJobsOptions) ([]JobInfo, error) {
+	path := "/api/experimental/job"
+	v := url.Values{}
+	if opts.SessionID != "" {
+		v.Set("sessionID", opts.SessionID)
+	}
+	if opts.Kind != "" {
+		v.Set("kind", opts.Kind)
+	}
+	if opts.Status != "" {
+		v.Set("status", opts.Status)
+	}
+	if opts.Descendants {
+		v.Set("descendants", "true")
+	}
+	if encoded := v.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var raw json.RawMessage
+	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	var jobs []JobInfo
+	if err := decodeDataOrDirect(raw, &jobs); err != nil {
+		return nil, err
+	}
+	return jobs, nil
+}
+
 // Agent describes an OpenCode V2 agent.
 type Agent struct {
 	ID          string `json:"id"`
