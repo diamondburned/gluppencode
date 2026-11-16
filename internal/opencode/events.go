@@ -222,3 +222,8 @@ func (e PermissionRepliedEvent) EffectiveRequestID() string {
 	}
 	return e.ID
 }
+
+// McpChangedEvent is emitted on "mcp.status.changed" and "mcp.resources.changed".
+type McpChangedEvent struct {
+	Server string `json:"server"`
+}

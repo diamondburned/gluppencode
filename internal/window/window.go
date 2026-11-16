@@ -524,6 +524,8 @@ type Window struct {
 	branchStatusBox     *gtk.Box
 	branchStatusLabel   *gtk.Label
 	backgroundStatusBtn *gtk.Button
+	mcpStatusBox        *gtk.Box
+	mcpStatusLabel      *gtk.Label
 	shellStatusBox      *gtk.Box
 	shellStatusLabel    *gtk.Label
 	subagentStatusBox   *gtk.Box
@@ -531,12 +533,23 @@ type Window struct {
 	tokRateStatusLabel  *gtk.Label
 	contextStatusLabel  *gtk.Label
 
+	sheetToastOverlay     *adw.ToastOverlay
+	sheetNavView          *adw.NavigationView
+	sheetOverviewPage     *adw.NavigationPage
 	sheetEmptyLabel       *gtk.Label
 	shellsSectionBox      *gtk.Box
 	shellListBox          *gtk.ListBox
 	subagentsSectionBox   *gtk.Box
 	sheetBackToParentBtn  *gtk.Button
 	subagentListBox       *gtk.ListBox
+	mcpSectionBox         *gtk.Box
+	mcpDirLabel           *gtk.Label
+	mcpAllLogsBtn         *gtk.Button
+	mcpRefreshBtn         *gtk.Button
+	mcpErrBanner          *adw.Banner
+	mcpSearchEntry        *gtk.SearchEntry
+	mcpListStack          *gtk.Stack
+	mcpListBox            *gtk.ListBox
 	contextSectionBox     *gtk.Box
 	contextSessionIDBox   *gtk.Box
 	contextSessionIDLabel *gtk.Label
@@ -552,6 +565,14 @@ type Window struct {
 	shellOutputs      map[string]string
 	shellOutputLabels map[string]*gtk.Label
 	shellPollRunning  bool
+
+	mcpByDir         map[string][]opencode.McpServer
+	mcpLoadedDirs    map[string]bool
+	mcpFetchingDirs  map[string]bool
+	mcpInFlight      map[string]bool
+	defaultServerDir string
+	mcpLogDir        string
+	mcpMgr           *mcpManager
 
 	tabs        map[string]*sessionTab // keyed by root session ID
 	tabOrder    []string               // root session IDs in display order
@@ -596,6 +617,7 @@ type Window struct {
 	syncingSidebarSelect bool
 	fileOpener           func(string)
 	clipboardSetter      func(string)
+	uriLauncher          func(string) error
 
 	takeCharge         bool
 	takeChargeInFlight map[string]bool
@@ -701,18 +723,31 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		branchStatusBox:       builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
 		branchStatusLabel:     builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
 		backgroundStatusBtn:   builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
+		mcpStatusBox:          builder.GetObject("mcpStatusBox").Cast().(*gtk.Box),
+		mcpStatusLabel:        builder.GetObject("mcpStatusLabel").Cast().(*gtk.Label),
 		shellStatusBox:        builder.GetObject("shellStatusBox").Cast().(*gtk.Box),
 		shellStatusLabel:      builder.GetObject("shellStatusLabel").Cast().(*gtk.Label),
 		subagentStatusBox:     builder.GetObject("subagentStatusBox").Cast().(*gtk.Box),
 		subagentStatusLabel:   builder.GetObject("subagentStatusLabel").Cast().(*gtk.Label),
 		tokRateStatusLabel:    builder.GetObject("tokRateStatusLabel").Cast().(*gtk.Label),
 		contextStatusLabel:    builder.GetObject("contextStatusLabel").Cast().(*gtk.Label),
+		sheetToastOverlay:     builder.GetObject("sheetToastOverlay").Cast().(*adw.ToastOverlay),
+		sheetNavView:          builder.GetObject("sheetNavView").Cast().(*adw.NavigationView),
+		sheetOverviewPage:     builder.GetObject("sheetOverviewPage").Cast().(*adw.NavigationPage),
 		sheetEmptyLabel:       builder.GetObject("sheetEmptyLabel").Cast().(*gtk.Label),
 		shellsSectionBox:      builder.GetObject("shellsSectionBox").Cast().(*gtk.Box),
 		shellListBox:          builder.GetObject("shellListBox").Cast().(*gtk.ListBox),
 		subagentsSectionBox:   builder.GetObject("subagentsSectionBox").Cast().(*gtk.Box),
 		sheetBackToParentBtn:  builder.GetObject("sheetBackToParentBtn").Cast().(*gtk.Button),
 		subagentListBox:       builder.GetObject("subagentListBox").Cast().(*gtk.ListBox),
+		mcpSectionBox:         builder.GetObject("mcpSectionBox").Cast().(*gtk.Box),
+		mcpDirLabel:           builder.GetObject("mcpDirLabel").Cast().(*gtk.Label),
+		mcpAllLogsBtn:         builder.GetObject("mcpAllLogsBtn").Cast().(*gtk.Button),
+		mcpRefreshBtn:         builder.GetObject("mcpRefreshBtn").Cast().(*gtk.Button),
+		mcpErrBanner:          builder.GetObject("mcpErrBanner").Cast().(*adw.Banner),
+		mcpSearchEntry:        builder.GetObject("mcpSearchEntry").Cast().(*gtk.SearchEntry),
+		mcpListStack:          builder.GetObject("mcpListStack").Cast().(*gtk.Stack),
+		mcpListBox:            builder.GetObject("mcpListBox").Cast().(*gtk.ListBox),
 		contextSectionBox:     builder.GetObject("contextSectionBox").Cast().(*gtk.Box),
 		contextSessionIDBox:   builder.GetObject("contextSessionIDBox").Cast().(*gtk.Box),
 		contextSessionIDLabel: builder.GetObject("contextSessionIDLabel").Cast().(*gtk.Label),
@@ -736,6 +771,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		activeShells:          make(map[string]opencode.ShellItem),
 		shellOutputs:          make(map[string]string),
 		shellOutputLabels:     make(map[string]*gtk.Label),
+		mcpByDir:              make(map[string][]opencode.McpServer),
+		mcpLoadedDirs:         make(map[string]bool),
+		mcpFetchingDirs:       make(map[string]bool),
+		mcpInFlight:           make(map[string]bool),
 		closeBtnSessID:        make(map[uintptr]string),
 		hoveredRow:            make(map[uintptr]bool),
 		rowProjectDir:         make(map[uintptr]string),
@@ -781,6 +820,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.applyAllPreferences()
 	adw.StyleManagerGetDefault().NotifyProperty("dark", func() {
 		w.applySyntaxTheme()
+		if w.mcpMgr != nil {
+			w.mcpMgr.applyLogTheme()
+		}
 	})
 
 	w.inputBuffer.ConnectChanged(func() {
@@ -816,11 +858,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	statusBarBox := builder.GetObject("statusBarBox").Cast().(*gtk.Box)
 	statusClick := gtk.NewGestureClick()
 	statusClick.ConnectReleased(func(_ int, _, _ float64) {
-		w.rebuildShellList()
-		w.ensureShellOutputPoller()
-		w.bottomSheet.SetOpen(true)
+		w.openBottomSheet(false, "")
 	})
 	statusBarBox.AddController(statusClick)
+	w.initMcpSheet()
 
 	w.backgroundStatusBtn.ConnectClicked(func() {
 		w.backgroundCurrentSession()
@@ -868,6 +909,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	adwWin.AddBreakpoint(bp)
 
 	adwWin.ConnectCloseRequest(func() bool {
+		if w.mcpMgr != nil {
+			w.mcpMgr.closeAuthDialog()
+			w.mcpMgr.stopLogPoller()
+		}
 		cancel()
 		for _, tab := range w.tabs {
 			tab.main.closeStreams()
@@ -915,6 +960,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 			if w.backgroundCurrentSession() {
 				return true
 			}
+		}
+		if keyval == gdk.KEY_Escape && w.bottomSheet != nil && w.bottomSheet.Open() {
+			return w.handleBottomSheetEscape()
 		}
 		return false
 	})
@@ -2942,6 +2990,13 @@ func (w *Window) setupAppMenuButton(menuBtn *gtk.MenuButton) {
 	})
 	menuBox.Append(prefsBtn)
 
+	mcpBtn, _ := newProjectHeaderMenuButton("bolt-symbolic", "MCP Servers…")
+	mcpBtn.ConnectClicked(func() {
+		popover.Popdown()
+		w.openMcpSheet("")
+	})
+	menuBox.Append(mcpBtn)
+
 	aboutBtn, _ := newProjectHeaderMenuButton("help-about-symbolic", "About Gluppencode")
 	aboutBtn.ConnectClicked(func() {
 		popover.Popdown()
@@ -3016,6 +3071,32 @@ func (w *Window) copyTextToClipboard(text string) {
 	if d := gdk.DisplayGetDefault(); d != nil {
 		d.Clipboard().SetText(text)
 	}
+}
+
+func (w *Window) launchExternalURI(rawURI string, onError func(error)) {
+	cleanURI, err := opencode.ValidateExternalAuthURL(rawURI)
+	if err != nil {
+		if onError != nil {
+			onError(err)
+		}
+		return
+	}
+	if w.uriLauncher != nil {
+		if err := w.uriLauncher(cleanURI); err != nil && onError != nil {
+			onError(err)
+		}
+		return
+	}
+	var parent *gtk.Window
+	if w.ApplicationWindow != nil {
+		parent = &w.Window
+	}
+	launcher := gtk.NewURILauncher(cleanURI)
+	launcher.Launch(w.ctx, parent, func(res gio.AsyncResulter) {
+		if err := launcher.LaunchFinish(res); err != nil && onError != nil {
+			onError(err)
+		}
+	})
 }
 
 func (w *Window) newProjectHeaderBox(rawDir string, includeSeparator bool) *gtk.Box {
@@ -4142,6 +4223,9 @@ func (w *Window) updateSwitcherIndicators() {
 }
 
 func (w *Window) loadAll() {
+	if len(w.mcpLoadedDirs) > 0 {
+		clear(w.mcpLoadedDirs)
+	}
 	// 1. Fetch sessions & active sessions immediately in parallel
 	gtkutil.Async(w.ctx, func() func() {
 		var (
@@ -5685,6 +5769,12 @@ func (w *Window) onStreamDelta(tab *sessionTab, conv *convTimeline, deltaLen int
 }
 
 func (w *Window) updateBottomBar(tab *sessionTab) {
+	w.ensureMcpStatusLoaded(w.activeDirectory())
+	w.refreshMcpStatusChip()
+	if w.mcpMgr != nil && w.isBottomSheetOpen() {
+		w.mcpMgr.syncDirectory(w.activeDirectory())
+	}
+
 	if tab == nil {
 		if w.backgroundStatusBtn != nil {
 			w.backgroundStatusBtn.SetVisible(false)
@@ -6359,6 +6449,7 @@ func (w *Window) updateSheetEmptyState() {
 	}
 	hasContent := (w.shellsSectionBox != nil && w.shellsSectionBox.Visible()) ||
 		(w.subagentsSectionBox != nil && w.subagentsSectionBox.Visible()) ||
+		(w.mcpSectionBox != nil && w.mcpSectionBox.Visible()) ||
 		(w.contextSectionBox != nil && w.contextSectionBox.Visible())
 	w.sheetEmptyLabel.SetVisible(!hasContent)
 }
@@ -7182,6 +7273,17 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 					w.changeSessionDirectory(nil, nil, cmdArgs)
 					return
 				}
+				if strings.EqualFold(parts[0], "mcp") || strings.EqualFold(parts[0], "mcps") {
+					var cmdArgs string
+					if len(parts) > 1 {
+						cmdArgs = strings.TrimSpace(parts[1])
+					}
+					w.recordInputHistory(text)
+					w.saveState()
+					w.inputBuffer.SetText("")
+					w.openMcpSheet(cmdArgs)
+					return
+				}
 			}
 			if text != "" || len(w.pendingFiles) > 0 {
 				w.createNewSessionInDirAndThen("", func() {
@@ -7221,7 +7323,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			cmdArgs = strings.TrimSpace(parts[1])
 		}
 		switch cmdName {
-		case "undo", "redo", "new", "cd", "compact":
+		case "undo", "redo", "new", "cd", "compact", "mcp", "mcps":
 			isSlashCmd = true
 		default:
 			for _, c := range w.commands {
@@ -7269,6 +7371,13 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 				w.rebuildAttachmentTray()
 			}
 			w.compactCurrentSession(tab, conv)
+			return
+		case "mcp", "mcps":
+			if len(files) > 0 {
+				w.pendingFiles = files
+				w.rebuildAttachmentTray()
+			}
+			w.openMcpSheet(cmdArgs)
 			return
 		default:
 			sessionID := conv.session.ID
@@ -8975,6 +9084,13 @@ func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgI
 }
 
 func (w *Window) resyncOnReconnect() {
+	w.ensureMcpMaps()
+	clear(w.mcpLoadedDirs)
+	clear(w.mcpFetchingDirs)
+	w.ensureMcpStatusLoaded(w.activeDirectory())
+	if mgr := w.mcpMgr; mgr != nil && w.isBottomSheetOpen() {
+		mgr.refreshAll()
+	}
 	for _, tab := range w.tabs {
 		if w.isTabSuspended(tab) {
 			continue
@@ -10038,6 +10154,31 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			if reqID := d.EffectiveRequestID(); reqID != "" {
 				w.removePendingPermission(d.SessionID, reqID)
 			}
+		}
+
+	case "mcp.status.changed":
+		evDir := normalizeProjectDir(ev.Location.Directory)
+		sheetOpen := w.isBottomSheetOpen()
+		mgrMatches := w.mcpMgr != nil && sheetOpen && (evDir == "" || normalizeProjectDir(w.mcpMgr.dir) == evDir)
+		if evDir == "" || evDir == w.effectiveMcpDirKey() || mgrMatches {
+			includeMeta := mgrMatches
+			targetDir := ev.Location.Directory
+			if targetDir == "" {
+				if w.mcpMgr != nil && sheetOpen && w.mcpMgr.dir != "" {
+					targetDir = w.mcpMgr.dir
+				} else {
+					targetDir = w.activeDirectory()
+				}
+			}
+			w.refreshMcpForDir(targetDir, includeMeta)
+		} else if evDir != "" {
+			delete(w.mcpLoadedDirs, evDir)
+		}
+
+	case "mcp.resources.changed":
+		evDir := normalizeProjectDir(ev.Location.Directory)
+		if w.mcpMgr != nil && w.isBottomSheetOpen() && (evDir == "" || normalizeProjectDir(w.mcpMgr.dir) == evDir) {
+			w.mcpMgr.refreshResources()
 		}
 	}
 }

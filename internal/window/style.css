@@ -705,6 +705,88 @@ button.glup-status-background:hover {
 	background-color: alpha(@warning_bg_color, 0.28);
 }
 
+.glup-status-mcp {
+	font-weight: 600;
+	background-color: alpha(@theme_fg_color, 0.07);
+	border: 1px solid alpha(@borders, 0.45);
+}
+
+.glup-status-mcp.glup-status-mcp-ok {
+	background-color: alpha(@success_color, 0.14);
+	color: @success_color;
+	border: 1px solid alpha(@success_color, 0.35);
+}
+
+.glup-status-mcp.glup-status-mcp-warn {
+	background-color: alpha(@warning_bg_color, 0.18);
+	color: @warning_color;
+	border: 1px solid alpha(@warning_color, 0.4);
+}
+
+.glup-status-mcp.glup-status-mcp-err {
+	background-color: alpha(@error_bg_color, 0.18);
+	color: @error_color;
+	border: 1px solid alpha(@error_color, 0.4);
+}
+
+.glup-status-mcp.glup-status-mcp-dim {
+	background-color: alpha(@theme_fg_color, 0.05);
+	border: 1px solid alpha(@borders, 0.35);
+	opacity: 0.72;
+}
+
+headerbar.glup-sheet-detail-header {
+	padding-top: 16px;
+}
+
+.glup-mcp-dot {
+	min-width: 10px;
+	min-height: 10px;
+	border-radius: 999px;
+	background-color: alpha(@theme_fg_color, 0.35);
+}
+
+/* Wrap Libadwaita oklab() semantic colors in alpha(..., 0.995) so GTK converts
+   them to sRGB before emitting GskColorNode (fixes Broadway rendering them red). */
+.glup-mcp-dot-ok {
+	background-color: alpha(@success_color, 0.995);
+}
+
+.glup-mcp-dot-warn {
+	background-color: alpha(@warning_color, 0.995);
+}
+
+.glup-mcp-dot-err {
+	background-color: alpha(@error_color, 0.995);
+}
+
+.glup-mcp-dot-dim {
+	background-color: alpha(@theme_fg_color, 0.32);
+}
+
+.glup-mcp-live-badge {
+	font-size: 0.78em;
+	font-weight: 600;
+	padding: 2px 8px;
+	border-radius: 999px;
+	background-color: alpha(@success_color, 0.15);
+	color: @success_color;
+}
+
+.glup-mcp-log-frame {
+	background-color: alpha(@theme_fg_color, 0.03);
+	border: 1px solid alpha(@borders, 0.45);
+	border-radius: 8px;
+}
+
+.glup-mcp-log-view,
+.glup-mcp-log-view text {
+	background: transparent;
+	background-color: transparent;
+	font-family: monospace;
+	font-size: 0.86em;
+}
+
 .glup-status-model {
 	background-color: alpha(@theme_fg_color, 0.07);
 	border: 1px solid alpha(@borders, 0.45);

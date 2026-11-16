@@ -235,6 +235,7 @@ var builtinSlashCommands = []struct {
 	{"/new", "Create a new session", "document-new-symbolic"},
 	{"/cd", "Change session working directory", "folder-visiting-symbolic"},
 	{"/compact", "Compact session history", "compress-symbolic"},
+	{"/mcp", "Manage MCP servers & view logs", "bolt-symbolic"},
 }
 
 func (p *CompletionProvider) populate(compCtx *gtksource.CompletionContext) (*gio.ListModel, error) {

@@ -620,6 +620,32 @@
               </object>
             </child>
             <child>
+              <object class="GtkBox" id="mcpStatusBox">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">5</property>
+                <property name="valign">center</property>
+                <property name="visible">false</property>
+                <style>
+                  <class name="glup-status-chip"/>
+                  <class name="glup-status-mcp"/>
+                </style>
+                <child>
+                  <object class="GtkImage">
+                    <property name="icon-name">bolt-symbolic</property>
+                    <property name="pixel-size">14</property>
+                    <property name="valign">center</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="mcpStatusLabel">
+                    <property name="label">0 MCP</property>
+                    <property name="valign">center</property>
+                    <property name="ellipsize">end</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
               <object class="GtkBox" id="shellStatusBox">
                 <property name="orientation">horizontal</property>
                 <property name="spacing">5</property>
@@ -698,178 +724,350 @@
         </property>
 
         <property name="sheet">
-          <object class="GtkScrolledWindow">
-            <property name="hscrollbar-policy">never</property>
-            <property name="vscrollbar-policy">automatic</property>
-            <property name="propagate-natural-height">true</property>
-            <property name="max-content-height">580</property>
+          <object class="AdwToastOverlay" id="sheetToastOverlay">
             <property name="child">
-              <object class="AdwClamp">
-                <property name="maximum-size">680</property>
-                <property name="child">
-                  <object class="GtkBox" id="sheetContentBox">
-                    <property name="orientation">vertical</property>
-                    <property name="spacing">14</property>
-                    <style>
-                      <class name="glup-sheet-content"/>
-                    </style>
-                    <child>
-                      <object class="GtkLabel" id="sheetEmptyLabel">
-                        <property name="label">No active background shells or subagents</property>
-                        <property name="wrap">true</property>
-                        <property name="justify">center</property>
-                        <property name="halign">center</property>
-                        <property name="valign">center</property>
-                        <property name="vexpand">true</property>
-                        <property name="margin-top">28</property>
-                        <property name="margin-bottom">28</property>
-                        <style>
-                          <class name="dim-label"/>
-                        </style>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkBox" id="shellsSectionBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">8</property>
-                        <property name="visible">false</property>
-                        <child>
-                          <object class="GtkLabel">
-                            <property name="label">Active Shells</property>
-                            <property name="xalign">0</property>
-                            <property name="hexpand">true</property>
-                            <style>
-                              <class name="heading"/>
-                            </style>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkListBox" id="shellListBox">
-                            <property name="selection-mode">none</property>
-                            <style>
-                              <class name="boxed-list"/>
-                            </style>
-                          </object>
-                        </child>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkBox" id="subagentsSectionBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">8</property>
-                        <property name="visible">false</property>
-                        <child>
-                          <object class="GtkBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">8</property>
-                            <child>
-                              <object class="GtkLabel">
-                                <property name="label">Subagents</property>
-                                <property name="xalign">0</property>
-                                <property name="hexpand">true</property>
-                                <style>
-                                  <class name="heading"/>
-                                </style>
-                              </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="sheetBackToParentBtn">
-                                <property name="label">Back to Main Conversation</property>
-                                <property name="visible">false</property>
-                              </object>
-                            </child>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkListBox" id="subagentListBox">
-                            <property name="selection-mode">none</property>
-                            <style>
-                              <class name="boxed-list"/>
-                            </style>
-                          </object>
-                        </child>
-                      </object>
-                    </child>
-                    <child>
-                      <object class="GtkBox" id="contextSectionBox">
-                        <property name="orientation">vertical</property>
-                        <property name="spacing">8</property>
-                        <property name="visible">false</property>
-                        <child>
-                          <object class="GtkLabel">
-                            <property name="label">Session &amp; Context</property>
-                            <property name="xalign">0</property>
-                            <property name="hexpand">true</property>
-                            <style>
-                              <class name="heading"/>
-                            </style>
-                          </object>
-                        </child>
-                        <child>
-                          <object class="GtkBox" id="contextSessionIDBox">
-                            <property name="orientation">horizontal</property>
-                            <property name="spacing">8</property>
-                            <property name="hexpand">true</property>
-                            <style>
-                              <class name="glup-context-grid"/>
-                            </style>
-                            <child>
-                              <object class="GtkBox">
+              <object class="AdwNavigationView" id="sheetNavView">
+                <property name="vhomogeneous">false</property>
+                <property name="hhomogeneous">false</property>
+                <child>
+                  <object class="AdwNavigationPage" id="sheetOverviewPage">
+                    <property name="title">Overview</property>
+                    <property name="tag">overview</property>
+                    <property name="child">
+                      <object class="GtkScrolledWindow">
+                        <property name="hscrollbar-policy">never</property>
+                        <property name="vscrollbar-policy">automatic</property>
+                        <property name="propagate-natural-height">true</property>
+                        <property name="max-content-height">580</property>
+                        <property name="child">
+                          <object class="AdwClamp">
+                            <property name="maximum-size">680</property>
+                            <property name="child">
+                              <object class="GtkBox" id="sheetContentBox">
                                 <property name="orientation">vertical</property>
-                                <property name="spacing">2</property>
-                                <property name="hexpand">true</property>
-                                <property name="valign">center</property>
+                                <property name="spacing">14</property>
                                 <style>
-                                  <class name="glup-context-cell"/>
+                                  <class name="glup-sheet-content"/>
                                 </style>
                                 <child>
-                                  <object class="GtkLabel">
-                                    <property name="label">Conversation ID</property>
-                                    <property name="xalign">0</property>
+                                  <object class="GtkLabel" id="sheetEmptyLabel">
+                                    <property name="label">No active shells, subagents, or MCP servers</property>
+                                    <property name="wrap">true</property>
+                                    <property name="justify">center</property>
+                                    <property name="halign">center</property>
+                                    <property name="valign">center</property>
+                                    <property name="vexpand">true</property>
+                                    <property name="margin-top">28</property>
+                                    <property name="margin-bottom">28</property>
                                     <style>
-                                      <class name="glup-context-cell-label"/>
+                                      <class name="dim-label"/>
                                     </style>
                                   </object>
                                 </child>
                                 <child>
-                                  <object class="GtkLabel" id="contextSessionIDLabel">
-                                    <property name="xalign">0</property>
-                                    <property name="selectable">true</property>
-                                    <property name="ellipsize">middle</property>
-                                    <style>
-                                      <class name="glup-context-cell-value"/>
-                                    </style>
+                                  <object class="GtkBox" id="shellsSectionBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <property name="visible">false</property>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label">Active Shells</property>
+                                        <property name="xalign">0</property>
+                                        <property name="hexpand">true</property>
+                                        <style>
+                                          <class name="heading"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkListBox" id="shellListBox">
+                                        <property name="selection-mode">none</property>
+                                        <style>
+                                          <class name="boxed-list"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkBox" id="subagentsSectionBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <property name="visible">false</property>
+                                    <child>
+                                      <object class="GtkBox">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">8</property>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label">Subagents</property>
+                                            <property name="xalign">0</property>
+                                            <property name="hexpand">true</property>
+                                            <style>
+                                              <class name="heading"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="sheetBackToParentBtn">
+                                            <property name="label">Back to Main Conversation</property>
+                                            <property name="visible">false</property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkListBox" id="subagentListBox">
+                                        <property name="selection-mode">none</property>
+                                        <style>
+                                          <class name="boxed-list"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkBox" id="mcpSectionBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <property name="visible">false</property>
+                                    <child>
+                                      <object class="GtkBox">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">8</property>
+                                        <child>
+                                          <object class="GtkLabel">
+                                            <property name="label">MCP Servers</property>
+                                            <property name="xalign">0</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="heading"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkLabel" id="mcpDirLabel">
+                                            <property name="xalign">0</property>
+                                            <property name="hexpand">true</property>
+                                            <property name="ellipsize">start</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="caption"/>
+                                              <class name="dim-label"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="mcpAllLogsBtn">
+                                            <property name="tooltip-text">View All MCP Logs</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="flat"/>
+                                            </style>
+                                            <child>
+                                              <object class="GtkBox">
+                                                <property name="orientation">horizontal</property>
+                                                <property name="spacing">5</property>
+                                                <child>
+                                                  <object class="GtkImage">
+                                                    <property name="icon-name">summarize-symbolic</property>
+                                                    <property name="pixel-size">14</property>
+                                                  </object>
+                                                </child>
+                                                <child>
+                                                  <object class="GtkLabel">
+                                                    <property name="label">Logs</property>
+                                                  </object>
+                                                </child>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="mcpRefreshBtn">
+                                            <property name="icon-name">refresh-symbolic</property>
+                                            <property name="tooltip-text">Refresh MCP Status</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="flat"/>
+                                              <class name="circular"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="AdwBanner" id="mcpErrBanner">
+                                        <property name="use-markup">false</property>
+                                        <property name="button-label">Retry</property>
+                                        <property name="revealed">false</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkSearchEntry" id="mcpSearchEntry">
+                                        <property name="placeholder-text">Filter MCP servers…</property>
+                                        <property name="visible">false</property>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkStack" id="mcpListStack">
+                                        <property name="vhomogeneous">false</property>
+                                        <property name="hhomogeneous">false</property>
+                                        <child>
+                                          <object class="GtkStackPage">
+                                            <property name="name">list</property>
+                                            <property name="child">
+                                              <object class="GtkListBox" id="mcpListBox">
+                                                <property name="selection-mode">none</property>
+                                                <property name="valign">start</property>
+                                                <style>
+                                                  <class name="boxed-list"/>
+                                                </style>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkStackPage">
+                                            <property name="name">empty</property>
+                                            <property name="child">
+                                              <object class="AdwStatusPage">
+                                                <property name="icon-name">bolt-symbolic</property>
+                                                <property name="title">No MCP Servers Configured</property>
+                                                <property name="description">Add servers under "mcp.servers" in opencode.json to manage them here.</property>
+                                                <style>
+                                                  <class name="compact"/>
+                                                </style>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkStackPage">
+                                            <property name="name">filtered-empty</property>
+                                            <property name="child">
+                                              <object class="AdwStatusPage">
+                                                <property name="icon-name">system-search-symbolic</property>
+                                                <property name="title">No Matching Servers</property>
+                                                <property name="description">Try a different search query.</property>
+                                                <style>
+                                                  <class name="compact"/>
+                                                </style>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkStackPage">
+                                            <property name="name">loading</property>
+                                            <property name="child">
+                                              <object class="GtkBox">
+                                                <property name="orientation">vertical</property>
+                                                <property name="spacing">8</property>
+                                                <property name="halign">center</property>
+                                                <property name="valign">center</property>
+                                                <property name="margin-top">18</property>
+                                                <property name="margin-bottom">18</property>
+                                                <child>
+                                                  <object class="AdwSpinner">
+                                                    <property name="width-request">28</property>
+                                                    <property name="height-request">28</property>
+                                                  </object>
+                                                </child>
+                                              </object>
+                                            </property>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                  </object>
+                                </child>
+                                <child>
+                                  <object class="GtkBox" id="contextSectionBox">
+                                    <property name="orientation">vertical</property>
+                                    <property name="spacing">8</property>
+                                    <property name="visible">false</property>
+                                    <child>
+                                      <object class="GtkLabel">
+                                        <property name="label">Session &amp; Context</property>
+                                        <property name="xalign">0</property>
+                                        <property name="hexpand">true</property>
+                                        <style>
+                                          <class name="heading"/>
+                                        </style>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkBox" id="contextSessionIDBox">
+                                        <property name="orientation">horizontal</property>
+                                        <property name="spacing">8</property>
+                                        <property name="hexpand">true</property>
+                                        <style>
+                                          <class name="glup-context-grid"/>
+                                        </style>
+                                        <child>
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">2</property>
+                                            <property name="hexpand">true</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="glup-context-cell"/>
+                                            </style>
+                                            <child>
+                                              <object class="GtkLabel">
+                                                <property name="label">Conversation ID</property>
+                                                <property name="xalign">0</property>
+                                                <style>
+                                                  <class name="glup-context-cell-label"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                            <child>
+                                              <object class="GtkLabel" id="contextSessionIDLabel">
+                                                <property name="xalign">0</property>
+                                                <property name="selectable">true</property>
+                                                <property name="ellipsize">middle</property>
+                                                <style>
+                                                  <class name="glup-context-cell-value"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </child>
+                                        <child>
+                                          <object class="GtkButton" id="copySessionIDBtn">
+                                            <property name="icon-name">edit-copy-symbolic</property>
+                                            <property name="tooltip-text">Copy Conversation ID</property>
+                                            <property name="valign">center</property>
+                                            <style>
+                                              <class name="flat"/>
+                                            </style>
+                                          </object>
+                                        </child>
+                                      </object>
+                                    </child>
+                                    <child>
+                                      <object class="GtkGrid" id="contextInfoGrid">
+                                        <property name="column-spacing">16</property>
+                                        <property name="row-spacing">12</property>
+                                        <property name="column-homogeneous">true</property>
+                                        <property name="hexpand">true</property>
+                                        <style>
+                                          <class name="glup-context-grid"/>
+                                        </style>
+                                      </object>
+                                    </child>
                                   </object>
                                 </child>
                               </object>
-                            </child>
-                            <child>
-                              <object class="GtkButton" id="copySessionIDBtn">
-                                <property name="icon-name">edit-copy-symbolic</property>
-                                <property name="tooltip-text">Copy Conversation ID</property>
-                                <property name="valign">center</property>
-                                <style>
-                                  <class name="flat"/>
-                                </style>
-                              </object>
-                            </child>
+                            </property>
                           </object>
-                        </child>
-                        <child>
-                          <object class="GtkGrid" id="contextInfoGrid">
-                            <property name="column-spacing">16</property>
-                            <property name="row-spacing">12</property>
-                            <property name="column-homogeneous">true</property>
-                            <property name="hexpand">true</property>
-                            <style>
-                              <class name="glup-context-grid"/>
-                            </style>
-                          </object>
-                        </child>
+                        </property>
                       </object>
-                    </child>
+                    </property>
                   </object>
-                </property>
+                </child>
               </object>
             </property>
           </object>
