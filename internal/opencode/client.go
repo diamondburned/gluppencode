@@ -952,6 +952,12 @@ type ContentPart struct {
 	State ToolState `json:"state,omitempty"`
 }
 
+// MessageRetry describes scheduled retry metadata on an in-progress assistant message.
+type MessageRetry struct {
+	Attempt int   `json:"attempt"`
+	At      int64 `json:"at,omitempty"`
+}
+
 // Message represents a timeline entry in a session.
 type Message struct {
 	ID            string           `json:"id"`
@@ -973,6 +979,7 @@ type Message struct {
 	Content       []ContentPart    `json:"content,omitempty"`
 	Cost          float64          `json:"cost,omitempty"`
 	Tokens        TokenUsage       `json:"tokens,omitempty"`
+	Retry         *MessageRetry    `json:"retry,omitempty"`
 	Time          struct {
 		Created   int64 `json:"created"`
 		Streamed  int64 `json:"streamed,omitempty"`

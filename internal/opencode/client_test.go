@@ -2424,3 +2424,62 @@ func TestPermissionEndpointsAndEvents(t *testing.T) {
 		t.Errorf("unexpected PermissionRepliedEvent: %+v", repliedEv)
 	}
 }
+
+func TestActivityStatusEventDecoding(t *testing.T) {
+	t.Parallel()
+
+	tests := map[string]func(t *testing.T){
+		"TextStartedEvent": func(t *testing.T) {
+			var ev TextStartedEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","assistantMessageID":"msg_1","ordinal":2}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.AssistantMessageID != "msg_1" || ev.Ordinal != 2 {
+				t.Errorf("unexpected TextStartedEvent: %+v", ev)
+			}
+		},
+		"StepFailedEvent": func(t *testing.T) {
+			var ev StepFailedEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","assistantMessageID":"msg_1"}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.AssistantMessageID != "msg_1" {
+				t.Errorf("unexpected StepFailedEvent: %+v", ev)
+			}
+		},
+		"SessionStatusEvent": func(t *testing.T) {
+			var ev SessionStatusEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","status":{"type":"retry","attempt":2,"message":"rate limited","next":1700000005000}}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.Status.Type != "retry" || ev.Status.Attempt != 2 || ev.Status.Message != "rate limited" || ev.Status.Next != 1700000005000 {
+				t.Errorf("unexpected SessionStatusEvent: %+v", ev)
+			}
+		},
+		"RetryScheduledEvent": func(t *testing.T) {
+			var ev RetryScheduledEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","assistantMessageID":"msg_1","attempt":3,"at":1700000009000}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.AssistantMessageID != "msg_1" || ev.Attempt != 3 || ev.At != 1700000009000 {
+				t.Errorf("unexpected RetryScheduledEvent: %+v", ev)
+			}
+		},
+		"MessageRetry": func(t *testing.T) {
+			var msg Message
+			if err := json.Unmarshal([]byte(`{"id":"msg_1","type":"assistant","retry":{"attempt":2,"at":1700000009000,"error":{"type":"rate_limit","message":"slow down"}},"time":{"created":100}}`), &msg); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if msg.Retry == nil || msg.Retry.Attempt != 2 || msg.Retry.At != 1700000009000 {
+				t.Errorf("unexpected Message.Retry: %+v", msg.Retry)
+			}
+		},
+	}
+
+	for name, fn := range tests {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fn(t)
+		})
+	}
+}

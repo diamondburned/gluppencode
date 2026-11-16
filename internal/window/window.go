@@ -60,6 +60,15 @@ func (p *pendingPrompt) dragKey() string {
 	return fmt.Sprintf("ptr:%p", p)
 }
 
+type activityPhase uint8
+
+const (
+	activityWaitingModel activityPhase = iota
+	activityThinking
+	activityResponding
+	activityRetrying
+)
+
 type convTimeline struct {
 	session            opencode.Session
 	scroll             *autoscroll.Window
@@ -88,7 +97,14 @@ type convTimeline struct {
 	loadingInitial     bool
 	loaded             bool
 	active             bool
+	activityGen        uint64
+	activityPhase      activityPhase
+	retryAttempt       int
+	compacting         bool
+	runningUserShell   bool
 	runningTools       int
+	executingTools     map[string]string
+	finishedTools      map[string]bool
 	blockingTools      map[string]time.Time
 	blockingShellTools map[string]bool
 	blockingShellIDs   map[string]string
@@ -184,6 +200,21 @@ func (c *convTimeline) syncToolPart(part opencode.ContentPart) {
 	shID, _ := part.State.Metadata["shellID"].(string)
 	metaStatus, _ := part.State.Metadata["status"].(string)
 
+	if part.State.Status == "running" && !c.finishedTools[part.ID] {
+		if c.executingTools == nil {
+			c.executingTools = make(map[string]string)
+		}
+		c.executingTools[part.ID] = name
+	} else {
+		delete(c.executingTools, part.ID)
+		if part.State.Status == "completed" || part.State.Status == "error" || part.State.Status == "failed" {
+			if c.finishedTools == nil {
+				c.finishedTools = make(map[string]bool)
+			}
+			c.finishedTools[part.ID] = true
+		}
+	}
+
 	if isBlockingBackgroundableTool(name, part.State.Status, part.State.Input) {
 		if c.blockingTools[part.ID].IsZero() {
 			c.blockingTools[part.ID] = time.Now()
@@ -207,6 +238,177 @@ func (c *convTimeline) syncToolPart(part opencode.ContentPart) {
 				c.backgroundShellIDs[shID] = true
 			}
 		}
+	}
+}
+
+func formatExecutingToolsLabel(tools map[string]string) string {
+	if len(tools) == 0 {
+		return ""
+	}
+	if len(tools) == 1 {
+		for _, name := range tools {
+			switch {
+			case isShellToolName(name):
+				return "Running command..."
+			case isSubagentTool(name):
+				return "Waiting on subagent..."
+			case strings.TrimSpace(name) == "":
+				return "Running tool..."
+			default:
+				return fmt.Sprintf("Running %s...", formatToolTitle(name))
+			}
+		}
+	}
+	allShell := true
+	allSubagent := true
+	for _, name := range tools {
+		if !isShellToolName(name) {
+			allShell = false
+		}
+		if !isSubagentTool(name) {
+			allSubagent = false
+		}
+	}
+	switch {
+	case allShell:
+		return "Running commands..."
+	case allSubagent:
+		return "Waiting on subagents..."
+	default:
+		return "Running tools..."
+	}
+}
+
+func (c *convTimeline) effectiveActivityText() string {
+	if c == nil {
+		return ""
+	}
+	if c.runningUserShell {
+		return "Running command..."
+	}
+	if len(c.executingTools) > 0 {
+		return formatExecutingToolsLabel(c.executingTools)
+	}
+	if c.compacting {
+		return "Compacting context..."
+	}
+	switch c.activityPhase {
+	case activityThinking:
+		return "Thinking..."
+	case activityResponding:
+		return "Responding..."
+	case activityRetrying:
+		if c.retryAttempt > 0 {
+			return fmt.Sprintf("Retrying (attempt %d)...", c.retryAttempt)
+		}
+		return "Retrying..."
+	default:
+		return "Waiting for model..."
+	}
+}
+
+func (c *convTimeline) syncActivityLabel() {
+	if c == nil || c.thinkingLabel == nil {
+		return
+	}
+	visible := (c.active || c.compacting || c.runningUserShell) && len(c.pendingForms) == 0 && len(c.pendingPermissions) == 0
+	if visible {
+		want := c.effectiveActivityText()
+		if c.thinkingLabel.Text() != want {
+			c.thinkingLabel.SetLabel(want)
+		}
+	}
+	if c.thinkingLabel.Visible() != visible {
+		c.thinkingLabel.SetVisible(visible)
+	}
+}
+
+func (c *convTimeline) setExecutingTool(id, name string) {
+	if c == nil || id == "" {
+		return
+	}
+	if c.executingTools == nil {
+		c.executingTools = make(map[string]string)
+	}
+	delete(c.finishedTools, id)
+	c.executingTools[id] = name
+	c.syncActivityLabel()
+}
+
+func (c *convTimeline) clearExecutingTool(id string) {
+	if c == nil || id == "" {
+		return
+	}
+	delete(c.executingTools, id)
+	if c.finishedTools == nil {
+		c.finishedTools = make(map[string]bool)
+	}
+	c.finishedTools[id] = true
+	if len(c.executingTools) == 0 && c.activityPhase != activityRetrying {
+		c.activityPhase = activityThinking
+	}
+	c.syncActivityLabel()
+}
+
+func (c *convTimeline) inferActivityStateFromMessages(msgs []opencode.Message) {
+	if c == nil {
+		return
+	}
+	c.compacting = false
+	c.retryAttempt = 0
+	if len(msgs) == 0 {
+		c.activityPhase = activityWaitingModel
+		return
+	}
+	last := msgs[len(msgs)-1]
+	switch last.Type {
+	case "idle":
+		c.activityPhase = activityWaitingModel
+		return
+	case "compaction":
+		switch last.Status {
+		case "running":
+			c.compacting = true
+			c.activityPhase = activityWaitingModel
+		case "failed":
+			c.activityPhase = activityWaitingModel
+		default:
+			c.activityPhase = activityThinking
+		}
+		return
+	case "assistant":
+		if last.Time.Completed != 0 {
+			c.activityPhase = activityThinking
+			return
+		}
+		if last.Retry != nil {
+			c.activityPhase = activityRetrying
+			c.retryAttempt = last.Retry.Attempt
+			return
+		}
+		if len(last.Content) == 0 {
+			c.activityPhase = activityThinking
+			return
+		}
+		lastPart := last.Content[len(last.Content)-1]
+		switch lastPart.Type {
+		case "reasoning":
+			c.activityPhase = activityThinking
+		case "text":
+			c.activityPhase = activityResponding
+		case "tool":
+			if lastPart.State.Status == "streaming" {
+				c.activityPhase = activityResponding
+			} else {
+				c.activityPhase = activityThinking
+			}
+		default:
+			c.activityPhase = activityThinking
+		}
+	default:
+		// User, synthetic, and notice entries already persisted in history mean
+		// inbox delivery has occurred and the runner is dispatching to the model.
+		c.activityPhase = activityThinking
 	}
 }
 
@@ -300,7 +502,7 @@ func (c *convTimeline) keepPendingAtBottom() {
 		}
 		c.timelineBox.Append(c.thinkingLabel)
 		c.thinkingAttached = true
-		c.thinkingLabel.SetVisible(c.active && len(c.pendingForms) == 0 && len(c.pendingPermissions) == 0)
+		c.syncActivityLabel()
 	}
 	for _, p := range c.pendingPrompts {
 		if p != nil && p.widget != nil && p.attached && p.delivery == opencode.DeliveryQueue {
@@ -2598,7 +2800,7 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 	scroll.AddCSSClass("glup-timeline-scroll")
 	scroll.SetChild(clamp)
 
-	thinkingLabel := gtk.NewLabel("Thinking...")
+	thinkingLabel := gtk.NewLabel("Waiting for model...")
 	thinkingLabel.SetXAlign(0)
 	thinkingLabel.SetHAlign(gtk.AlignStart)
 	thinkingLabel.AddCSSClass("dim-label")
@@ -2621,6 +2823,8 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 		permissionWidgets:  make(map[string]*PermissionPromptWidget),
 		ignoredCancelIDs:   make(map[string]bool),
 		seenMsgIDs:         make(map[string]bool),
+		executingTools:     make(map[string]string),
+		finishedTools:      make(map[string]bool),
 		blockingTools:      make(map[string]time.Time),
 		blockingShellTools: make(map[string]bool),
 		blockingShellIDs:   make(map[string]string),
@@ -5118,6 +5322,10 @@ func (w *Window) openSubagent(tab *sessionTab, subSess opencode.Session) {
 	} else {
 		subConv.session = subSess
 	}
+	if subSess.IsRunning() && !subConv.active {
+		subConv.active = true
+		subConv.syncActivityLabel()
+	}
 
 	tab.activeSubID = subSess.ID
 	tab.stack.SetVisibleChildName("sub_" + subSess.ID)
@@ -5283,6 +5491,7 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 		return
 	}
 	sessionID := conv.session.ID
+	startGen := conv.activityGen
 	gtkutil.Async(w.ctx, func() func() {
 		var (
 			page       *opencode.MessagePage
@@ -5363,6 +5572,10 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			conv.revertBanner = nil
 			prevBlocking := conv.blockingTools
 			conv.seenMsgIDs = make(map[string]bool)
+			conv.executingTools = make(map[string]string)
+			conv.finishedTools = make(map[string]bool)
+			conv.compacting = false
+			conv.runningUserShell = false
 			conv.blockingTools = make(map[string]time.Time)
 			conv.blockingShellTools = make(map[string]bool)
 			conv.blockingShellIDs = make(map[string]string)
@@ -5381,6 +5594,7 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 			conv.nextCursor = page.NextCursor
 			conv.hasOlder = page.NextCursor != ""
 
+			staleEpoch := conv.activityGen != startGen
 			var runningTools int
 			for _, msg := range page.Messages {
 				conv.seenMsgIDs[msg.ID] = true
@@ -5395,7 +5609,9 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 							if part.State.Status == "running" || part.State.Status == "streaming" {
 								runningTools++
 							}
-							conv.syncToolPart(part)
+							if !staleEpoch {
+								conv.syncToolPart(part)
+							}
 						}
 					}
 				} else if msg.Type == "synthetic" && isSubagentOrShellSynthetic(msg) {
@@ -5408,6 +5624,9 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				}
 			}
 			conv.runningTools = runningTools
+			if !staleEpoch {
+				conv.inferActivityStateFromMessages(page.Messages)
+			}
 
 			// Filter out any pendingPrompts that were already delivered in page.Messages
 			remainingPending := conv.pendingPrompts[:0]
@@ -5619,6 +5838,7 @@ func (w *Window) reconcileTail(sessionID string) {
 	if w.client == nil || conv == nil || !conv.loaded {
 		return
 	}
+	startGen := conv.activityGen
 	gtkutil.Async(w.ctx, func() func() {
 		var (
 			page  *opencode.MessagePage
@@ -5675,18 +5895,37 @@ func (w *Window) reconcileTail(sessionID string) {
 				return nil
 			}
 
+			staleEpoch := conv.activityGen != startGen
+			hadExecuting := len(conv.executingTools) > 0
 			for _, msg := range page.Messages {
 				if cw, ok := conv.compactionMap[msg.ID]; ok && msg.Type == "compaction" {
 					cw.Update(msg)
 				}
 				if msg.Type == "assistant" {
 					for _, part := range msg.Content {
-						if part.Type == "tool" && part.ID != "" {
+						if part.Type == "tool" && part.ID != "" && !staleEpoch {
 							conv.syncToolPart(part)
 						}
 					}
 				} else if msg.Type == "synthetic" && isSubagentOrShellSynthetic(msg) {
 					conv.markSyntheticTargetCompleted(msg)
+				}
+			}
+			if !staleEpoch {
+				wasCompacting := conv.compacting
+				var lastCompactionFailed bool
+				if len(page.Messages) > 0 {
+					if last := page.Messages[len(page.Messages)-1]; last.Type == "compaction" {
+						conv.compacting = last.Status == "running"
+						lastCompactionFailed = last.Status == "failed"
+					}
+				}
+				if ((hadExecuting && len(conv.executingTools) == 0) || (wasCompacting && !conv.compacting)) && conv.activityPhase != activityRetrying {
+					if lastCompactionFailed {
+						conv.activityPhase = activityWaitingModel
+					} else {
+						conv.activityPhase = activityThinking
+					}
 				}
 			}
 
@@ -8973,12 +9212,23 @@ func (w *Window) backgroundCurrentSession() bool {
 		return false
 	}
 	if _, conv := w.resolveConv(sessionID); conv != nil {
+		for id := range conv.blockingTools {
+			delete(conv.executingTools, id)
+			if conv.finishedTools == nil {
+				conv.finishedTools = make(map[string]bool)
+			}
+			conv.finishedTools[id] = true
+		}
+		if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+			conv.activityPhase = activityThinking
+		}
 		clear(conv.blockingTools)
 		clear(conv.blockingShellTools)
 		for shID := range conv.blockingShellIDs {
 			conv.backgroundShellIDs[shID] = true
 		}
 		clear(conv.blockingShellIDs)
+		conv.syncActivityLabel()
 	}
 	w.updateBottomBar(tab)
 	w.rebuildShellList()
@@ -9021,6 +9271,13 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		conv.active = active
 		if !active {
 			conv.runningTools = 0
+			conv.activityGen++
+			conv.activityPhase = activityWaitingModel
+			conv.retryAttempt = 0
+			conv.compacting = false
+			conv.runningUserShell = false
+			clear(conv.executingTools)
+			clear(conv.finishedTools)
 			clear(conv.blockingTools)
 			clear(conv.blockingShellTools)
 			clear(conv.blockingShellIDs)
@@ -9411,6 +9668,10 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			w.revealActiveSession(d.SessionID)
 			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
+			if conv != nil {
+				conv.activityPhase = activityWaitingModel
+				conv.retryAttempt = 0
+			}
 			w.setConvActive(d.SessionID, true)
 			w.setSubagentActive(d.SessionID, true, "")
 			w.reconcileTail(d.SessionID)
@@ -9437,17 +9698,29 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		}
 
 	case "session.status":
-		var d struct {
-			SessionID string `json:"sessionID"`
-			Status    struct {
-				Type string `json:"type"`
-			} `json:"status"`
-		}
+		var d opencode.SessionStatusEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			switch d.Status.Type {
-			case "busy", "retry":
+			case "busy":
 				w.updateSessionActivityState(d.SessionID, true)
 				w.revealActiveSession(d.SessionID)
+				if _, conv := w.resolveEventConv(d.SessionID); conv != nil && conv.activityPhase == activityRetrying {
+					conv.activityPhase = activityThinking
+					conv.retryAttempt = 0
+				}
+				w.setConvActive(d.SessionID, true)
+				w.setSubagentActive(d.SessionID, true, "")
+			case "retry":
+				w.updateSessionActivityState(d.SessionID, true)
+				w.revealActiveSession(d.SessionID)
+				if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+					if d.Status.Attempt > 0 {
+						conv.retryAttempt = d.Status.Attempt
+					} else if conv.activityPhase != activityRetrying {
+						conv.retryAttempt = 0
+					}
+					conv.activityPhase = activityRetrying
+				}
 				w.setConvActive(d.SessionID, true)
 				w.setSubagentActive(d.SessionID, true, "")
 			case "idle":
@@ -9457,6 +9730,25 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
 					w.loadChildSubagents(rootID)
 				}
+			}
+		}
+
+	case "session.retry.scheduled":
+		var d opencode.RetryScheduledEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				conv.activityPhase = activityRetrying
+				conv.retryAttempt = d.Attempt
+				conv.syncActivityLabel()
+			}
+		}
+
+	case "session.shell.started", "session.shell.ended":
+		var d opencode.SessionIDEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				conv.runningUserShell = ev.Type == "session.shell.started"
+				conv.syncActivityLabel()
 			}
 		}
 
@@ -9511,6 +9803,15 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			}
 		}
 
+	case "session.compaction.delta":
+		var d opencode.CompactionEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil && !conv.compacting {
+				conv.compacting = true
+				conv.syncActivityLabel()
+			}
+		}
+
 	case "session.inbox.delivered", "session.synthetic", "session.instructions.updated", "session.skill.activated",
 		"session.compaction.started", "session.compaction.ended", "session.compaction.failed":
 		var d struct {
@@ -9521,6 +9822,33 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
+				switch ev.Type {
+				case "session.inbox.delivered":
+					if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+						conv.activityPhase = activityThinking
+						conv.retryAttempt = 0
+						conv.syncActivityLabel()
+					}
+				case "session.compaction.started":
+					conv.compacting = true
+					conv.syncActivityLabel()
+				case "session.compaction.ended":
+					conv.activityGen++
+					conv.compacting = false
+					if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+						conv.activityPhase = activityThinking
+						conv.retryAttempt = 0
+					}
+					conv.syncActivityLabel()
+				case "session.compaction.failed":
+					conv.activityGen++
+					conv.compacting = false
+					if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+						conv.activityPhase = activityWaitingModel
+						conv.retryAttempt = 0
+					}
+					conv.syncActivityLabel()
+				}
 				if conv.loaded {
 					w.reconcileTail(d.SessionID)
 				}
@@ -9603,6 +9931,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				conv.streamStart = time.Now()
 				conv.streamEnd = time.Time{}
 				conv.streamedChars = 0
+				conv.activityPhase = activityThinking
+				conv.retryAttempt = 0
 				w.setConvActive(d.SessionID, true)
 				if d.Agent != "" {
 					conv.session.Agent = d.Agent
@@ -9683,10 +10013,35 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if authoritative := opencode.FormatMessageTokPerSec(conv.messages); authoritative != "" {
 					conv.lastTokRate = authoritative
 				}
+				if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+					conv.activityPhase = activityThinking
+					conv.syncActivityLabel()
+				}
 				w.updateTurnDurations(conv)
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
 				}
+			}
+		}
+
+	case "session.step.failed":
+		var d opencode.StepFailedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
+					conv.activityPhase = activityWaitingModel
+					conv.syncActivityLabel()
+				}
+			}
+		}
+
+	case "session.reasoning.started":
+		var d opencode.TextStartedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				conv.activityPhase = activityThinking
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
 			}
 		}
 
@@ -9695,6 +10050,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
+				conv.activityPhase = activityThinking
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				if conv.loaded {
 					aw := w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, "", "")
@@ -9713,11 +10071,24 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			}
 		}
 
+	case "session.text.started":
+		var d opencode.TextStartedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				conv.activityPhase = activityResponding
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
+			}
+		}
+
 	case "session.text.delta":
 		var d opencode.TextDeltaEvent
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
+				conv.activityPhase = activityResponding
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				if strings.TrimSpace(d.Delta) != "" {
 					w.markTabNeedsAttention(tab, false)
@@ -9748,6 +10119,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
 				conv.runningTools++
+				conv.activityPhase = activityResponding
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
 				if d.ID != "" && d.Name != "" {
 					conv.toolNames[d.ID] = d.Name
 				}
@@ -9764,6 +10138,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			if conv != nil {
+				conv.activityPhase = activityResponding
+				conv.retryAttempt = 0
+				conv.syncActivityLabel()
 				w.onStreamDelta(tab, conv, len(d.Delta))
 				name := d.Name
 				if name == "" && d.ID != "" {
@@ -9790,6 +10167,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if name == "" && d.ID != "" {
 					name = conv.toolNames[d.ID]
 				}
+				conv.setExecutingTool(d.ID, name)
 				if d.ID != "" {
 					if isBlockingBackgroundableTool(name, "running", d.Input) {
 						if conv.blockingTools[d.ID].IsZero() {
@@ -9831,6 +10209,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				name := d.Name
 				if name == "" && d.ID != "" {
 					name = conv.toolNames[d.ID]
+				}
+				if d.ID != "" && name != "" {
+					if _, executing := conv.executingTools[d.ID]; executing {
+						conv.executingTools[d.ID] = name
+						conv.syncActivityLabel()
+					}
 				}
 				var inputDesc, inputAgent string
 				if d.ID != "" && d.Input != nil {
@@ -9918,6 +10302,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if name == "" && d.ID != "" {
 					name = conv.toolNames[d.ID]
 				}
+				conv.clearExecutingTool(d.ID)
 				if d.ID != "" {
 					delete(conv.blockingTools, d.ID)
 					delete(conv.blockingShellTools, d.ID)
@@ -10000,6 +10385,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if name == "" && d.ID != "" {
 					name = conv.toolNames[d.ID]
 				}
+				conv.clearExecutingTool(d.ID)
 				if d.ID != "" {
 					delete(conv.blockingTools, d.ID)
 					delete(conv.blockingShellTools, d.ID)

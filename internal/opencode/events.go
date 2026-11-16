@@ -2,6 +2,13 @@ package opencode
 
 import "encoding/json"
 
+// TextStartedEvent is emitted on "session.text.started" and "session.reasoning.started".
+type TextStartedEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID"`
+	Ordinal            int    `json:"ordinal"`
+}
+
 // TextDeltaEvent is emitted on "session.text.delta" and "session.reasoning.delta".
 type TextDeltaEvent struct {
 	SessionID          string `json:"sessionID"`
@@ -39,6 +46,12 @@ type StepEndedEvent struct {
 	Cost               float64    `json:"cost,omitempty"`
 	Tokens             TokenUsage `json:"tokens,omitempty"`
 	Finish             string     `json:"finish,omitempty"`
+}
+
+// StepFailedEvent is emitted on "session.step.failed".
+type StepFailedEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID"`
 }
 
 // ToolEvent is emitted on "session.tool.*".
@@ -226,4 +239,26 @@ func (e PermissionRepliedEvent) EffectiveRequestID() string {
 // McpChangedEvent is emitted on "mcp.status.changed" and "mcp.resources.changed".
 type McpChangedEvent struct {
 	Server string `json:"server"`
+}
+
+// SessionStatus describes the session status payload inside "session.status".
+type SessionStatus struct {
+	Type    string `json:"type"`
+	Attempt int    `json:"attempt,omitempty"`
+	Message string `json:"message,omitempty"`
+	Next    int64  `json:"next,omitempty"`
+}
+
+// SessionStatusEvent is emitted on "session.status".
+type SessionStatusEvent struct {
+	SessionID string        `json:"sessionID"`
+	Status    SessionStatus `json:"status"`
+}
+
+// RetryScheduledEvent is emitted on "session.retry.scheduled".
+type RetryScheduledEvent struct {
+	SessionID          string `json:"sessionID"`
+	AssistantMessageID string `json:"assistantMessageID,omitempty"`
+	Attempt            int    `json:"attempt,omitempty"`
+	At                 int64  `json:"at,omitempty"`
 }
