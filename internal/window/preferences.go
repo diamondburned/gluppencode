@@ -399,7 +399,7 @@ func (w *Window) openPreferencesDialog() {
 	})
 	layoutGroup.Add(shellLinesRow)
 
-	diffLinesRow := adw.NewSpinRowWithRange(float64(minDiffTruncationLines), float64(maxDiffTruncationLines), 10)
+	diffLinesRow := adw.NewSpinRowWithRange(float64(minDiffTruncationLines), float64(maxDiffTruncationLines), 1)
 	diffLinesRow.SetTitle("Inline Diff Truncation Limit")
 	diffLinesRow.SetSubtitle("Maximum lines shown in inline tool diffs before truncating")
 	diffLinesRow.SetValue(float64(w.effectiveDiffTruncationLines()))

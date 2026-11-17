@@ -3470,6 +3470,79 @@ func TestPreferencesPersistenceAndLiveApply(t *testing.T) {
 	}
 }
 
+func TestInlineDiffDefaultTruncationAndExpandToggle(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	if got := clampDiffTruncationLines(0); got != 8 {
+		t.Fatalf("clampDiffTruncationLines(0) = %d, want 8", got)
+	}
+
+	var diffLines []string
+	for i := 1; i <= 12; i++ {
+		diffLines = append(diffLines, fmt.Sprintf("+line %d", i))
+	}
+	tw := &ToolWidget{
+		Box:     gtk.NewBox(gtk.OrientationVertical, 0),
+		diffBox: gtk.NewBox(gtk.OrientationVertical, 0),
+	}
+	tw.renderInlineDiff(strings.Join(diffLines, "\n"))
+
+	// Default 8 lines + 1 footer toggle label ("… (4 more lines) - show more") = 9 widgets.
+	if len(tw.diffWidgets) != 9 {
+		t.Fatalf("len(tw.diffWidgets) with default limit = %d, want 9", len(tw.diffWidgets))
+	}
+	moreLbl := tw.diffWidgets[len(tw.diffWidgets)-1]
+	if got := moreLbl.Text(); got != "… (4 more lines) - show more" {
+		t.Fatalf("more footer text = %q, want %q", got, "… (4 more lines) - show more")
+	}
+	if !strings.Contains(moreLbl.Label(), `<a href="expand">show more</a>`) {
+		t.Fatalf("more footer markup = %q, expected show more link", moreLbl.Label())
+	}
+
+	// Activating the "show more" link expands to all 12 lines + 1 "show less" link = 13 widgets.
+	moreLbl.Emit("activate-link", "expand")
+	if !tw.diffExpanded {
+		t.Fatalf("expected tw.diffExpanded to be true after activating show more")
+	}
+	if len(tw.diffWidgets) != 13 {
+		t.Fatalf("len(tw.diffWidgets) after expand = %d, want 13", len(tw.diffWidgets))
+	}
+	lessLbl := tw.diffWidgets[len(tw.diffWidgets)-1]
+	if got := lessLbl.Text(); got != "show less" {
+		t.Fatalf("less footer text = %q, want %q", got, "show less")
+	}
+
+	// Activating "show less" collapses back to 8 lines + 1 toggle label = 9 widgets.
+	lessLbl.Emit("activate-link", "collapse")
+	if tw.diffExpanded {
+		t.Fatalf("expected tw.diffExpanded to be false after activating show less")
+	}
+	if len(tw.diffWidgets) != 9 {
+		t.Fatalf("len(tw.diffWidgets) after collapse = %d, want 9", len(tw.diffWidgets))
+	}
+
+	// Verify singular "1 more line" wording when truncated by 1.
+	tw.renderInlineDiff(strings.Join(diffLines[:9], "\n"))
+	if got := tw.diffWidgets[len(tw.diffWidgets)-1].Text(); got != "… (1 more line) - show more" {
+		t.Fatalf("singular more footer text = %q, want %q", got, "… (1 more line) - show more")
+	}
+
+	// Verify styleCSS parses without CSS errors (including .glup-diff-toggle link overrides).
+	prov := gtk.NewCSSProvider()
+	prov.ConnectParsingError(func(sec *gtk.CSSSection, err error) {
+		t.Fatalf("style.css parsing error: %v", err)
+	})
+	prov.LoadFromString(styleCSS)
+
+	// Verify compact minimum horizontal width is preserved with the toggle label.
+	minW, _, _, _ := tw.diffBox.Measure(gtk.OrientationHorizontal, -1)
+	if minW > 120 {
+		t.Fatalf("diffBox horizontal minimum width = %d px, want <= 120 px", minW)
+	}
+}
+
 func TestRevertUserMessageCountAndFileRollbackBanner(t *testing.T) {
 	if !gtk.InitCheck() {
 		t.Skip("no display")

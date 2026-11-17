@@ -381,6 +381,19 @@ expander-widget.glup-tool-expander > title > arrow {
 	font-weight: 600;
 }
 
+.glup-diff-toggle {
+	opacity: 0.6;
+	font-weight: 600;
+}
+
+label.glup-diff-toggle link,
+label.glup-diff-toggle link:visited,
+label.glup-diff-toggle link:hover,
+label.glup-diff-toggle link:active {
+	color: inherit;
+	text-decoration: underline;
+}
+
 .glup-image-thumb {
 	border-radius: 8px;
 	border: 1px solid alpha(@borders, 0.5);

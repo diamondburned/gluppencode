@@ -24,8 +24,8 @@ const (
 	defaultShellTailLines      = 7
 	minShellTailLines          = 3
 	maxShellTailLines          = 30
-	defaultDiffTruncationLines = 80
-	minDiffTruncationLines     = 20
+	defaultDiffTruncationLines = 8
+	minDiffTruncationLines     = 1
 	maxDiffTruncationLines     = 500
 )
 

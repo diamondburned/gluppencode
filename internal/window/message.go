@@ -314,6 +314,8 @@ type ToolWidget struct {
 	lazyOutputErr      any
 	lazyOutputDirty    bool
 	rawDiffText        string
+	diffRendered       bool
+	diffExpanded       bool
 	diffMaxLines       func() int
 }
 
@@ -706,7 +708,9 @@ func (t *ToolWidget) SetInput(raw any) {
 		if deleted > 0 {
 			t.addBadge(fmt.Sprintf("-%d", deleted), "glup-diff-badge-del")
 		}
-		t.renderInlineDiff(diffText)
+		if !t.diffRendered || t.rawDiffText != diffText {
+			t.renderInlineDiff(diffText)
+		}
 		t.inputView.SetVisible(false)
 		return
 	}
@@ -975,6 +979,7 @@ func (t *ToolWidget) SetDiffMaxLines(maxLines int) {
 
 func (t *ToolWidget) renderInlineDiff(diffText string) {
 	t.rawDiffText = diffText
+	t.diffRendered = true
 	for _, lbl := range t.diffWidgets {
 		t.diffBox.Remove(lbl)
 	}
@@ -992,9 +997,11 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 			maxLines = m
 		}
 	}
+	totalLines := len(lines)
+	canCollapse := totalLines > maxLines
 	truncated := 0
-	if len(lines) > maxLines {
-		truncated = len(lines) - maxLines
+	if canCollapse && !t.diffExpanded {
+		truncated = totalLines - maxLines
 		lines = lines[:maxLines]
 	}
 
@@ -1017,13 +1024,49 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 		t.diffWidgets = append(t.diffWidgets, lbl)
 	}
 	if truncated > 0 {
-		more := gtk.NewLabel(fmt.Sprintf("… (%d more lines)", truncated))
+		lineWord := "lines"
+		if truncated == 1 {
+			lineWord = "line"
+		}
+		more := gtk.NewLabel("")
 		more.SetXAlign(0)
-		more.AddCSSClass("glup-diff-line-hdr")
+		more.SetWrap(true)
+		more.SetWrapMode(pango.WrapWordChar)
+		more.SetWidthChars(1)
+		more.AddCSSClass("glup-diff-toggle")
+		more.SetMarkup(fmt.Sprintf(`… (%d more %s) - <a href="expand">show more</a>`, truncated, lineWord))
+		more.ConnectActivateLink(func(uri string) bool {
+			t.setDiffExpanded(true)
+			return true
+		})
 		t.diffBox.Append(more)
 		t.diffWidgets = append(t.diffWidgets, more)
+	} else if canCollapse && t.diffExpanded {
+		less := gtk.NewLabel("")
+		less.SetXAlign(0)
+		less.SetWrap(true)
+		less.SetWrapMode(pango.WrapWordChar)
+		less.SetWidthChars(1)
+		less.AddCSSClass("glup-diff-toggle")
+		less.SetMarkup(`<a href="collapse">show less</a>`)
+		less.ConnectActivateLink(func(uri string) bool {
+			t.setDiffExpanded(false)
+			return true
+		})
+		t.diffBox.Append(less)
+		t.diffWidgets = append(t.diffWidgets, less)
 	}
 	t.diffBox.SetVisible(true)
+}
+
+func (t *ToolWidget) setDiffExpanded(expanded bool) {
+	if t.diffExpanded == expanded {
+		return
+	}
+	t.diffExpanded = expanded
+	if t.rawDiffText != "" {
+		t.renderInlineDiff(t.rawDiffText)
+	}
 }
 
 func summarizeToolInput(m map[string]any) string {
