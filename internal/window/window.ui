@@ -582,6 +582,33 @@
               </object>
             </child>
             <child>
+              <object class="GtkBox" id="mcpStatusBox">
+                <property name="orientation">horizontal</property>
+                <property name="spacing">5</property>
+                <property name="halign">start</property>
+                <property name="valign">center</property>
+                <property name="visible">false</property>
+                <style>
+                  <class name="glup-status-chip"/>
+                  <class name="glup-status-mcp"/>
+                </style>
+                <child>
+                  <object class="GtkImage">
+                    <property name="icon-name">bolt-symbolic</property>
+                    <property name="pixel-size">14</property>
+                    <property name="valign">center</property>
+                  </object>
+                </child>
+                <child>
+                  <object class="GtkLabel" id="mcpStatusLabel">
+                    <property name="label">0 MCP</property>
+                    <property name="valign">center</property>
+                    <property name="ellipsize">end</property>
+                  </object>
+                </child>
+              </object>
+            </child>
+            <child>
               <object class="GtkBox">
                 <property name="hexpand">true</property>
               </object>
@@ -615,32 +642,6 @@
                         <property name="ellipsize">end</property>
                       </object>
                     </child>
-                  </object>
-                </child>
-              </object>
-            </child>
-            <child>
-              <object class="GtkBox" id="mcpStatusBox">
-                <property name="orientation">horizontal</property>
-                <property name="spacing">5</property>
-                <property name="valign">center</property>
-                <property name="visible">false</property>
-                <style>
-                  <class name="glup-status-chip"/>
-                  <class name="glup-status-mcp"/>
-                </style>
-                <child>
-                  <object class="GtkImage">
-                    <property name="icon-name">bolt-symbolic</property>
-                    <property name="pixel-size">14</property>
-                    <property name="valign">center</property>
-                  </object>
-                </child>
-                <child>
-                  <object class="GtkLabel" id="mcpStatusLabel">
-                    <property name="label">0 MCP</property>
-                    <property name="valign">center</property>
-                    <property name="ellipsize">end</property>
                   </object>
                 </child>
               </object>

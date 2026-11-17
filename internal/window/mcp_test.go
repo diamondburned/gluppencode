@@ -131,6 +131,16 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		projectSessions: make(map[string][]opencode.Session),
 	}
 
+	uiBuilder := gtk.NewBuilderFromString(windowUI)
+	uiBranch := uiBuilder.GetObject("branchStatusBox").Cast().(*gtk.Box)
+	uiMcp := uiBuilder.GetObject("mcpStatusBox").Cast().(*gtk.Box)
+	if prev := uiMcp.PrevSibling(); prev == nil || gtk.BaseWidget(prev).Object.Native() != uiBranch.Object.Native() {
+		t.Fatalf("expected mcpStatusBox immediately after branchStatusBox, got %v", prev)
+	}
+	if next := uiMcp.NextSibling(); next == nil || !gtk.BaseWidget(next).HExpand() {
+		t.Fatalf("expected hexpand spacer immediately after mcpStatusBox, got %v", next)
+	}
+
 	// 1. Direct chip formatting states.
 	win.mcpByDir = map[string][]opencode.McpServer{
 		normalizeProjectDir(dirA): {},
@@ -143,10 +153,18 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 
 	win.mcpByDir[normalizeProjectDir(dirA)] = []opencode.McpServer{
 		{Name: "a", Status: opencode.McpStatus{Status: "connected"}},
+	}
+	win.refreshMcpStatusChip()
+	if !mcpBox.Visible() || mcpLbl.Text() != "1 MCP" || !mcpBox.HasCSSClass("glup-status-mcp-ok") {
+		t.Fatalf("single-connected chip = visible:%v text:%q ok:%v", mcpBox.Visible(), mcpLbl.Text(), mcpBox.HasCSSClass("glup-status-mcp-ok"))
+	}
+
+	win.mcpByDir[normalizeProjectDir(dirA)] = []opencode.McpServer{
+		{Name: "a", Status: opencode.McpStatus{Status: "connected"}},
 		{Name: "b", Status: opencode.McpStatus{Status: "connected"}},
 	}
 	win.refreshMcpStatusChip()
-	if !mcpBox.Visible() || mcpLbl.Text() != "2 MCP" || !mcpBox.HasCSSClass("glup-status-mcp-ok") {
+	if !mcpBox.Visible() || mcpLbl.Text() != "2 MCPs" || !mcpBox.HasCSSClass("glup-status-mcp-ok") {
 		t.Fatalf("all-connected chip = visible:%v text:%q ok:%v", mcpBox.Visible(), mcpLbl.Text(), mcpBox.HasCSSClass("glup-status-mcp-ok"))
 	}
 
@@ -155,7 +173,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		{Name: "b", Status: opencode.McpStatus{Status: "failed"}},
 	}
 	win.refreshMcpStatusChip()
-	if mcpLbl.Text() != "1/2 MCP · 1 err" || !mcpBox.HasCSSClass("glup-status-mcp-err") {
+	if mcpLbl.Text() != "1/2 MCPs · 1 err" || !mcpBox.HasCSSClass("glup-status-mcp-err") {
 		t.Fatalf("failed chip = text:%q err:%v", mcpLbl.Text(), mcpBox.HasCSSClass("glup-status-mcp-err"))
 	}
 
@@ -164,7 +182,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		{Name: "b", Status: opencode.McpStatus{Status: "needs_auth"}},
 	}
 	win.refreshMcpStatusChip()
-	if mcpLbl.Text() != "1/2 MCP · auth" || !mcpBox.HasCSSClass("glup-status-mcp-warn") {
+	if mcpLbl.Text() != "1/2 MCPs · auth" || !mcpBox.HasCSSClass("glup-status-mcp-warn") {
 		t.Fatalf("needs_auth chip = text:%q warn:%v", mcpLbl.Text(), mcpBox.HasCSSClass("glup-status-mcp-warn"))
 	}
 
@@ -173,7 +191,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		{Name: "b", Status: opencode.McpStatus{Status: "disabled"}},
 	}
 	win.refreshMcpStatusChip()
-	if mcpLbl.Text() != "0/2 MCP" || !mcpBox.HasCSSClass("glup-status-mcp-dim") {
+	if mcpLbl.Text() != "0/2 MCPs" || !mcpBox.HasCSSClass("glup-status-mcp-dim") {
 		t.Fatalf("disabled chip = text:%q dim:%v", mcpLbl.Text(), mcpBox.HasCSSClass("glup-status-mcp-dim"))
 	}
 
@@ -182,8 +200,8 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		{Name: "b", Status: opencode.McpStatus{Status: "pending"}},
 	}
 	win.refreshMcpStatusChip()
-	if mcpLbl.Text() != "1/2 MCP" {
-		t.Fatalf("partial chip = %q, want '1/2 MCP'", mcpLbl.Text())
+	if mcpLbl.Text() != "1/2 MCPs" {
+		t.Fatalf("partial chip = %q, want '1/2 MCPs'", mcpLbl.Text())
 	}
 
 	// 2. Greeter (tab == nil): updateBottomBar(nil) triggers ListMCP("") -> resolves defaultServerDir.
@@ -192,7 +210,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 	win.defaultServerDir = ""
 	win.updateBottomBar(nil)
 	pumpMainLoopUntil(t, 2*time.Second, func() bool {
-		return win.defaultServerDir == normalizeProjectDir(dirA) && mcpLbl.Text() == "2 MCP"
+		return win.defaultServerDir == normalizeProjectDir(dirA) && mcpLbl.Text() == "2 MCPs"
 	})
 
 	// 3. Greeter SSE matching via defaultServerDir.
@@ -208,7 +226,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 		Data:     json.RawMessage(`{"server":"search"}`),
 	})
 	pumpMainLoopUntil(t, 2*time.Second, func() bool {
-		return mcpLbl.Text() == "1/2 MCP · 1 err"
+		return mcpLbl.Text() == "1/2 MCPs · 1 err"
 	})
 
 	// 4. Suspended background directory SSE should NOT issue a fetch, only invalidate cache.
@@ -246,7 +264,7 @@ func TestMcpStatusChipStatesGreeterAndEvents(t *testing.T) {
 	vs.SetVisibleChildName(sess.ID)
 	win.onVisibleTabChanged()
 	pumpMainLoopUntil(t, 2*time.Second, func() bool {
-		return mcpLbl.Text() == "1/2 MCP · 1 err"
+		return mcpLbl.Text() == "1/2 MCPs · 1 err"
 	})
 
 	win.applySessionMoved(sess.ID, dirB)

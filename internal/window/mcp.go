@@ -218,22 +218,26 @@ func (w *Window) refreshMcpStatusChip() {
 	}
 
 	total := len(servers)
+	unit := "MCP"
+	if total > 1 {
+		unit = "MCPs"
+	}
 	var label, cls string
 	switch {
 	case failed > 0:
-		label = fmt.Sprintf("%d/%d MCP · %d err", connected, total, failed)
+		label = fmt.Sprintf("%d/%d %s · %d err", connected, total, unit, failed)
 		cls = "glup-status-mcp-err"
 	case needsAuth > 0:
-		label = fmt.Sprintf("%d/%d MCP · auth", connected, total)
+		label = fmt.Sprintf("%d/%d %s · auth", connected, total, unit)
 		cls = "glup-status-mcp-warn"
 	case connected == total:
-		label = fmt.Sprintf("%d MCP", total)
+		label = fmt.Sprintf("%d %s", total, unit)
 		cls = "glup-status-mcp-ok"
 	case disabled == total:
-		label = fmt.Sprintf("0/%d MCP", total)
+		label = fmt.Sprintf("0/%d %s", total, unit)
 		cls = "glup-status-mcp-dim"
 	default:
-		label = fmt.Sprintf("%d/%d MCP", connected, total)
+		label = fmt.Sprintf("%d/%d %s", connected, total, unit)
 	}
 
 	if cls != "" {

@@ -720,9 +720,7 @@ button.glup-status-background:hover {
 }
 
 .glup-status-mcp.glup-status-mcp-ok {
-	background-color: alpha(@success_color, 0.14);
-	color: @success_color;
-	border: 1px solid alpha(@success_color, 0.35);
+	opacity: 0.85;
 }
 
 .glup-status-mcp.glup-status-mcp-warn {
