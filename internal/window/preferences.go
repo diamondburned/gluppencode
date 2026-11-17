@@ -123,11 +123,11 @@ func (w *Window) applyColorScheme() {
 	}
 }
 
-func (w *Window) applySyntaxTheme() {
+func (w *Window) currentSyntaxStyleScheme() *gtksource.StyleScheme {
 	styleMgr := adw.StyleManagerGetDefault()
 	schemeMgr := gtksource.StyleSchemeManagerGetDefault()
 	if styleMgr == nil || schemeMgr == nil {
-		return
+		return nil
 	}
 
 	var scheme *gtksource.StyleScheme
@@ -149,8 +149,18 @@ func (w *Window) applySyntaxTheme() {
 			}
 		}
 	}
+	return scheme
+}
+
+func (w *Window) applySyntaxTheme() {
+	scheme := w.currentSyntaxStyleScheme()
 	if w.inputBuffer != nil {
 		w.inputBuffer.SetStyleScheme(scheme)
+	}
+	for _, d := range w.drafts {
+		if d != nil && d.buffer != nil && d.buffer != w.inputBuffer {
+			d.buffer.SetStyleScheme(scheme)
+		}
 	}
 }
 

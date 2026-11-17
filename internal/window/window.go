@@ -5,7 +5,6 @@ import (
 	"cmp"
 	"context"
 	_ "embed"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -835,6 +834,12 @@ type Window struct {
 	archivedSessions  map[string]bool
 	projectOrder      []string
 	statePath         string
+	draftsDir         string
+	drafts            map[string]*composerDraft
+	activeDraftKey    string
+	draftGenMu        sync.Mutex
+	draftWriteGen     map[string]uint64
+	draftWriteMu      sync.Mutex
 	allSessions       []opencode.Session
 	projectSessions   map[string][]opencode.Session
 
@@ -1007,6 +1012,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		visibleSessions:       make(map[string]bool),
 		archivedSessions:      make(map[string]bool),
 		statePath:             defaultStateFilePath(),
+		draftsDir:             defaultDraftsDirForState(defaultStateFilePath()),
+		drafts:                make(map[string]*composerDraft),
+		draftWriteGen:         make(map[string]uint64),
 		projectSessions:       make(map[string][]opencode.Session),
 		activeShells:          make(map[string]opencode.ShellItem),
 		shellOutputs:          make(map[string]string),
@@ -1054,6 +1062,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		builder.GetObject("timelineBottomFade").Cast().(*gtk.Box),
 	)
 	w.inputBuffer = w.inputView.Buffer().Cast().(*gtksource.Buffer)
+	w.initComposerDrafts()
 	w.setupComposerMarkdown()
 	w.setupComposerMultiline()
 
@@ -1062,15 +1071,6 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.applySyntaxTheme()
 		if w.mcpMgr != nil {
 			w.mcpMgr.applyLogTheme()
-		}
-	})
-
-	w.inputBuffer.ConnectChanged(func() {
-		w.composerPlaceholder.SetVisible(w.inputBuffer.CharCount() == 0)
-		w.syncInputScrollPolicy()
-		w.applyComposerMarkdownHighlighting()
-		if !w.settingHistoryText {
-			w.syncComposerCompletionPopup()
 		}
 	})
 	w.agentPopover.ConnectMap(func() {
@@ -1160,6 +1160,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 
 	adwWin.ConnectCloseRequest(func() bool {
+		w.flushAllDraftsSync()
 		if w.mcpMgr != nil {
 			w.mcpMgr.closeAuthDialog()
 			w.mcpMgr.stopLogPoller()
@@ -1722,6 +1723,9 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		w.viewStack.SetVisibleChildName(prevVisID)
 	}
 	w.populating = prevPopulating
+	if !prevPopulating && prevVisID == "" {
+		w.onVisibleTabChanged()
+	}
 
 	found := false
 	for i, s := range w.allSessions {
@@ -1874,6 +1878,7 @@ func (w *Window) archiveSession(sessID string) {
 	}
 
 	if !ok {
+		w.deleteSessionDraftsForTab(sessID, nil)
 		w.withdrawSessionNotifications(sessID)
 		w.syncSidebar()
 		return
@@ -1887,6 +1892,7 @@ func (w *Window) archiveSession(sessID string) {
 
 	prevPopulating := w.populating
 	w.populating = true
+	w.deleteSessionDraftsForTab(sessID, tab)
 	w.cancelCompletionSettle(tab)
 	w.withdrawSessionNotifications(sessID)
 	tab.main.closeStreams()
@@ -1945,6 +1951,9 @@ func (w *Window) clearProjectSessions(rawDir string) {
 	for id := range toArchive {
 		w.archivedSessions[id] = true
 		delete(w.visibleSessions, id)
+		if _, hasTab := w.tabs[id]; !hasTab {
+			w.deleteSessionDraftsForTab(id, nil)
+		}
 	}
 	delete(w.collapsedProjects, normDir)
 	delete(w.expandedProjects, normDir)
@@ -1966,6 +1975,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 			continue
 		}
 		if tab, ok := w.tabs[id]; ok {
+			w.deleteSessionDraftsForTab(id, tab)
 			w.cancelCompletionSettle(tab)
 			tab.main.closeStreams()
 			for _, sub := range tab.subTimelines {
@@ -5191,6 +5201,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 	if targetID != "" {
 		w.viewStack.SetVisibleChildName(targetID)
 	}
+	w.pruneArchivedDrafts()
 	w.onVisibleTabChanged()
 	w.syncSidebar()
 	if pendingOpenID != "" {
@@ -5826,6 +5837,7 @@ func (w *Window) onVisibleTabChanged() {
 	w.syncEmptyGreeterVisibility()
 	tab := w.currentTab()
 	if tab == nil {
+		w.switchComposerDraft(greeterDraftKey)
 		if w.windowTitle != nil {
 			w.windowTitle.SetTitle("Gluppencode")
 			w.windowTitle.SetSubtitle("Select or create a session")
@@ -5856,6 +5868,7 @@ func (w *Window) onVisibleTabChanged() {
 	}
 	tab.setNeedsAttention(false)
 
+	w.switchComposerDraft(tab.activeConv().session.ID)
 	w.refreshHeaderAndBottomBar(tab)
 	w.rebuildShellList()
 	w.ensureShellOutputPoller()
@@ -6001,6 +6014,9 @@ func (w *Window) openSubagent(tab *sessionTab, subSess opencode.Session) {
 		subConv.loadingInitial = true
 		w.loadConvMessages(tab, subConv)
 	}
+	if w.currentTab() == tab {
+		w.switchComposerDraft(subSess.ID)
+	}
 	w.refreshHeaderAndBottomBar(tab)
 }
 
@@ -6010,6 +6026,9 @@ func (w *Window) closeSubagent(tab *sessionTab) {
 	}
 	tab.activeSubID = ""
 	tab.stack.SetVisibleChildName("main")
+	if w.currentTab() == tab {
+		w.switchComposerDraft(tab.activeConv().session.ID)
+	}
 	w.refreshHeaderAndBottomBar(tab)
 }
 
@@ -8207,7 +8226,8 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			if text != "" || len(w.pendingFiles) > 0 {
 				w.createNewSessionInDirAndThen("", func() {
 					// Guard against creating sessions in a loop if no tab became current.
-					if w.currentTab() != nil {
+					if cur := w.currentTab(); cur != nil {
+						w.adoptDraft(greeterDraftKey, cur.activeConv().session.ID)
 						w.sendPromptWithDelivery(delivery)
 					}
 				})
@@ -8225,12 +8245,6 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 		w.recordInputHistory(text)
 		w.saveState()
 	}
-	w.inputBuffer.SetText("")
-	w.setComposerExpanded(false)
-
-	files := slices.Clone(w.pendingFiles)
-	w.pendingFiles = nil
-	w.rebuildAttachmentTray()
 
 	var isSlashCmd bool
 	var cmdName string
@@ -8258,49 +8272,39 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	if isSlashCmd {
 		switch cmdName {
 		case "undo":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.undoLastMessage(tab, conv)
 			return
 		case "redo":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.redoRevert(tab, conv)
 			return
 		case "new":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.createNewSession()
 			return
 		case "cd":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.changeSessionDirectory(tab, conv, cmdArgs)
 			return
 		case "compact":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.compactCurrentSession(tab, conv)
 			return
 		case "mcp", "mcps":
-			if len(files) > 0 {
-				w.pendingFiles = files
-				w.rebuildAttachmentTray()
-			}
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			w.openMcpSheet(cmdArgs)
 			return
 		default:
 			sessionID := conv.session.ID
+			w.inputBuffer.SetText("")
+			w.setComposerExpanded(false)
 			uw := NewUserMessageWidget(w.ctx, text)
 			conv.slashBubbles = append(conv.slashBubbles, uw)
 			conv.timelineBox.Append(uw)
@@ -8322,20 +8326,16 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 							return b == uw
 						})
 						conv.updateGreeterVisibility()
-						start, end := w.inputBuffer.Bounds()
-						if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" {
-							w.inputBuffer.SetText(text)
-						}
-						if len(files) > 0 && len(w.pendingFiles) == 0 {
-							w.pendingFiles = files
-							w.rebuildAttachmentTray()
-						}
+						w.restoreDraft(sessionID, text, nil)
 					}
 				}
 			})
 			return
 		}
 	}
+
+	files := slices.Clone(w.pendingFiles)
+	sentGen := w.clearDraftInMemoryForSend(conv.session.ID)
 
 	if text == "" && len(files) > 0 {
 		var parts []string
@@ -8395,16 +8395,10 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 						break
 					}
 				}
-				start, end := w.inputBuffer.Bounds()
-				if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" {
-					w.inputBuffer.SetText(text)
-				}
-				if len(files) > 0 && len(w.pendingFiles) == 0 {
-					w.pendingFiles = files
-					w.rebuildAttachmentTray()
-				}
+				w.restoreDraft(sessionID, text, files)
 				return
 			}
+			w.removeDraftDirIfGen(sessionID, sentGen)
 			if item == nil || item.ID == "" {
 				return
 			}
@@ -8716,14 +8710,7 @@ func (w *Window) cancelPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 		}
 	}
 	conv.updateGreeterVisibility()
-	start, end := w.inputBuffer.Bounds()
-	if strings.TrimSpace(w.inputBuffer.Text(start, end, false)) == "" && p.text != "" {
-		w.inputBuffer.SetText(p.text)
-	}
-	if len(p.files) > 0 && len(w.pendingFiles) == 0 {
-		w.pendingFiles = slices.Clone(p.files)
-		w.rebuildAttachmentTray()
-	}
+	w.restoreDraft(conv.session.ID, p.text, p.files)
 	if p.inboxID == "" || p.rewriting {
 		return
 	}
@@ -9567,12 +9554,8 @@ func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messa
 	}
 	sessionID := conv.session.ID
 
-	if w.inputBuffer != nil {
-		start, end := w.inputBuffer.Bounds()
-		curText := strings.TrimSpace(w.inputBuffer.Text(start, end, false))
-		if curText == "" && messageText != "" {
-			w.inputBuffer.SetText(messageText)
-		}
+	if messageText != "" {
+		w.restoreDraft(sessionID, messageText, nil)
 	}
 
 	gtkutil.Async(w.ctx, func() func() {
@@ -9719,6 +9702,7 @@ func (w *Window) pasteClipboardImage() {
 	if clipboard == nil {
 		return
 	}
+	targetKey := w.activeDraftKey
 	clipboard.ReadTextureAsync(w.ctx, func(res gio.AsyncResulter) {
 		texer, err := clipboard.ReadTextureFinish(res)
 		if err != nil || texer == nil {
@@ -9732,8 +9716,16 @@ func (w *Window) pasteClipboardImage() {
 		if pngBytes == nil {
 			return
 		}
-		b64 := base64.StdEncoding.EncodeToString(pngBytes.Data())
-		w.addPendingImage(fmt.Sprintf("clipboard-%d.png", len(w.pendingFiles)+1), "image/png", b64, tex)
+		if !w.isLiveDraftTarget(targetKey) {
+			return
+		}
+		count := len(w.pendingFiles)
+		if w.drafts != nil {
+			if d := w.ensureAndLoadDraft(targetKey); d != nil {
+				count = len(d.files)
+			}
+		}
+		w.attachRawToDraft(targetKey, fmt.Sprintf("clipboard-%d.png", count+1), "image/png", pngBytes.Data(), tex)
 	})
 }
 
@@ -9753,9 +9745,13 @@ func (w *Window) chooseAndAttachFile() {
 	dlg.SetFilters(filters)
 	dlg.SetDefaultFilter(filter)
 
+	targetKey := w.activeDraftKey
 	dlg.Open(w.ctx, &w.Window, func(res gio.AsyncResulter) {
 		file, err := dlg.OpenFinish(res)
 		if err != nil || file == nil {
+			return
+		}
+		if !w.isLiveDraftTarget(targetKey) {
 			return
 		}
 		path := file.Path()
@@ -9764,7 +9760,6 @@ func (w *Window) chooseAndAttachFile() {
 			slog.Error("failed to read attached file", "err", err)
 			return
 		}
-		b64 := base64.StdEncoding.EncodeToString(data)
 		mime := "image/png"
 		lower := strings.ToLower(path)
 		if strings.HasSuffix(lower, ".jpg") || strings.HasSuffix(lower, ".jpeg") {
@@ -9774,27 +9769,29 @@ func (w *Window) chooseAndAttachFile() {
 		} else if strings.HasSuffix(lower, ".gif") {
 			mime = "image/gif"
 		}
-		tex, _ := decodeBase64Texture(b64)
-		w.addPendingImage(filepath.Base(path), mime, b64, tex)
+		w.attachRawToDraft(targetKey, filepath.Base(path), mime, data, nil)
 	})
-}
-
-func (w *Window) addPendingImage(name, mime, b64 string, tex *gdk.Texture) {
-	if mime == "" {
-		mime = "image/png"
-	}
-	if name == "" {
-		name = fmt.Sprintf("image-%d.png", len(w.pendingFiles)+1)
-	}
-	w.pendingFiles = append(w.pendingFiles, opencode.FileAttachment{
-		Name: name,
-		Mime: mime,
-		Data: b64,
-	})
-	w.rebuildAttachmentTray()
 }
 
 func (w *Window) removePendingFile(idx int) {
+	if d := w.activeDraft(); d != nil {
+		if idx < 0 || idx >= len(d.files) {
+			return
+		}
+		d.files = slices.Delete(d.files, idx, idx+1)
+		if idx < len(d.blobNames) {
+			d.blobNames = slices.Delete(d.blobNames, idx, idx+1)
+		}
+		if idx < len(d.blobTextures) {
+			d.blobTextures = slices.Delete(d.blobTextures, idx, idx+1)
+		}
+		w.pendingFiles = d.files
+		w.rebuildAttachmentTray()
+		if d.key != greeterDraftKey {
+			w.saveDraftSync(d)
+		}
+		return
+	}
 	if idx < 0 || idx >= len(w.pendingFiles) {
 		return
 	}
@@ -9809,6 +9806,7 @@ func (w *Window) rebuildAttachmentTray() {
 		return
 	}
 	w.attachmentTray.SetVisible(true)
+	curDraft := w.activeDraft()
 	for i, f := range w.pendingFiles {
 		overlay := gtk.NewOverlay()
 		overlay.AddCSSClass("glup-attachment-item")
@@ -9819,7 +9817,16 @@ func (w *Window) rebuildAttachmentTray() {
 		pic.SetSizeRequest(64, 64)
 		pic.AddCSSClass("glup-attachment-thumb")
 
-		tex, err := decodeBase64Texture(f.Data)
+		var tex *gdk.Texture
+		var err error
+		if curDraft != nil && i < len(curDraft.blobTextures) && curDraft.blobTextures[i] != nil {
+			tex = curDraft.blobTextures[i]
+		} else {
+			tex, err = decodeBase64Texture(f.Data)
+			if err == nil && tex != nil && curDraft != nil && i < len(curDraft.blobTextures) {
+				curDraft.blobTextures[i] = tex
+			}
+		}
 		if err == nil && tex != nil {
 			pic.SetPaintable(tex)
 			pic.SetCursorFromName("pointer")
@@ -10219,6 +10226,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			delID := d.SessionID
 			if parentID, ok := w.childToRoot[delID]; ok {
 				delete(w.childToRoot, delID)
+				w.deleteDraft(delID)
 				if parentTab, ok := w.tabs[parentID]; ok {
 					filtered := parentTab.subagents[:0]
 					for _, s := range parentTab.subagents {
@@ -10227,12 +10235,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						}
 					}
 					parentTab.subagents = filtered
+					if parentTab.activeSubID == delID {
+						w.closeSubagent(parentTab)
+					}
 					if subConv, ok := parentTab.subTimelines[delID]; ok {
 						subConv.closeStreams()
 						delete(parentTab.subTimelines, delID)
-					}
-					if parentTab.activeConv() != nil && parentTab.activeConv().session.ID == delID {
-						w.closeSubagent(parentTab)
 					}
 					w.refreshTabActionAttention(parentTab)
 					w.maybeScheduleRootTurnCompletion(parentTab)
@@ -10303,6 +10311,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 
 					prevPopulating := w.populating
 					w.populating = true
+					w.deleteSessionDraftsForTab(delID, tab)
 					w.cancelCompletionSettle(tab)
 					tab.main.closeStreams()
 					for subID, c := range tab.subTimelines {
@@ -10351,6 +10360,8 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					} else {
 						w.updateWindowManagerTitle()
 					}
+				} else {
+					w.deleteSessionDraftsForTab(delID, nil)
 				}
 				w.withdrawSessionNotifications(delID)
 				w.syncSidebar()

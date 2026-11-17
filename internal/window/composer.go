@@ -5,6 +5,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/diamondburned/gotk4-sourceview/pkg/gtksource/v5"
 	"github.com/diamondburned/gotk4/pkg/gdk/v4"
 	"github.com/diamondburned/gotk4/pkg/gtk/v4"
 	"github.com/diamondburned/gotk4/pkg/pango"
@@ -33,6 +34,14 @@ func (w *Window) setComposerExpanded(expanded bool) {
 	if w.composerExpanded == expanded {
 		return
 	}
+	w.setComposerExpandedUI(expanded)
+	if d := w.activeDraft(); d != nil {
+		d.expanded = expanded
+		w.markDraftDirtyAndScheduleSave(d)
+	}
+}
+
+func (w *Window) setComposerExpandedUI(expanded bool) {
 	w.composerExpanded = expanded
 
 	if w.composerExpandBtn != nil {
@@ -95,23 +104,30 @@ func (w *Window) syncInputScrollPolicy() {
 }
 
 func (w *Window) setupComposerMarkdown() {
-	if w.inputBuffer == nil {
+	w.setupComposerBufferMarkdown(w.inputBuffer)
+}
+
+func (w *Window) setupComposerBufferMarkdown(buf *gtksource.Buffer) {
+	if buf == nil {
 		return
 	}
-	w.inputBuffer.SetHighlightSyntax(false)
-	w.inputBuffer.SetHighlightMatchingBrackets(false)
-	w.ensureComposerMarkdownTags()
-	w.applyComposerMarkdownHighlighting()
+	buf.SetHighlightSyntax(false)
+	buf.SetHighlightMatchingBrackets(false)
+	w.ensureBufferMarkdownTags(buf)
+	w.applyComposerMarkdownHighlightingToBuffer(buf)
 }
 
 func (w *Window) ensureComposerMarkdownTags() {
-	if w.inputBuffer == nil || (w.mdTagBold != nil && w.mdTagItalic != nil &&
-		w.mdTagStrike != nil && w.mdTagMono != nil && w.mdTagCodeBlock != nil) {
-		return
+	w.ensureBufferMarkdownTags(w.inputBuffer)
+}
+
+func (w *Window) ensureBufferMarkdownTags(buf *gtksource.Buffer) (bold, italic, strike, mono, codeBlock *gtk.TextTag) {
+	if buf == nil {
+		return nil, nil, nil, nil, nil
 	}
-	table := w.inputBuffer.TagTable()
+	table := buf.TagTable()
 	if table == nil {
-		return
+		return nil, nil, nil, nil, nil
 	}
 	ensureTag := func(name string, configure func(t *gtk.TextTag)) *gtk.TextTag {
 		if existing := table.Lookup(name); existing != nil {
@@ -122,47 +138,59 @@ func (w *Window) ensureComposerMarkdownTags() {
 		table.Add(t)
 		return t
 	}
-	w.mdTagBold = ensureTag("glup-md-bold", func(t *gtk.TextTag) {
+	bold = ensureTag("glup-md-bold", func(t *gtk.TextTag) {
 		t.SetObjectProperty("weight", int(pango.WeightBold))
 	})
-	w.mdTagItalic = ensureTag("glup-md-italic", func(t *gtk.TextTag) {
+	italic = ensureTag("glup-md-italic", func(t *gtk.TextTag) {
 		t.SetObjectProperty("style", pango.StyleItalic)
 	})
-	w.mdTagStrike = ensureTag("glup-md-strike", func(t *gtk.TextTag) {
+	strike = ensureTag("glup-md-strike", func(t *gtk.TextTag) {
 		t.SetObjectProperty("strikethrough", true)
 	})
-	w.mdTagMono = ensureTag("glup-md-mono", func(t *gtk.TextTag) {
+	mono = ensureTag("glup-md-mono", func(t *gtk.TextTag) {
 		t.SetObjectProperty("family", "Monospace")
 		t.SetObjectProperty("background", "#787c8826")
 	})
-	w.mdTagCodeBlock = ensureTag("glup-md-codeblock", func(t *gtk.TextTag) {
+	codeBlock = ensureTag("glup-md-codeblock", func(t *gtk.TextTag) {
 		t.SetObjectProperty("family", "Monospace")
 		t.SetObjectProperty("paragraph-background", "#787c8818")
 	})
+	if buf == w.inputBuffer {
+		w.mdTagBold = bold
+		w.mdTagItalic = italic
+		w.mdTagStrike = strike
+		w.mdTagMono = mono
+		w.mdTagCodeBlock = codeBlock
+	}
+	return bold, italic, strike, mono, codeBlock
 }
 
 func (w *Window) applyComposerMarkdownHighlighting() {
-	if w.inputBuffer == nil {
+	w.applyComposerMarkdownHighlightingToBuffer(w.inputBuffer)
+}
+
+func (w *Window) applyComposerMarkdownHighlightingToBuffer(buf *gtksource.Buffer) {
+	if buf == nil {
 		return
 	}
-	w.ensureComposerMarkdownTags()
-	start, end := w.inputBuffer.Bounds()
+	bold, italic, strike, mono, codeBlock := w.ensureBufferMarkdownTags(buf)
+	start, end := buf.Bounds()
 	if start == nil || end == nil {
 		return
 	}
 	for _, tag := range []*gtk.TextTag{
-		w.mdTagBold,
-		w.mdTagItalic,
-		w.mdTagStrike,
-		w.mdTagMono,
-		w.mdTagCodeBlock,
+		bold,
+		italic,
+		strike,
+		mono,
+		codeBlock,
 	} {
 		if tag != nil {
-			w.inputBuffer.RemoveTag(tag, start, end)
+			buf.RemoveTag(tag, start, end)
 		}
 	}
 
-	text := w.inputBuffer.Text(start, end, false)
+	text := buf.Text(start, end, false)
 	if text == "" || len(text) > composerMarkdownMaxBytes {
 		return
 	}
@@ -171,23 +199,23 @@ func (w *Window) applyComposerMarkdownHighlighting() {
 		var tag *gtk.TextTag
 		switch sp.kind {
 		case mdSpanBold:
-			tag = w.mdTagBold
+			tag = bold
 		case mdSpanItalic:
-			tag = w.mdTagItalic
+			tag = italic
 		case mdSpanStrike:
-			tag = w.mdTagStrike
+			tag = strike
 		case mdSpanMono:
-			tag = w.mdTagMono
+			tag = mono
 		case mdSpanCodeBlock:
-			tag = w.mdTagCodeBlock
+			tag = codeBlock
 		}
 		if tag == nil {
 			continue
 		}
-		sIter := w.inputBuffer.IterAtOffset(sp.start)
-		eIter := w.inputBuffer.IterAtOffset(sp.end)
+		sIter := buf.IterAtOffset(sp.start)
+		eIter := buf.IterAtOffset(sp.end)
 		if sIter != nil && eIter != nil {
-			w.inputBuffer.ApplyTag(tag, sIter, eIter)
+			buf.ApplyTag(tag, sIter, eIter)
 		}
 	}
 }

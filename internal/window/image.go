@@ -15,9 +15,17 @@ import (
 	"github.com/diamondburned/gotkit/app"
 )
 
-// decodeBase64Texture decodes a base64-encoded image (with or without data URI prefix)
-// into a GdkTexture.
-func decodeBase64Texture(data string) (*gdk.Texture, error) {
+// decodeTextureBytes decodes raw image bytes into a GdkTexture.
+func decodeTextureBytes(rawBytes []byte) (*gdk.Texture, error) {
+	if len(rawBytes) == 0 {
+		return nil, fmt.Errorf("empty image bytes")
+	}
+	bytes := glib.NewBytesWithGo(rawBytes)
+	return gdk.NewTextureFromBytes(bytes)
+}
+
+// decodeBase64Bytes decodes a base64-encoded payload (with or without data URI prefix).
+func decodeBase64Bytes(data string) ([]byte, error) {
 	if idx := strings.Index(data, ","); idx != -1 && strings.HasPrefix(data, "data:") {
 		data = data[idx+1:]
 	}
@@ -37,8 +45,17 @@ func decodeBase64Texture(data string) (*gdk.Texture, error) {
 			return nil, fmt.Errorf("decode base64 image: %w", err)
 		}
 	}
-	bytes := glib.NewBytesWithGo(rawBytes)
-	return gdk.NewTextureFromBytes(bytes)
+	return rawBytes, nil
+}
+
+// decodeBase64Texture decodes a base64-encoded image (with or without data URI prefix)
+// into a GdkTexture.
+func decodeBase64Texture(data string) (*gdk.Texture, error) {
+	rawBytes, err := decodeBase64Bytes(data)
+	if err != nil {
+		return nil, err
+	}
+	return decodeTextureBytes(rawBytes)
 }
 
 // decodeImageTexture decodes an image from base64, data URI, file:// URI, or local file path.
