@@ -280,6 +280,7 @@ func (w *Window) loadState() {
 	w.greeterProfile = st.Greeter
 	w.prefs = st.Preferences
 	w.applySidebarWidth()
+	w.syncSidebarBreakpoint()
 }
 
 func (w *Window) saveState() {

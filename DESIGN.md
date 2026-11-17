@@ -1,81 +1,84 @@
 # Gluppencode
 
-A GTK4 + Libadwaita frontend for OpenCode V2 written in Go with `gotk4`.
+A GTK4 + Libadwaita + GtkSourceView5 desktop frontend for OpenCode V2 written in Go with `gotk4`.
 
 ## Requirements
 
 The following requirements serve as the design source of truth for Gluppencode:
 
-1. **Global Tabs via `AdwViewStack`**:
-   - Global session tabs across all projects within the same window using [`AdwViewStack`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.ViewStack.html).
-   - Users can choose between:
-     - **Vertical tabs**: [`AdwViewSwitcherSidebar`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.ViewSwitcherSidebar.html), grouping sessions into project sections (`starts-section` and `section-title`). Project headers display a `folder-symbolic` icon to the left of the project name (`filepath.Base(dir)`) in a horizontal box (`spacing: 8`) with a tooltip indicating the shortened path, separated by subtle horizontal dividers. Conversation rows underneath are subtly indented (`margin-left: 14px`). Always chosen over horizontal tabs on mobile/narrow widths; on desktop, can be collapsed/hidden via the top-left button in the sidebar/headerbar.
-     - **Per-Project Conversation Limits**: Max 5 conversations displayed per project section by default (sorted newest-first). If a project contains more than 5 conversations, a clickable `"Show N more…"` footer button expands all conversations for that project. The currently viewed conversation is always displayed even if it sits beyond the top 5 while collapsed.
-     - **Horizontal tabs**: [`AdwViewSwitcher`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.ViewSwitcher.html) in the header bar.
-   - Tab pages do not use tab icons (`icon-name` unset).
-   - Right side of each view switcher item contains a dynamic status indicator:
-     - An active working spinner (`AdwSpinner`) while a session is actively streaming or executing tools.
-     - A compact relative timemark (e.g. `"now"`, `"2m"`, `"1h"`, `"3d"`, `"2w"`) indicating last updated time when the session is idle and unfocused (hidden when the tab is currently focused).
-     - Numeric badges are kept cleared (`SetBadgeNumber(0)`) to avoid duplicate badge clutter.
-   - `needs-attention` indicators highlight unfocused tabs when background activity occurs.
+1. **Sidebar, Global Tabs & Window Lifecycle**:
+   - Global root-session tabs across all projects within the same window using [`AdwViewStack`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.ViewStack.html) inside an [`AdwOverlaySplitView`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.OverlaySplitView.html).
+   - **Resizable Project-Grouped Sidebar**:
+     - Custom `GtkListBox` (`sidebarList`) in the split-view sidebar, drag-resizable on desktop (`sidebarResizeHandle`, clamped to `180–600px`, persisted as `sidebarWidth`), pinned side-by-side when wide (no hide button), and collapsed into an overlay with headerbar toggle buttons via a dynamic `AdwBreakpoint` (`max(600px, sidebarWidth*2)`) on narrow screens.
+     - Sessions are grouped under project section headers (collapse chevron, `folder-symbolic`, basename title, shortened path subtitle, collapsed count, hover `+` New Session button, and subtle separator) supporting drag-and-drop project reordering (`projectOrder`), collapse/expand state (`collapsedProjects`), and a project context menu (New Session, Open in Files, Copy Path, Collapse/Expand Project, Archive Project).
+     - Conversation rows sit indented beneath their project header with hover close/archive actions.
+   - **Per-Project Conversation Limits**:
+     - Configurable max visible conversations per project (default `5`, range `1–50` via Preferences `MaxVisibleSessions`), sorted newest-first.
+     - Projects exceeding the limit render a clickable `"Show N more…"` footer row to expand all sessions; the currently active session remains visible even if outside the top N.
+   - **Dynamic Tab Status & Attention Indicators**:
+     - Right side of each conversation row displays an `AdwSpinner` while streaming or executing tools, an attention/pending-input indicator when unfocused tabs finish or await user input (`needs-attention`), or a compact relative timemark (`"now"`, `"2m"`, `"1h"`, `"3d"`, `"2w"`) when idle and unfocused.
+     - Window title reflects the active session and global unread attention count; desktop notifications (`gio.Notification`) support click-to-focus (`app.open-session`) and automatic withdrawal when the window/tab becomes active.
+   - **Inactive Tab Suspension**:
+     - Idle, unvisited root tabs (`tabSuspendAfter = 5m`) are skipped by reconnect resyncs and background directory sweeps so the server does not wake inactive workspaces unnecessarily; visiting the tab or receiving a live SSE event wakes it immediately.
+   - **Offline Screen**:
+     - Connection failures transition `windowStack` to an `AdwStatusPage` offline view with error details and a "Retry Connection" action.
 
-2. **Fuzzy Session Search (`Ctrl+K`)**:
-   - Sidebar header includes a dedicated search button (`searchSessionsBtn`) and global `Ctrl+K` shortcut.
-   - Opens a modal dialog with a `GtkSearchEntry` and scrollable `boxed-list` querying across up to 200 sessions.
-   - Token-based and subsequence fuzzy matching with scoring bonuses for word boundaries and recent activity.
-   - Activating a search result immediately switches to the session and ensures it is displayed in the sidebar.
+2. **Fuzzy Session & Project Search (`Ctrl+K`)**:
+   - Sidebar header includes a search button (`searchSessionsBtn`) on the left and main menu (`appMenuSidebarBtn`: Preferences, MCP Servers, About) on the right, with `Ctrl+K` bound globally for search.
+   - Opens a modal dialog with a `GtkSearchEntry` querying recent sessions (`ListSessions`) plus live server session search (`SearchSessions`), known project directories, and matching filesystem paths (`matchFilesystemDirs`).
+   - Uses token-based, substring, and subsequence fuzzy matching (`fuzzyMatchScore`) with bonuses for word boundaries, consecutive characters, and active status.
+   - Activating a session switches to it immediately (unarchiving/revealing it in the sidebar if needed); activating a directory starts a new session there.
 
-3. **Material Icons**:
-   - Bundle Material symbolic SVG icons via `glib-compile-resources` into an embedded `GResource` (`internal/icons`), following Dissent's pattern.
+3. **Material Icons & Embedded Assets**:
+   - Bundle Material symbolic action SVGs, app icons (`so.libdb.gluppencode`), and assets via `glib-compile-resources` into an embedded `GResource` (`internal/icons`), exposed on the display icon theme path `/so/libdb/gluppencode/icons`.
 
-4. **Antigravity-Style 2-Row Composer, Status Bar & Active Background Shells**:
-   - 2-row composer card (`glup-composer-frame`) and persistent native Libadwaita bottom bar (`statusBarBox`):
-     - **Composer frame**:
-       - Top row: `GtkSourceView` text view with subtle placeholder (`Ask anything, @ to mention, / for actions`) that hides on text entry.
-       - Bottom controls row: `+` attach button (`list-add-symbolic`), flat `^ <Agent>` and `^ <Model>` menu buttons opening dedicated `GtkPopover`s (`agentPopover` and `modelPopover`, positioned above the composer with search filtering and top-6 recent models), and 32x32 circular Send / Stop action buttons.
-     - **Bottom status bar**:
-       - Left side: Separate `.glup-status-chip` pills for the project directory (`folder-symbolic` + `<project>`) and cached Git branch (`git-branch-symbolic` + `<branch>`, visible when inside a Git repository), resolving from `.git/HEAD` or worktree pointer files.
-       - Right side: Active background shells chip (`terminal-symbolic` + `N shells`, green chip in system UI font, shown only when running shells > 0), active subagents counter (`arrow-downward-symbolic` + `N subagents`), live tokens-per-second status chip, and context usage (`xxxK`).
-   - Clicking the bottom bar opens [`AdwBottomSheet`](https://gnome.pages.gitlab.gnome.org/libadwaita/doc/1-latest/class.BottomSheet.html) strictly for bottom-bar runtime details:
-     - Drag handle sits cleanly at the top of the sheet without headerbar label collision.
-     - **Active background shells list**: queries `/api/shell` and listens to `shell.created`, `shell.exited`, `shell.deleted` SSE events, showing command, PID, and a Stop button (`DELETE /api/shell/{id}`).
-     - **Active subagents list**: displays only currently active/running subagents (succeeded or failed subagents are filtered out). When viewing a subagent, the section remains accessible to provide a "Back to Main Conversation" button.
-   - When viewing a subagent conversation:
-     - Top headerbar shows breadcrumb navigation (`Main Conv > Subagent Conv`), where clicking `Main Conv` navigates back to the parent conversation.
-     - Sidebar continues to highlight the main conversation.
+4. **Antigravity-Style Composer, Status Bar & Bottom Sheet**:
+   - **Floating Composer Card (`.glup-composer-frame`)**:
+     - Floats over the bottom of the timeline inside a `GtkOverlay`, paired with a dynamic bottom fade ramp (`timelineBottomFade`) and bottom scroll inset (`applyComposerInset`).
+     - Attachment tray (`AdwWrapBox`) for pending image attachments (file chooser or `Ctrl+V` clipboard paste).
+     - `GtkSourceView` (`inputView`) with placeholder (`Ask anything, @ to mention, / for actions`), live client-side Markdown span highlighting, multiline expand/collapse toggle (`composerExpandBtn`), Up/Down input history, and `GtkSourceCompletion` popups for `/` commands (built-in + server) and `@` mentions (skills, agents, workspace files).
+     - Bottom controls row: `+` attach button, flat `^ <Agent>` and searchable `^ <Model>` popovers (positioned above the composer with recent/filtered models), expand button, and circular Send / Stop action buttons.
+     - Supports configurable `Enter` vs `Ctrl+Enter` send mode, immediate **Steer** (`Ctrl+Enter`) vs **Queue** (`Enter`) delivery (`opencode.InboxDelivery`), drag-and-drop queue reordering, and built-in slash commands (`/undo`, `/redo`, `/new`, `/cd`, `/compact`, `/mcp` / `/mcps`).
+   - **Persistent Bottom Status Bar (`statusBarBox`)**:
+     - Left chips (`.glup-status-chip`): project directory (`folder-symbolic`), cached Git branch (`git-branch-symbolic`, resolved locally from `.git/HEAD` or worktree pointers), and MCP summary (`bolt-symbolic`).
+     - Right chips: `Ctrl+B to background` action chip (appears after 5s of blocking foreground shell/subagent execution), active background shells (`terminal-symbolic` + `N shells`), active subagents (`arrow-downward-symbolic` + `N subagents`), live tokens-per-second rate, and context usage (`xxxK`).
+   - **Bottom Sheet (`AdwBottomSheet` + `AdwNavigationView`)**:
+     - Clicking the status bar (or pressing `Ctrl+Shift+M` for MCP) opens the bottom sheet containing:
+       - **Active Shells**: queries `/api/shell` and tracks `shell.*` SSE events, showing command, PID, live tail output, and Stop action.
+       - **Active Subagents**: lists currently running subagents (clicking navigates into the subagent timeline) and provides "Back to Main Conversation" when viewing a subagent.
+       - **MCP Servers (`mcpManager`)**: per-directory MCP server status/config, search filter, connect/disconnect/refresh, navigation detail page (`AdwNavigationPage`) with resources/templates, live log tailing (`McpLogTailer`), and integration OAuth dialog (`mcpOAuthDialog`).
+       - **Session & Context**: copyable conversation ID and token/cost/model metadata grid.
+   - **Headerbar Subagent Breadcrumbs & Take Charge**:
+     - Viewing a subagent switches `headerTitleStack` to `Main Conv > Subagent Conv` breadcrumbs while the sidebar keeps the parent root session highlighted.
+     - Headerbar includes a `Take Charge` toggle (`takeChargeBtn`) that autonomously answers incoming `FormInfo` questions using a configurable directive and auto-approves `PermissionRequest` prompts (`Allow Once`) while away, plus a `New Window` button (`Ctrl+Shift+N`), `Refresh`, and session rename popover.
 
-5. **GtkBuilder `.ui` Files**:
-   - Define widget hierarchies declaratively in embedded `.ui` XML files (`//go:embed *.ui` + `gtk.NewBuilderFromString`), matching Dissent's convention.
+5. **GtkBuilder `.ui` Files & Styling**:
+   - Define widget hierarchies declaratively in embedded `.ui` XML files (`window.ui`, `message.ui`, `tool.ui`) and application CSS in `style.css`.
 
 6. **Minimal Forum-Style Linear Flow & Tight Density**:
-   - Display the conversation as a single linear, high-density flow.
-   - System fonts used everywhere across UI labels, reserving monospace strictly for tool bodies, diffs, and code blocks.
-   - User messages rendered inside distinct card boxes (`.glup-user-card`) without author labels, featuring a subtle corner Undo button (`edit-undo-symbolic`, `.glup-user-undo-btn`, `opacity: 0.5` default, `1.0` on hover) in the bottom-right corner overlay with right text margin to prevent text overlap.
-   - Assistant turns rendered cleanly inline without author/model headers or divider borders.
-   - Consecutive tool calls stack tightly with 1px vertical spacing.
-   - Thinking blocks displayed as subtle left blockquotes (`.glup-reasoning-inline`) without `"thinking"` headers.
-   - Prettier OpenCode Web UI-inspired tool call formatting:
-     - Clear titles, subtitles, and badges (`+N -M` diff lines, `lines X–Y` for reads, code execution subtitles).
-     - Inline unified diffs and output files without duplicate raw JSON dumps.
-     - Direct "View Session →" action button for subagents and continuation calls.
-   - Compaction dividers (`──── Compaction · X in · Y out ────`) with inline markdown summaries.
-   - Synthetic completion rows:
-     - Subagents: `↳ <Agent> finished · <Description>` with a "View Session →" button and expandable response text.
-     - Shells: `↳ Shell finished · <Command>` with a `terminal-symbolic` icon and expandable command output.
-   - Agent-switched timeline notices.
-   - Lazy scroll-up history pagination (`ListMessagesPage`, 50 messages/page, scroll locking at top) and automatic tail reconciliation on live SSE execution events.
+   - Single linear, high-density conversation flow inside `adw.Clamp` (configurable `ChatWidth`, default `920px`).
+   - System fonts across UI labels, reserving monospace strictly for tool bodies, diffs, and code blocks.
+   - **Empty Greeter (`GreeterWidget`)**: personalized greeting card (`GreeterProfile` cached in state and refreshed asynchronously) with clickable starter prompt chips when a session has no messages.
+   - **User & Queued Prompt Cards (`.glup-user-card`)**: distinct cards without author labels, featuring corner Undo/Revert (`edit-undo-symbolic`) on delivered messages, Steer and Cancel controls on queued prompts, and drag-to-reorder support.
+   - **Assistant Turns & Tools**: inline reasoning blockquotes (`.glup-reasoning-inline`), streaming Markdown blocks, and tightly stacked `ToolWidget`s with title/subtitle/badges (`+N -M`, `lines X–Y`), inline diffs (truncated to `DiffTruncationLines`), lazy `read` bodies, live scrollable shell output, and "View Session →" buttons for subagents.
+   - **Timeline Controls & Notices**: `RevertBannerWidget` (reverted count, rolled-back file diffs, and Redo button for staged `/undo`), compaction dividers with inline summaries, synthetic subagent/shell completion rows (`SyntheticSubagentWidget`), system/agent/model/location notices, and turn duration labels.
+   - **Inline Interactive Prompts**: multi-step `QuestionFormWidget` for server `FormInfo` requests and `PermissionPromptWidget` (`Deny`, `Allow Once`, `Always Allow`).
+   - **History Pagination & Reconciliation**: lazy scroll-up history pagination (`ListMessagesPage`, 50 messages/page with `autoscroll.Window.LockScroll()`), live tail reconciliation (`reconcileTail`), and SSE reconnect resync (`resyncOnReconnect`).
 
 7. **Inline Images & Lightbox Image Viewer**:
-   - User-attached images and tool output files render as clickable inline `84×84` square thumbnails (`.glup-image-thumb`) stacked horizontally side-by-side.
-   - Clicking any thumbnail opens the modal Lightbox Image Viewer window featuring fit-to-window or 1:1 view toggle, "Copy Image to Clipboard", and Escape-to-close.
+   - User-attached images and tool output images render as clickable `64×64` square thumbnails (`.glup-image-thumb`).
+   - Clicking any thumbnail opens the modal Lightbox Image Viewer (`showImageViewer`) with 1:1 / Fit-to-window toggle, "Copy Image to Clipboard", and Escape-to-close.
 
-8. **Multi-Window Support**:
-   - Running `./gluppencode` multiple times or clicking the "New Window" button in the headerbar (or pressing `Ctrl+Shift+N`) spawns an independent top-level window.
-   - Each window maintains its own cancellable context, cleanly terminating background tickers and SSE event listeners upon window close without affecting other windows.
+8. **Multi-Window Support, State & Preferences**:
+   - Spawning multiple instances or pressing `Ctrl+Shift+N` opens independent top-level windows, each with its own cancellable context terminating background tickers and SSE loops on close.
+   - Multi-window `notificationCoordinator` (`notifications.go`) syncs preference changes and desktop notifications across open windows.
+   - Atomic JSON persistence (`state.go`) stores visible/archived sessions, collapsed/ordered projects, sidebar width, input history, greeter profile, and user preferences (`$GLUPPENCODE_STATE_FILE` or `$XDG_DATA_HOME/opencode/gluppencode.json`), alongside per-session draft directories (`gluppencode/drafts/<sessionID>/` in `draft.go`).
+   - `adw.PreferencesDialog` (`preferences.go`) configures chat width, max visible sessions, color scheme, `GtkSourceView` / Chroma syntax theme, shell tail lines, diff truncation lines, `Ctrl+Enter` send mode, Take Charge directive, greeter overrides, notifications, and server URL override.
 
-9. **Prefix-Cached & Batched Streaming Markdown**:
+9. **Prefix-Cached & Batched Streaming Markdown (`internal/mdstream`)**:
    - Avoid re-parsing and re-rendering the entire message on every streamed token.
-   - Batch incoming token deltas per conversation in a background goroutine (~30–40ms tick), parse off the GTK main thread, and incrementally commit stable block prefixes while only updating the active tail block on the GTK thread.
+   - Coalesce incoming token deltas per conversation (~35ms `Streamer` tick), parse uncommitted suffix blocks with `goldmark` off the GTK main thread, and incrementally append frozen `Committed` block widgets while replacing only the active `Tail` block widget on the GTK thread.
+   - Supports Chroma-highlighted `CodeBlock`s, `TableGrid`s, `ListBlock`s, `InlineBlock` link icons, and async `ses_...` session ID title resolution with clickable links.
 
-10. **Development Harness (`.draft/`)**:
-    - Headless UI testing and inspection harness using `gtk4-broadwayd` + Chrome DevTools MCP in `.draft/`.
+10. **Development & E2E Harness (`.draft/`)**:
+    - Headless UI testing and inspection harness using `opencode serve` + `gtk4-broadwayd` + `gluppencode` in `.draft/e2e-harness.sh` (and `.draft/broadway-run.sh`), plus Chrome DevTools recipes in `.draft/chrome-recipes/`.

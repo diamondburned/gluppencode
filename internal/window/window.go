@@ -686,6 +686,7 @@ type Window struct {
 	client *opencode.Client
 
 	rootContent         *adw.OverlaySplitView
+	sidebarBreakpoint   *adw.Breakpoint
 	windowStack         *gtk.Stack
 	offlineView         *adw.ToolbarView
 	offlineStatus       *adw.StatusPage
@@ -703,8 +704,6 @@ type Window struct {
 
 	bottomSheet           *adw.BottomSheet
 	showSidebarBtn        *gtk.Button
-	appMenuTopBtn         *gtk.MenuButton
-	searchSessionsTopBtn  *gtk.Button
 	headerTitleStack      *gtk.Stack
 	windowTitleBtn        *gtk.MenuButton
 	windowTitle           *adw.WindowTitle
@@ -906,7 +905,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	a := app.FromContext(ctx)
 	adwWin := adw.NewApplicationWindow(a.Application)
 	adwWin.SetTitle("gluppencode")
-	adwWin.SetSizeRequest(720, 560)
+	adwWin.SetSizeRequest(360, 480)
 	adwWin.SetDefaultSize(1180, 780)
 
 	winCtx, cancel := context.WithCancel(ctx)
@@ -931,8 +930,6 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		sidebarList:           builder.GetObject("sidebarList").Cast().(*gtk.ListBox),
 		bottomSheet:           builder.GetObject("bottomSheet").Cast().(*adw.BottomSheet),
 		showSidebarBtn:        builder.GetObject("showSidebarBtn").Cast().(*gtk.Button),
-		appMenuTopBtn:         builder.GetObject("appMenuTopBtn").Cast().(*gtk.MenuButton),
-		searchSessionsTopBtn:  builder.GetObject("searchSessionsTopBtn").Cast().(*gtk.Button),
 		headerTitleStack:      builder.GetObject("headerTitleStack").Cast().(*gtk.Stack),
 		windowTitleBtn:        builder.GetObject("windowTitleBtn").Cast().(*gtk.MenuButton),
 		windowTitle:           builder.GetObject("windowTitle").Cast().(*adw.WindowTitle),
@@ -1140,10 +1137,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	w.setupSidebarResize()
 
-	// Mobile adaptive breakpoint: collapse sidebar into overlay on narrow screens.
-	bp := adw.NewBreakpoint(adw.BreakpointConditionParse("max-width: 680sp"))
-	bp.AddSetter(w.rootContent, "collapsed", true)
-	adwWin.AddBreakpoint(bp)
+	// Mobile adaptive breakpoint: collapse sidebar into overlay on narrow screens (max(600px, sidebar_width*2)).
+	w.sidebarBreakpoint = adw.NewBreakpoint(adw.BreakpointConditionParse(fmt.Sprintf("max-width: %dpx", w.sidebarBreakpointWidth())))
+	w.sidebarBreakpoint.AddSetter(w.rootContent, "collapsed", true)
+	adwWin.AddBreakpoint(w.sidebarBreakpoint)
 
 	adwWin.NotifyProperty("is-active", func() {
 		if adwWin.IsActive() {
@@ -1186,9 +1183,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.renameSessionEntry.ConnectActivate(w.submitRenameSession)
 	w.renameSessionSaveBtn.ConnectClicked(w.submitRenameSession)
 	w.searchSessionsBtn.ConnectClicked(w.openSessionSearchDialog)
-	w.searchSessionsTopBtn.ConnectClicked(w.openSessionSearchDialog)
 	w.setupAppMenuButton(w.appMenuSidebarBtn)
-	w.setupAppMenuButton(w.appMenuTopBtn)
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
 	w.refreshBtn.ConnectClicked(w.loadAll)
 	w.takeChargeBtn.ConnectToggled(func() {
@@ -2912,21 +2907,33 @@ func (w *Window) syncNavigationChrome() {
 		}
 	}
 	if w.rootContent != nil {
-		sidebarVisible := w.rootContent.ShowSidebar() && !w.rootContent.Collapsed()
+		collapsed := w.rootContent.Collapsed()
+		if !collapsed && !w.rootContent.ShowSidebar() {
+			w.rootContent.SetShowSidebar(true)
+		}
+		if w.hideSidebarBtn != nil {
+			w.hideSidebarBtn.SetVisible(collapsed)
+		}
 		if w.showSidebarBtn != nil {
-			w.showSidebarBtn.SetVisible(!sidebarVisible)
-		}
-		if w.appMenuTopBtn != nil {
-			w.appMenuTopBtn.SetVisible(!sidebarVisible)
-		}
-		if w.searchSessionsTopBtn != nil {
-			w.searchSessionsTopBtn.SetVisible(!sidebarVisible)
+			w.showSidebarBtn.SetVisible(collapsed)
 		}
 		if w.sidebarResizeHandle != nil {
-			w.sidebarResizeHandle.SetVisible(!w.rootContent.Collapsed())
+			w.sidebarResizeHandle.SetVisible(!collapsed)
 		}
 		w.applySidebarWidth()
 	}
+}
+
+func (w *Window) sidebarBreakpointWidth() int {
+	width := cmp.Or(clampSidebarWidth(w.sidebarWidth), defaultSidebarWidth)
+	return max(600, width*2)
+}
+
+func (w *Window) syncSidebarBreakpoint() {
+	if w.sidebarBreakpoint == nil {
+		return
+	}
+	w.sidebarBreakpoint.SetCondition(adw.BreakpointConditionParse(fmt.Sprintf("max-width: %dpx", w.sidebarBreakpointWidth())))
 }
 
 func (w *Window) applySidebarWidth() {
@@ -2941,6 +2948,11 @@ func (w *Window) applySidebarWidth() {
 		return
 	}
 	width := cmp.Or(clampSidebarWidth(w.sidebarWidth), defaultSidebarWidth)
+	if totalW := w.rootContent.Width(); totalW > minSidebarWidth*2 {
+		if maxW := (totalW - 1) / 2; width > maxW && maxW >= minSidebarWidth {
+			width = maxW
+		}
+	}
 	w.rootContent.SetSidebarWidthUnit(adw.LengthUnitPx)
 	w.rootContent.SetMinSidebarWidth(float64(width))
 	w.rootContent.SetMaxSidebarWidth(float64(width))
@@ -2953,7 +2965,7 @@ func (w *Window) setDesktopSidebarWidth(width int) {
 	}
 	if w.rootContent != nil {
 		if totalW := w.rootContent.Width(); totalW > minSidebarWidth*2 {
-			if maxW := totalW / 2; clamped > maxW && maxW >= minSidebarWidth {
+			if maxW := (totalW - 1) / 2; clamped > maxW && maxW >= minSidebarWidth {
 				clamped = maxW
 			}
 		}
@@ -2963,6 +2975,9 @@ func (w *Window) setDesktopSidebarWidth(width int) {
 	}
 	w.sidebarWidth = clamped
 	w.applySidebarWidth()
+	if !w.resizingSidebar {
+		w.syncSidebarBreakpoint()
+	}
 }
 
 func (w *Window) setupSidebarResize() {
@@ -3018,6 +3033,7 @@ func (w *Window) setupSidebarResize() {
 		}
 		w.resizingSidebar = false
 		w.sidebarResizeHandle.RemoveCSSClass("dragging")
+		w.syncSidebarBreakpoint()
 		w.saveState()
 	})
 	w.rootContent.AddController(drag)

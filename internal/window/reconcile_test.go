@@ -3925,25 +3925,49 @@ func TestProjectHeaderPlusButtonAndContextMenu(t *testing.T) {
 		t.Fatalf("expected Archive Project in popover menu to archive all project sessions, got %+v", win.archivedSessions)
 	}
 
-	// 3. App menu button setup attaches a popover menu and syncNavigationChrome toggles appMenuTopBtn and searchSessionsTopBtn with sidebar visibility.
+	// 3. App menu button setup attaches a popover menu, window.ui keeps toggle buttons hidden initially
+	// and removes duplicate top-bar search/menu buttons, and syncNavigationChrome only shows sidebar
+	// toggle buttons when collapsed.
+	b := gtk.NewBuilderFromString(windowUI)
+	uiHideBtn := b.GetObject("hideSidebarBtn").Cast().(*gtk.Button)
+	uiSearchBtn := b.GetObject("searchSessionsBtn").Cast().(*gtk.Button)
+	uiMenuBtn := b.GetObject("appMenuSidebarBtn").Cast().(*gtk.MenuButton)
+	uiShowBtn := b.GetObject("showSidebarBtn").Cast().(*gtk.Button)
+	if uiSearchBtn == nil || uiMenuBtn == nil {
+		t.Fatalf("expected searchSessionsBtn and appMenuSidebarBtn in sidebarHeader")
+	}
+	if uiHideBtn.Visible() || uiShowBtn.Visible() {
+		t.Fatalf("expected hideSidebarBtn and showSidebarBtn to start hidden in window.ui")
+	}
+	if b.GetObject("appMenuTopBtn") != nil || b.GetObject("searchSessionsTopBtn") != nil {
+		t.Fatalf("expected duplicate appMenuTopBtn and searchSessionsTopBtn to be removed from contentHeader")
+	}
+
 	menuBtn := gtk.NewMenuButton()
 	win.setupAppMenuButton(menuBtn)
 	if menuBtn.Popover() == nil {
 		t.Fatalf("expected setupAppMenuButton to attach a popover to menuBtn")
 	}
 	win.rootContent = adw.NewOverlaySplitView()
+	win.hideSidebarBtn = gtk.NewButton()
 	win.showSidebarBtn = gtk.NewButton()
-	win.appMenuTopBtn = gtk.NewMenuButton()
-	win.searchSessionsTopBtn = gtk.NewButton()
-	win.rootContent.SetShowSidebar(true)
+	win.rootContent.SetCollapsed(false)
 	win.syncNavigationChrome()
-	if win.appMenuTopBtn.Visible() || win.searchSessionsTopBtn.Visible() {
-		t.Fatalf("expected appMenuTopBtn and searchSessionsTopBtn to be hidden when sidebar is visible")
+	if win.hideSidebarBtn.Visible() || win.showSidebarBtn.Visible() {
+		t.Fatalf("expected hideSidebarBtn and showSidebarBtn to be hidden when uncollapsed")
 	}
-	win.rootContent.SetShowSidebar(false)
+	if !win.rootContent.ShowSidebar() {
+		t.Fatalf("expected sidebar to stay shown when uncollapsed")
+	}
+	win.rootContent.SetCollapsed(true)
 	win.syncNavigationChrome()
-	if !win.appMenuTopBtn.Visible() || !win.searchSessionsTopBtn.Visible() {
-		t.Fatalf("expected appMenuTopBtn and searchSessionsTopBtn to be visible when sidebar is hidden")
+	if !win.hideSidebarBtn.Visible() || !win.showSidebarBtn.Visible() {
+		t.Fatalf("expected hideSidebarBtn and showSidebarBtn to be visible when collapsed")
+	}
+	win.rootContent.SetCollapsed(false)
+	win.syncNavigationChrome()
+	if win.hideSidebarBtn.Visible() || win.showSidebarBtn.Visible() {
+		t.Fatalf("expected hideSidebarBtn and showSidebarBtn to be hidden after uncollapsing")
 	}
 
 	// 4. Unified search (matchAndSortSearchItems) matches sessions, known projects, and filesystem paths.
@@ -3982,13 +4006,27 @@ func TestProjectHeaderPlusButtonAndContextMenu(t *testing.T) {
 	// 5. applySidebarWidth pins both min and max sidebar width to the exact pixel width when uncollapsed,
 	// and rebuildShellList ellipsizes background shell output labels so long lines cannot inflate bottomSheet.
 	win.sidebarWidth = 0
+	win.sidebarBreakpoint = adw.NewBreakpoint(adw.BreakpointConditionParse("max-width: 600px"))
 	win.applySidebarWidth()
+	win.syncSidebarBreakpoint()
 	if gotMin, gotMax := win.rootContent.MinSidebarWidth(), win.rootContent.MaxSidebarWidth(); gotMin != defaultSidebarWidth || gotMax != defaultSidebarWidth {
 		t.Fatalf("applySidebarWidth() with 0 width: min=%v max=%v, want %v", gotMin, gotMax, defaultSidebarWidth)
+	}
+	if gotBP := win.sidebarBreakpointWidth(); gotBP != 600 {
+		t.Fatalf("sidebarBreakpointWidth() with default width = %d, want 600", gotBP)
+	}
+	if gotCond := win.sidebarBreakpoint.Condition().String(); gotCond != "max-width: 600px" {
+		t.Fatalf("sidebarBreakpoint.Condition() = %q, want %q", gotCond, "max-width: 600px")
 	}
 	win.setDesktopSidebarWidth(340)
 	if gotMin, gotMax := win.rootContent.MinSidebarWidth(), win.rootContent.MaxSidebarWidth(); gotMin != 340 || gotMax != 340 {
 		t.Fatalf("setDesktopSidebarWidth(340): min=%v max=%v, want 340", gotMin, gotMax)
+	}
+	if gotBP := win.sidebarBreakpointWidth(); gotBP != 680 {
+		t.Fatalf("sidebarBreakpointWidth() with 340 width = %d, want 680", gotBP)
+	}
+	if gotCond := win.sidebarBreakpoint.Condition().String(); gotCond != "max-width: 680px" {
+		t.Fatalf("sidebarBreakpoint.Condition() = %q, want %q", gotCond, "max-width: 680px")
 	}
 	delete(win.archivedSessions, "ses_existing_1")
 	win.ensureSessionTab(s1)
