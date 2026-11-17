@@ -4593,7 +4593,7 @@ func (w *Window) syncSidebar() {
 		visibleCount := 0
 		for i, tab := range g.tabs {
 			sessID := tab.main.session.ID
-			if !expanded && i >= maxVis && sessID != currentID {
+			if !expanded && i >= maxVis && sessID != currentID && !w.isTabAgentWorking(tab) {
 				continue
 			}
 			visibleCount++
@@ -4795,15 +4795,16 @@ func (w *Window) loadAll() {
 	if len(w.mcpLoadedDirs) > 0 {
 		clear(w.mcpLoadedDirs)
 	}
-	// 1. Fetch sessions & active sessions immediately in parallel
+	// 1. Fetch sessions, active sessions, and running subagent jobs immediately in parallel
 	gtkutil.Async(w.ctx, func() func() {
 		var (
 			sessions []opencode.Session
 			sessErr  error
 			active   map[string]opencode.ActiveStatus
+			jobs     []opencode.JobInfo
 			wg       sync.WaitGroup
 		)
-		wg.Add(2)
+		wg.Add(3)
 		go func() {
 			defer wg.Done()
 			sessions, sessErr = w.client.ListSessions(w.ctx, 200)
@@ -4812,7 +4813,19 @@ func (w *Window) loadAll() {
 			defer wg.Done()
 			active, _ = w.client.ActiveSessions(w.ctx)
 		}()
+		go func() {
+			defer wg.Done()
+			jobs, _ = w.client.ListJobs(w.ctx, opencode.ListJobsOptions{
+				Kind:   "subagent",
+				Status: "running",
+			})
+		}()
 		wg.Wait()
+
+		var childSessions []opencode.Session
+		if sessErr == nil {
+			sessions, childSessions = resolveStartupActiveChildren(w.ctx, w.client, sessions, active, jobs)
+		}
 
 		return func() {
 			if sessErr != nil {
@@ -4836,7 +4849,13 @@ func (w *Window) loadAll() {
 			if len(w.models) > 0 {
 				w.rebuildModelList()
 			}
-			w.populateSessionTabs(sessions, active)
+			tabsSessions := sessions
+			if len(childSessions) > 0 {
+				tabsSessions = make([]opencode.Session, 0, len(sessions)+len(childSessions))
+				tabsSessions = append(tabsSessions, sessions...)
+				tabsSessions = append(tabsSessions, childSessions...)
+			}
+			w.populateSessionTabs(tabsSessions, active)
 		}
 	})
 
@@ -4900,6 +4919,120 @@ func (w *Window) loadAll() {
 	})
 }
 
+func resolveStartupActiveChildren(
+	ctx context.Context,
+	client *opencode.Client,
+	rootSessions []opencode.Session,
+	active map[string]opencode.ActiveStatus,
+	jobs []opencode.JobInfo,
+) ([]opencode.Session, []opencode.Session) {
+	knownRoots := make(map[string]bool, len(rootSessions))
+	for _, s := range rootSessions {
+		if s.ID != "" && s.ParentID == "" {
+			knownRoots[s.ID] = true
+		}
+	}
+
+	var candidateIDs []string
+	candidateSeen := make(map[string]bool)
+	addCandidate := func(id string) {
+		if id == "" || knownRoots[id] || candidateSeen[id] {
+			return
+		}
+		candidateSeen[id] = true
+		candidateIDs = append(candidateIDs, id)
+	}
+	for id := range active {
+		addCandidate(id)
+	}
+	jobByChild := make(map[string]opencode.JobInfo)
+	for _, job := range jobs {
+		if job.Status != "" && job.Status != "running" {
+			continue
+		}
+		if job.ChildSessionID != "" {
+			jobByChild[job.ChildSessionID] = job
+			addCandidate(job.ChildSessionID)
+		}
+	}
+
+	if len(candidateIDs) == 0 {
+		return rootSessions, nil
+	}
+
+	fetched := make(map[string]opencode.Session)
+	if client != nil {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 8)
+		for _, id := range candidateIDs {
+			wg.Add(1)
+			go func(startID string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+
+				curID := startID
+				visited := make(map[string]bool)
+				for range 8 {
+					if curID == "" || knownRoots[curID] || visited[curID] {
+						break
+					}
+					visited[curID] = true
+
+					mu.Lock()
+					existing, ok := fetched[curID]
+					mu.Unlock()
+					if ok {
+						curID = existing.ParentID
+						continue
+					}
+
+					sess, err := client.GetSession(ctx, curID)
+					if err != nil || sess == nil || sess.ID == "" {
+						break
+					}
+					mu.Lock()
+					fetched[sess.ID] = *sess
+					mu.Unlock()
+					curID = sess.ParentID
+				}
+			}(id)
+		}
+		wg.Wait()
+	}
+
+	var childSessions []opencode.Session
+	extraRootSeen := make(map[string]bool)
+	childSeen := make(map[string]bool)
+	for _, s := range fetched {
+		if s.ParentID == "" {
+			if !knownRoots[s.ID] && !extraRootSeen[s.ID] {
+				extraRootSeen[s.ID] = true
+				rootSessions = append(rootSessions, s)
+			}
+			continue
+		}
+		if !childSeen[s.ID] {
+			childSeen[s.ID] = true
+			childSessions = append(childSessions, s)
+		}
+	}
+	for childID, job := range jobByChild {
+		if knownRoots[childID] || childSeen[childID] || job.SessionID == "" {
+			continue
+		}
+		childSeen[childID] = true
+		childSessions = append(childSessions, opencode.Session{
+			ID:       childID,
+			ParentID: job.SessionID,
+			Title:    cmp.Or(job.Title, job.Description),
+			Agent:    job.Agent,
+		})
+	}
+	return rootSessions, childSessions
+}
+
 func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[string]opencode.ActiveStatus) {
 	prevSelected := w.currentRootSessionID()
 	w.populating = true
@@ -4910,12 +5043,40 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		w.archivedSessions = make(map[string]bool)
 	}
 
-	activeRootIDs := make(map[string]bool)
+	parentByID := make(map[string]string, len(sessions))
 	for _, s := range sessions {
-		if s.ParentID != "" {
-			if _, ok := active[s.ID]; ok || (s.Time.Busy > 0 && s.Time.Busy > s.Time.Idle) {
-				activeRootIDs[s.ParentID] = true
+		if s.ID != "" && s.ParentID != "" {
+			parentByID[s.ID] = s.ParentID
+		}
+	}
+	resolveRootID := func(id string) string {
+		cur := id
+		for range 16 {
+			p := parentByID[cur]
+			if p == "" {
+				return cur
 			}
+			cur = p
+		}
+		return cur
+	}
+
+	activeRootIDs := make(map[string]bool)
+	childrenByRoot := make(map[string][]opencode.Session)
+	childSeen := make(map[string]bool)
+	for _, s := range sessions {
+		if s.ParentID != "" && s.ID != "" && !childSeen[s.ID] {
+			childSeen[s.ID] = true
+			rootID := resolveRootID(s.ID)
+			if _, ok := active[s.ID]; ok {
+				if s.Outcome == "" && !s.IsRunning() {
+					s.Time.Idle = 0
+				}
+				activeRootIDs[rootID] = true
+			} else if s.IsRunning() {
+				activeRootIDs[rootID] = true
+			}
+			childrenByRoot[rootID] = append(childrenByRoot[rootID], s)
 		}
 	}
 
@@ -4999,17 +5160,22 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		dir := normalizeProjectDir(sess.Location.Directory)
 		count := projCount[dir]
 		_, isRunning := active[sess.ID]
-		if count < maxVis || sess.ID == prevSelected || isRunning || w.expandedProjects[dir] {
+		hasActiveChild := activeRootIDs[sess.ID]
+		if count < maxVis || sess.ID == prevSelected || isRunning || hasActiveChild || w.expandedProjects[dir] {
 			if firstID == "" {
 				firstID = sess.ID
 			}
 			if firstUncollapsedID == "" && !w.collapsedProjects[dir] {
 				firstUncollapsedID = sess.ID
 			}
-			w.addSessionTab(sess)
+			tab := w.addSessionTab(sess)
 			w.tabOrder = append(w.tabOrder, sess.ID)
 			if isRunning {
 				w.setConvActive(sess.ID, true)
+			}
+			for _, child := range childrenByRoot[sess.ID] {
+				w.childToRoot[child.ID] = sess.ID
+				tab.subagents = append(tab.subagents, child)
 			}
 			projCount[dir] = count + 1
 		}

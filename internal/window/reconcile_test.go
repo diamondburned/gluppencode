@@ -4337,3 +4337,172 @@ func TestTurnDurationAndScrollableInlineShellOutput(t *testing.T) {
 		t.Fatalf("expected markSyntheticTargetCompleted to populate all 25 lines in ToolWidget, got %d", len(gotLines))
 	}
 }
+
+func TestStartupUnvisitedSubagentSpinnerAndResolution(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	// 1. resolveStartupActiveChildren fetches only unknown active/job child IDs
+	// and walks nested parents up to their root sessions.
+	var listChildCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session":
+			if r.URL.Query().Get("parentID") != "null" {
+				listChildCalls.Add(1)
+			}
+			_ = json.NewEncoder(w).Encode([]opencode.Session{})
+		case "/api/session/ses_child_1":
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:       "ses_child_1",
+				ParentID: "ses_root_bg",
+				Title:    "Background Researcher",
+				Agent:    "explore",
+				Time:     opencode.SessionTime{Created: 100, Busy: 200},
+			})
+		case "/api/session/ses_grandchild_1":
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:       "ses_grandchild_1",
+				ParentID: "ses_child_mid",
+				Title:    "Nested Worker",
+				Agent:    "general",
+				Time:     opencode.SessionTime{Created: 150, Busy: 250},
+			})
+		case "/api/session/ses_child_mid":
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:       "ses_child_mid",
+				ParentID: "ses_root_bg",
+				Title:    "Mid Coordinator",
+				Agent:    "general",
+				Time:     opencode.SessionTime{Created: 120, Busy: 180, Idle: 190},
+				Outcome:  "succeeded",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	client := &opencode.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+	rootSessions := []opencode.Session{
+		{
+			ID:       "ses_root_vis",
+			Title:    "Visible Idle Session",
+			Location: opencode.Location{Directory: "/tmp/proj"},
+			Time:     opencode.SessionTime{Created: 10, Updated: 5000, Busy: 100, Idle: 200},
+		},
+		{
+			ID:       "ses_root_bg",
+			Title:    "Unvisited With Running Subagents",
+			Location: opencode.Location{Directory: "/tmp/proj"},
+			Time:     opencode.SessionTime{Created: 20, Updated: 3000, Busy: 100, Idle: 200},
+		},
+		{
+			ID:       "ses_root_job",
+			Title:    "Unvisited With Job Fallback",
+			Location: opencode.Location{Directory: "/tmp/proj"},
+			Time:     opencode.SessionTime{Created: 30, Updated: 2000, Busy: 100, Idle: 200},
+		},
+	}
+	active := map[string]opencode.ActiveStatus{
+		"ses_child_1":      {Type: "busy"},
+		"ses_grandchild_1": {Type: "busy"},
+	}
+	jobs := []opencode.JobInfo{
+		{
+			ID:             "job_1",
+			Kind:           "subagent",
+			SessionID:      "ses_root_job",
+			ChildSessionID: "ses_job_child_1",
+			Status:         "running",
+			Title:          "Fallback Subagent Job",
+			Agent:          "explore",
+		},
+	}
+
+	resolvedRoots, resolvedChildren := resolveStartupActiveChildren(t.Context(), client, rootSessions, active, jobs)
+	if len(resolvedRoots) != 3 {
+		t.Fatalf("len(resolvedRoots) = %d, want 3", len(resolvedRoots))
+	}
+	if listChildCalls.Load() != 0 {
+		t.Fatalf("unexpected ListChildSessions calls: %d", listChildCalls.Load())
+	}
+	gotChildIDs := make(map[string]string, len(resolvedChildren))
+	for _, ch := range resolvedChildren {
+		gotChildIDs[ch.ID] = ch.ParentID
+	}
+	for _, want := range []struct {
+		id     string
+		parent string
+	}{
+		{"ses_child_1", "ses_root_bg"},
+		{"ses_child_mid", "ses_root_bg"},
+		{"ses_grandchild_1", "ses_child_mid"},
+		{"ses_job_child_1", "ses_root_job"},
+	} {
+		if gotChildIDs[want.id] != want.parent {
+			t.Fatalf("resolved child %s parent = %q, want %q", want.id, gotChildIDs[want.id], want.parent)
+		}
+	}
+
+	// 2. populateSessionTabs creates unvisited tabs with running subagent spinners
+	// visible immediately without clicking, while keeping main.active = false,
+	// and maps childToRoot so subsequent SSE idle events turn the spinner off.
+	win := &Window{
+		ctx:               t.Context(),
+		statePath:         filepath.Join(t.TempDir(), "state.json"),
+		viewStack:         adw.NewViewStack(),
+		sidebarList:       gtk.NewListBox(),
+		tabs:              make(map[string]*sessionTab),
+		childToRoot:       make(map[string]string),
+		expandedProjects:  make(map[string]bool),
+		collapsedProjects: make(map[string]bool),
+		visibleSessions:   map[string]bool{"ses_root_vis": true},
+		archivedSessions:  make(map[string]bool),
+		projectSessions:   make(map[string][]opencode.Session),
+	}
+	// Make maxVisibleSessions=1 so we also verify active-subagent roots bypass maxVis truncation.
+	win.prefs.MaxVisibleSessions = 1
+
+	allForTabs := append(slices.Clone(resolvedRoots), resolvedChildren...)
+	win.populateSessionTabs(allForTabs, active)
+
+	if win.currentRootSessionID() != "ses_root_vis" {
+		t.Fatalf("currentRootSessionID() = %q, want ses_root_vis", win.currentRootSessionID())
+	}
+	bgTab := win.tabs["ses_root_bg"]
+	if bgTab == nil {
+		t.Fatalf("expected unvisited ses_root_bg tab to be created despite MaxVisibleSessions=1")
+	}
+	if bgTab.main.active {
+		t.Fatalf("expected ses_root_bg main.active = false when only child subagents are running")
+	}
+	if bgTab.sidebarIndicator == nil || bgTab.sidebarIndicator.spinner == nil {
+		t.Fatalf("expected sidebarIndicator and spinner to be built for ses_root_bg")
+	}
+	if !bgTab.sidebarIndicator.spinner.Visible() {
+		t.Fatalf("expected sidebar spinner to be visible immediately on startup for unvisited ses_root_bg with running subagents")
+	}
+	if win.childToRoot["ses_child_1"] != "ses_root_bg" || win.childToRoot["ses_grandchild_1"] != "ses_root_bg" {
+		t.Fatalf("childToRoot mappings missing for ses_root_bg children: %+v", win.childToRoot)
+	}
+
+	jobTab := win.tabs["ses_root_job"]
+	if jobTab == nil || jobTab.sidebarIndicator == nil || !jobTab.sidebarIndicator.spinner.Visible() {
+		t.Fatalf("expected unvisited ses_root_job with running subagent job to show sidebar spinner on startup")
+	}
+
+	// Simulate SSE idle for both running children of ses_root_bg before ever clicking the tab.
+	win.handleEvent(opencode.Event{
+		Type: "session.status",
+		Data: json.RawMessage(`{"sessionID":"ses_child_1","status":{"type":"idle"}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.status",
+		Data: json.RawMessage(`{"sessionID":"ses_grandchild_1","status":{"type":"idle"}}`),
+	})
+	if bgTab.sidebarIndicator.spinner.Visible() {
+		t.Fatalf("expected sidebar spinner for ses_root_bg to hide once all running subagents go idle")
+	}
+}
