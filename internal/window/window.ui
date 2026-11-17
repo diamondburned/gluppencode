@@ -474,6 +474,19 @@
                                   </object>
                                 </child>
                                 <child>
+                                  <object class="GtkButton" id="composerExpandBtn">
+                                    <property name="icon-name">unfold-more-symbolic</property>
+                                    <property name="valign">center</property>
+                                    <property name="tooltip-text">Expand Composer (Multiline Mode)</property>
+                                    <property name="focus-on-click">false</property>
+                                    <style>
+                                      <class name="flat"/>
+                                      <class name="circular"/>
+                                      <class name="glup-composer-flat-btn"/>
+                                    </style>
+                                  </object>
+                                </child>
+                                <child>
                                   <object class="GtkButton" id="sendBtn">
                                     <property name="icon-name">paper-plane-symbolic</property>
                                     <property name="valign">center</property>

@@ -242,6 +242,10 @@ func (w *Window) applySendShortcutUI() {
 	if w.sendBtn == nil {
 		return
 	}
+	if w.composerExpanded {
+		w.sendBtn.SetTooltipText("Queue Prompt (Shift+Enter) · Steer Immediately (Ctrl+Enter)")
+		return
+	}
 	if w.prefs.CtrlEnterToSend {
 		w.sendBtn.SetTooltipText("Send Message (Ctrl+Enter)")
 	} else {

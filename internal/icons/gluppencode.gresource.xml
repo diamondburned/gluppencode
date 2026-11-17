@@ -55,6 +55,8 @@
     <file preprocess="xml-stripblanks" alias="terminal-symbolic.svg">scalable/actions/terminal-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="text-x-generic-symbolic.svg">scalable/actions/document-open-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="thread-branch-symbolic.svg">scalable/actions/thread-branch-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="unfold-less-symbolic.svg">scalable/actions/unfold-less-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="unfold-more-symbolic.svg">scalable/actions/unfold-more-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="utilities-terminal-symbolic.svg">scalable/actions/terminal-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="view-more-symbolic.svg">scalable/actions/view-more-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="visibility-off-symbolic.svg">scalable/actions/visibility-off-symbolic.svg</file>

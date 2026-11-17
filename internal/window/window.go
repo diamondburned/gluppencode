@@ -726,13 +726,21 @@ type Window struct {
 	viewStack             *adw.ViewStack
 	composerClamp         *adw.Clamp
 
-	inputView      *gtksource.View
-	inputBuffer    *gtksource.Buffer
-	sendBtn        *gtk.Button
-	stopBtn        *gtk.Button
-	attachBtn      *gtk.Button
-	attachmentTray *adw.WrapBox
-	pendingFiles   []opencode.FileAttachment
+	inputView         *gtksource.View
+	inputBuffer       *gtksource.Buffer
+	inputScroll       *gtk.ScrolledWindow
+	composerExpandBtn *gtk.Button
+	composerExpanded  bool
+	mdTagBold         *gtk.TextTag
+	mdTagItalic       *gtk.TextTag
+	mdTagStrike       *gtk.TextTag
+	mdTagMono         *gtk.TextTag
+	mdTagCodeBlock    *gtk.TextTag
+	sendBtn                *gtk.Button
+	stopBtn                *gtk.Button
+	attachBtn              *gtk.Button
+	attachmentTray         *adw.WrapBox
+	pendingFiles           []opencode.FileAttachment
 
 	composerPlaceholder *gtk.Label
 	composerAgentBtn    *gtk.MenuButton
@@ -935,8 +943,10 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		contentMainBox:        builder.GetObject("contentMainBox").Cast().(*gtk.Box),
 		viewStackOverlay:      builder.GetObject("viewStackOverlay").Cast().(*gtk.Overlay),
 		viewStack:             builder.GetObject("viewStack").Cast().(*adw.ViewStack),
-		composerClamp:         builder.GetObject("composerClamp").Cast().(*adw.Clamp),
-		inputView:             builder.GetObject("inputView").Cast().(*gtksource.View),
+		composerClamp:     builder.GetObject("composerClamp").Cast().(*adw.Clamp),
+		composerExpandBtn: builder.GetObject("composerExpandBtn").Cast().(*gtk.Button),
+		inputScroll:       builder.GetObject("inputScroll").Cast().(*gtk.ScrolledWindow),
+		inputView:         builder.GetObject("inputView").Cast().(*gtksource.View),
 		sendBtn:               builder.GetObject("sendBtn").Cast().(*gtk.Button),
 		stopBtn:               builder.GetObject("stopBtn").Cast().(*gtk.Button),
 		attachBtn:             builder.GetObject("attachBtn").Cast().(*gtk.Button),
@@ -1043,10 +1053,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		builder.GetObject("composerBar").Cast().(*gtk.Box),
 		builder.GetObject("timelineBottomFade").Cast().(*gtk.Box),
 	)
-	inputScroll := builder.GetObject("inputScroll").Cast().(*gtk.ScrolledWindow)
 	w.inputBuffer = w.inputView.Buffer().Cast().(*gtksource.Buffer)
-	w.inputBuffer.SetHighlightSyntax(false)
-	w.inputBuffer.SetHighlightMatchingBrackets(false)
+	w.setupComposerMarkdown()
+	w.setupComposerMultiline()
 
 	w.applyAllPreferences()
 	adw.StyleManagerGetDefault().NotifyProperty("dark", func() {
@@ -1058,11 +1067,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 
 	w.inputBuffer.ConnectChanged(func() {
 		w.composerPlaceholder.SetVisible(w.inputBuffer.CharCount() == 0)
-		if w.inputBuffer.LineCount() > 4 {
-			inputScroll.SetPolicy(gtk.PolicyNever, gtk.PolicyAutomatic)
-		} else {
-			inputScroll.SetPolicy(gtk.PolicyNever, gtk.PolicyExternal)
-		}
+		w.syncInputScrollPolicy()
+		w.applyComposerMarkdownHighlighting()
 		if !w.settingHistoryText {
 			w.syncComposerCompletionPopup()
 		}
@@ -1219,12 +1225,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	steerKeyCtrl := gtk.NewEventControllerKey()
 	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
-		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
-			if w.prefs.CtrlEnterToSend {
-				w.sendPromptWithDelivery(opencode.DeliveryQueue)
-			} else {
-				w.sendPromptWithDelivery(opencode.DeliverySteer)
-			}
+		if delivery, ok := w.composerEnterAction(true, keyval, state); ok {
+			w.sendPromptWithDelivery(delivery)
 			return true
 		}
 		if (keyval == gdk.KEY_B || keyval == gdk.KEY_b) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
@@ -1241,19 +1243,8 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 
 	keyCtrl := gtk.NewEventControllerKey()
 	keyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
-		if (keyval == gdk.KEY_Return || keyval == gdk.KEY_KP_Enter) && !state.Has(gdk.ShiftMask) {
-			if state.Has(gdk.ControlMask) {
-				if w.prefs.CtrlEnterToSend {
-					w.sendPromptWithDelivery(opencode.DeliveryQueue)
-				} else {
-					w.sendPromptWithDelivery(opencode.DeliverySteer)
-				}
-				return true
-			}
-			if w.prefs.CtrlEnterToSend {
-				return false
-			}
-			w.sendPromptWithDelivery(opencode.DeliveryQueue)
+		if delivery, ok := w.composerEnterAction(false, keyval, state); ok {
+			w.sendPromptWithDelivery(delivery)
 			return true
 		}
 		if keyval == gdk.KEY_comma && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
@@ -8196,6 +8187,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 					w.recordInputHistory(text)
 					w.saveState()
 					w.inputBuffer.SetText("")
+					w.setComposerExpanded(false)
 					w.changeSessionDirectory(nil, nil, cmdArgs)
 					return
 				}
@@ -8207,6 +8199,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 					w.recordInputHistory(text)
 					w.saveState()
 					w.inputBuffer.SetText("")
+					w.setComposerExpanded(false)
 					w.openMcpSheet(cmdArgs)
 					return
 				}
@@ -8233,6 +8226,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 		w.saveState()
 	}
 	w.inputBuffer.SetText("")
+	w.setComposerExpanded(false)
 
 	files := slices.Clone(w.pendingFiles)
 	w.pendingFiles = nil
