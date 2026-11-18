@@ -756,6 +756,7 @@ type Window struct {
 	projectStatusLabel  *gtk.Label
 	branchStatusBox     *gtk.Box
 	branchStatusLabel   *gtk.Label
+	stopConfirmBtn      *gtk.Button
 	backgroundStatusBtn *gtk.Button
 	mcpStatusBox        *gtk.Box
 	mcpStatusLabel      *gtk.Label
@@ -882,6 +883,11 @@ type Window struct {
 	notifyCoord           *notificationCoordinator
 	completionSettleDelay time.Duration
 
+	escStopArmedSess string
+	escStopGen       uint64
+	escStopTimer     glib.SourceHandle
+	escStopTimeoutMS uint
+
 	populating bool
 }
 
@@ -964,6 +970,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		projectStatusLabel:    builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
 		branchStatusBox:       builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
 		branchStatusLabel:     builder.GetObject("branchStatusLabel").Cast().(*gtk.Label),
+		stopConfirmBtn:        builder.GetObject("stopConfirmBtn").Cast().(*gtk.Button),
 		backgroundStatusBtn:   builder.GetObject("backgroundStatusBtn").Cast().(*gtk.Button),
 		mcpStatusBox:          builder.GetObject("mcpStatusBox").Cast().(*gtk.Box),
 		mcpStatusLabel:        builder.GetObject("mcpStatusLabel").Cast().(*gtk.Label),
@@ -1097,6 +1104,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	statusBarBox.AddController(statusClick)
 	w.initMcpSheet()
 
+	w.stopConfirmBtn.ConnectClicked(w.interruptSession)
 	w.backgroundStatusBtn.ConnectClicked(func() {
 		w.backgroundCurrentSession()
 	})
@@ -1158,6 +1166,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 
 	adwWin.ConnectCloseRequest(func() bool {
 		w.flushAllDraftsSync()
+		w.disarmEscStop()
 		if w.mcpMgr != nil {
 			w.mcpMgr.closeAuthDialog()
 			w.mcpMgr.stopLogPoller()
@@ -1210,14 +1219,19 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 				return true
 			}
 		}
-		if keyval == gdk.KEY_Escape && w.bottomSheet != nil && w.bottomSheet.Open() {
-			return w.handleBottomSheetEscape()
+		if keyval == gdk.KEY_Escape {
+			if w.bottomSheet != nil && w.bottomSheet.Open() {
+				return w.handleBottomSheetEscape()
+			}
+			if w.handleEscapeStop(state) {
+				return true
+			}
 		}
 		return false
 	})
 	adwWin.AddController(winKeyCtrl)
 
-	// Composer Enter / Ctrl+Enter / Shift+Enter handling, Up/Down history navigation, Ctrl+B to background, and Ctrl+V clipboard image pasting.
+	// Composer Enter / Ctrl+Enter / Alt+Enter handling, Up/Down history navigation, Ctrl+B to background, and Ctrl+V clipboard image pasting.
 	steerKeyCtrl := gtk.NewEventControllerKey()
 	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
@@ -9887,7 +9901,110 @@ func (w *Window) rebuildAttachmentTray() {
 	}
 }
 
+const defaultEscStopConfirmTimeoutMS = 3000
+
+func (w *Window) effectiveEscStopTimeoutMS() uint {
+	if w != nil && w.escStopTimeoutMS > 0 {
+		return w.escStopTimeoutMS
+	}
+	return defaultEscStopConfirmTimeoutMS
+}
+
+func (w *Window) hasVisibleComposerPopover() bool {
+	for _, pop := range []*gtk.Popover{w.agentPopover, w.modelPopover, w.renameSessionPopover} {
+		if pop != nil && pop.Visible() {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) handleEscapeStop(state gdk.ModifierType) bool {
+	if state.Has(gdk.ControlMask) || state.Has(gdk.ShiftMask) || state.Has(gdk.AltMask) || state.Has(gdk.SuperMask) {
+		return false
+	}
+	if w.offline || w.hasVisibleComposerPopover() {
+		return false
+	}
+	tab := w.currentTab()
+	if tab == nil {
+		w.disarmEscStop()
+		return false
+	}
+	conv := tab.activeConv()
+	if conv == nil || !conv.active || conv.session.ID == "" {
+		w.disarmEscStop()
+		return false
+	}
+	if w.escStopArmedSess == conv.session.ID {
+		w.disarmEscStop()
+		w.interruptSession()
+		return true
+	}
+	w.armEscStop(conv.session.ID)
+	return true
+}
+
+func (w *Window) armEscStop(sessionID string) {
+	if w.escStopTimer != 0 {
+		glib.SourceRemove(w.escStopTimer)
+		w.escStopTimer = 0
+	}
+	w.escStopGen++
+	gen := w.escStopGen
+	w.escStopArmedSess = sessionID
+	w.syncEscStopUI()
+
+	w.escStopTimer = glib.TimeoutAdd(w.effectiveEscStopTimeoutMS(), func() bool {
+		w.escStopTimer = 0
+		if w.ctx != nil && w.ctx.Err() != nil {
+			return false
+		}
+		if w.escStopGen == gen {
+			w.disarmEscStop()
+		}
+		return false
+	})
+}
+
+func (w *Window) disarmEscStop() {
+	if w.escStopTimer != 0 {
+		glib.SourceRemove(w.escStopTimer)
+		w.escStopTimer = 0
+	}
+	w.escStopGen++
+	w.escStopArmedSess = ""
+	w.syncEscStopUI()
+}
+
+func (w *Window) syncEscStopUI() {
+	armed := false
+	if w.escStopArmedSess != "" {
+		if tab := w.currentTab(); tab != nil {
+			if conv := tab.activeConv(); conv != nil && conv.active && conv.session.ID == w.escStopArmedSess {
+				armed = true
+			}
+		}
+	}
+	if w.stopConfirmBtn != nil {
+		w.stopConfirmBtn.SetVisible(armed)
+	}
+	if w.stopBtn != nil {
+		if armed {
+			w.stopBtn.AddCSSClass("glup-stop-armed")
+			w.stopBtn.SetTooltipText("Press Esc again or click to stop session")
+		} else {
+			w.stopBtn.RemoveCSSClass("glup-stop-armed")
+			w.stopBtn.SetTooltipText("Interrupt Session")
+		}
+	}
+}
+
 func (w *Window) interruptSession() {
+	w.disarmEscStop()
+	if w.client == nil {
+		return
+	}
 	tab := w.currentTab()
 	if tab == nil {
 		return
@@ -10002,6 +10119,9 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 			conv.scroll.ScrollToBottomIfBottomed()
 		}
 	}
+	if !active && w.escStopArmedSess == sessionID {
+		w.disarmEscStop()
+	}
 	if w.currentTab() == tab {
 		if tab.activeConv() == conv {
 			w.updateBusyState(active)
@@ -10015,6 +10135,20 @@ func (w *Window) updateBusyState(busy bool) {
 	if w.stopBtn != nil {
 		w.stopBtn.SetVisible(busy)
 	}
+	if w.escStopArmedSess == "" {
+		w.syncEscStopUI()
+		return
+	}
+	if !busy {
+		w.disarmEscStop()
+		return
+	}
+	tab := w.currentTab()
+	if tab == nil || tab.activeConv() == nil || tab.activeConv().session.ID != w.escStopArmedSess {
+		w.disarmEscStop()
+		return
+	}
+	w.syncEscStopUI()
 }
 
 func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgID, agent, model string) *AssistantMessageWidget {

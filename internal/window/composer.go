@@ -66,7 +66,7 @@ func (w *Window) setComposerExpandedUI(expanded bool) {
 	w.applySendShortcutUI()
 }
 
-// composerEnterAction resolves Enter / Shift+Enter / Ctrl+Enter key presses for
+// composerEnterAction resolves Enter / Shift+Enter / Alt+Enter / Ctrl+Enter key presses for
 // the capture and bubble key controllers on inputView.
 func (w *Window) composerEnterAction(capture bool, keyval uint, state gdk.ModifierType) (opencode.InboxDelivery, bool) {
 	if keyval != gdk.KEY_Return && keyval != gdk.KEY_KP_Enter {
@@ -74,16 +74,17 @@ func (w *Window) composerEnterAction(capture bool, keyval uint, state gdk.Modifi
 	}
 	hasCtrl := state.Has(gdk.ControlMask)
 	hasShift := state.Has(gdk.ShiftMask)
-	if hasCtrl && !hasShift {
+	hasAlt := state.Has(gdk.AltMask)
+	if hasCtrl && !hasShift && !hasAlt {
 		if w.composerExpanded || !w.prefs.CtrlEnterToSend {
 			return opencode.DeliverySteer, true
 		}
 		return opencode.DeliveryQueue, true
 	}
-	if w.composerExpanded && hasShift && !hasCtrl {
+	if w.composerExpanded && hasAlt && !hasCtrl && !hasShift {
 		return opencode.DeliveryQueue, true
 	}
-	if capture || w.composerExpanded || hasShift || hasCtrl {
+	if capture || w.composerExpanded || hasShift || hasCtrl || hasAlt {
 		return "", false
 	}
 	if w.prefs.CtrlEnterToSend {

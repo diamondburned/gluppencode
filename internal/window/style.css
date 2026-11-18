@@ -583,6 +583,19 @@ menubutton.glup-composer-selector-btn > button:checked {
 	border-radius: 999px;
 }
 
+@keyframes glup-stop-pulse {
+	0%, 100% {
+		box-shadow: 0 0 0 0 alpha(@error_color, 0.55);
+	}
+	50% {
+		box-shadow: 0 0 0 5px alpha(@error_color, 0.12);
+	}
+}
+
+#stopBtn.glup-stop-armed {
+	animation: glup-stop-pulse 0.85s ease-in-out infinite;
+}
+
 .glup-attachment-tray {
 	padding: 2px 0 6px 0;
 }
@@ -724,6 +737,21 @@ button.glup-status-background {
 
 button.glup-status-background:hover {
 	background-color: alpha(@warning_bg_color, 0.28);
+}
+
+button.glup-status-stop-confirm {
+	background-color: alpha(@error_bg_color, 0.18);
+	color: @error_color;
+	border: 1px solid alpha(@error_color, 0.45);
+	font-weight: 600;
+	font-size: 0.82em;
+	min-height: 18px;
+	padding: 4px 10px;
+	border-radius: 6px;
+}
+
+button.glup-status-stop-confirm:hover {
+	background-color: alpha(@error_bg_color, 0.28);
 }
 
 .glup-status-mcp {

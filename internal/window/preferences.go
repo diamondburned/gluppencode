@@ -253,7 +253,7 @@ func (w *Window) applySendShortcutUI() {
 		return
 	}
 	if w.composerExpanded {
-		w.sendBtn.SetTooltipText("Queue Prompt (Shift+Enter) · Steer Immediately (Ctrl+Enter)")
+		w.sendBtn.SetTooltipText("Queue Prompt (Alt+Enter) · Steer Immediately (Ctrl+Enter)")
 		return
 	}
 	if w.prefs.CtrlEnterToSend {

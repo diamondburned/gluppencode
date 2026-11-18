@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -213,13 +214,37 @@ func TestComposerEnterAction(t *testing.T) {
 			wantHandled: false,
 		},
 		{
-			name:         "expanded shift+enter queues",
+			name:        "expanded shift+enter inserts newline",
+			expanded:    true,
+			capture:     true,
+			keyval:      gdk.KEY_Return,
+			state:       gdk.ShiftMask,
+			wantHandled: false,
+		},
+		{
+			name:         "expanded alt+enter queues",
 			expanded:     true,
 			capture:      true,
 			keyval:       gdk.KEY_Return,
-			state:        gdk.ShiftMask,
+			state:        gdk.AltMask,
 			wantDelivery: opencode.DeliveryQueue,
 			wantHandled:  true,
+		},
+		{
+			name:        "expanded shift+alt+enter ignored",
+			expanded:    true,
+			capture:     true,
+			keyval:      gdk.KEY_Return,
+			state:       gdk.ShiftMask | gdk.AltMask,
+			wantHandled: false,
+		},
+		{
+			name:        "compact alt+enter ignored",
+			expanded:    false,
+			capture:     false,
+			keyval:      gdk.KEY_Return,
+			state:       gdk.AltMask,
+			wantHandled: false,
 		},
 		{
 			name:            "expanded ctrl+enter steers even when Ctrl+EnterToSend is true",
@@ -296,8 +321,8 @@ func TestComposerMultilineAndMarkdownWidgets(t *testing.T) {
 	if w.inputScroll.MinContentHeight() != composerExpandedMinHeight {
 		t.Fatalf("MinContentHeight = %d, want %d", w.inputScroll.MinContentHeight(), composerExpandedMinHeight)
 	}
-	if got := w.sendBtn.TooltipText(); !strings.Contains(got, "Shift+Enter") {
-		t.Fatalf("expanded sendBtn tooltip = %q, want Shift+Enter hint", got)
+	if got := w.sendBtn.TooltipText(); !strings.Contains(got, "Alt+Enter") {
+		t.Fatalf("expanded sendBtn tooltip = %q, want Alt+Enter hint", got)
 	}
 
 	w.composerExpandBtn.Emit("clicked")
@@ -367,5 +392,140 @@ func TestComposerAutoCollapseOnSend(t *testing.T) {
 	win.sendPromptWithDelivery(opencode.DeliveryQueue)
 	if win.composerExpanded {
 		t.Fatal("expected sendPromptWithDelivery to collapse composerExpanded to false")
+	}
+}
+
+func TestEscapeDoublePressStopSession(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+	adw.Init()
+
+	var interruptCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/interrupt") {
+			interruptCalls.Add(1)
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		_, _ = w.Write([]byte(`[]`))
+	}))
+	defer srv.Close()
+
+	builder := gtk.NewBuilderFromString(windowUI)
+	stopBtn := builder.GetObject("stopBtn").Cast().(*gtk.Button)
+	stopConfirmBtn := builder.GetObject("stopConfirmBtn").Cast().(*gtk.Button)
+
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:              t.Context(),
+		client:           &opencode.Client{BaseURL: srv.URL},
+		viewStack:        vs,
+		tabs:             make(map[string]*sessionTab),
+		stopBtn:          stopBtn,
+		stopConfirmBtn:   stopConfirmBtn,
+		escStopTimeoutMS: 60,
+	}
+	stopConfirmBtn.ConnectClicked(win.interruptSession)
+
+	sess := opencode.Session{ID: "ses_busy"}
+	conv := &convTimeline{session: sess, active: false}
+	pageBox := gtk.NewBox(gtk.OrientationVertical, 0)
+	vs.AddNamed(pageBox, sess.ID)
+	vs.SetVisibleChildName(sess.ID)
+	win.tabs[sess.ID] = &sessionTab{main: conv}
+
+	// Esc while idle must not arm.
+	if win.handleEscapeStop(0) {
+		t.Fatal("expected handleEscapeStop to return false while session is idle")
+	}
+	if stopConfirmBtn.Visible() || stopBtn.HasCSSClass("glup-stop-armed") {
+		t.Fatal("expected stop confirmation UI hidden when idle")
+	}
+
+	// Mark session active.
+	conv.active = true
+	win.updateBusyState(true)
+
+	// Modified Esc (e.g. Shift+Esc) must not arm.
+	if win.handleEscapeStop(gdk.ShiftMask) {
+		t.Fatal("expected Shift+Esc to be ignored")
+	}
+
+	// First Esc arms stop confirmation and pulses stopBtn.
+	if !win.handleEscapeStop(0) {
+		t.Fatal("expected first Esc to arm stop confirmation")
+	}
+	if win.escStopArmedSess != sess.ID {
+		t.Fatalf("escStopArmedSess = %q, want %q", win.escStopArmedSess, sess.ID)
+	}
+	if !stopConfirmBtn.Visible() {
+		t.Fatal("expected stopConfirmBtn visible after first Esc")
+	}
+	if !stopBtn.HasCSSClass("glup-stop-armed") {
+		t.Fatal("expected stopBtn to have glup-stop-armed class after first Esc")
+	}
+	if interruptCalls.Load() != 0 {
+		t.Fatalf("interruptCalls = %d after first Esc, want 0", interruptCalls.Load())
+	}
+
+	// Timeout automatically disarms.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && win.escStopArmedSess != "" {
+		glib.MainContextDefault().Iteration(false)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if win.escStopArmedSess != "" || stopConfirmBtn.Visible() || stopBtn.HasCSSClass("glup-stop-armed") {
+		t.Fatal("expected stop confirmation to disarm after timeout")
+	}
+
+	// Arm again and press Esc a second time -> interrupts and disarms.
+	if !win.handleEscapeStop(0) {
+		t.Fatal("expected re-arming Esc to return true")
+	}
+	if !win.handleEscapeStop(0) {
+		t.Fatal("expected second Esc to interrupt and return true")
+	}
+	if win.escStopArmedSess != "" || stopConfirmBtn.Visible() || stopBtn.HasCSSClass("glup-stop-armed") {
+		t.Fatal("expected stop confirmation to disarm immediately after second Esc")
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && interruptCalls.Load() == 0 {
+		glib.MainContextDefault().Iteration(false)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := interruptCalls.Load(); got != 1 {
+		t.Fatalf("interruptCalls = %d after double Esc, want 1", got)
+	}
+
+	// Clicking stopConfirmBtn while armed also interrupts and disarms.
+	if !win.handleEscapeStop(0) {
+		t.Fatal("expected Esc to arm before clicking stopConfirmBtn")
+	}
+	stopConfirmBtn.Emit("clicked")
+	for glib.MainContextDefault().Iteration(false) {
+	}
+	if win.escStopArmedSess != "" || stopConfirmBtn.Visible() {
+		t.Fatal("expected clicking stopConfirmBtn to disarm")
+	}
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) && interruptCalls.Load() < 2 {
+		glib.MainContextDefault().Iteration(false)
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := interruptCalls.Load(); got != 2 {
+		t.Fatalf("interruptCalls = %d after clicking stopConfirmBtn, want 2", got)
+	}
+
+	// Becoming idle while armed disarms.
+	if !win.handleEscapeStop(0) {
+		t.Fatal("expected Esc to arm before becoming idle")
+	}
+	conv.active = false
+	win.updateBusyState(false)
+	if win.escStopArmedSess != "" || stopConfirmBtn.Visible() || stopBtn.HasCSSClass("glup-stop-armed") {
+		t.Fatal("expected updateBusyState(false) to disarm stop confirmation")
 	}
 }
