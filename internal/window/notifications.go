@@ -445,6 +445,26 @@ func (c *notificationCoordinator) syncPreferences(sender *Window, prev, next Pre
 	}
 }
 
+func (c *notificationCoordinator) syncLastSelection(sender *Window, agent string, model opencode.ModelRef) {
+	if c == nil {
+		return
+	}
+	for _, win := range c.windows {
+		if win == nil || win == sender {
+			continue
+		}
+		win.lastSelectedAgent = agent
+		win.lastSelectedModel = model
+		if win.currentTab() == nil {
+			win.updateComposerAgentModel(agent, model)
+			win.rebuildAgentPills()
+			if len(win.models) > 0 {
+				win.rebuildModelList()
+			}
+		}
+	}
+}
+
 func (w *Window) notifySessionFinished(tab *sessionTab) {
 	w.ensureNotificationCoordinator().notifyFinished(w, tab)
 }

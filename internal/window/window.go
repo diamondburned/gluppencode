@@ -824,6 +824,8 @@ type Window struct {
 	branchCache    map[string]string
 
 	modelLastUsed      map[string]int64
+	lastSelectedAgent  string
+	lastSelectedModel  opencode.ModelRef
 	showAllModels      bool
 	showAllModelsRow   *gtk.ListBoxRow
 	showAllModelsLabel *gtk.Label
@@ -1056,6 +1058,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 	})
 	w.loadState()
+	w.updateComposerAgentModel(w.lastSelectedAgent, w.lastSelectedModel)
 	w.initNotificationCoordinator(a.Application)
 	w.emptyGreeter = NewGreeterWidget(w.effectiveGreeterProfile(), w.populateComposerSuggestion)
 	w.contentMainBox.Prepend(w.emptyGreeter)
@@ -4944,6 +4947,11 @@ func (w *Window) loadAll() {
 					}
 				}
 				w.rebuildModelList()
+				if cur := w.currentTab(); cur != nil {
+					w.updateBottomBar(cur)
+				} else {
+					w.updateComposerAgentModel(w.lastSelectedAgent, w.lastSelectedModel)
+				}
 			}
 			w.refreshGreeterProfileAsync()
 		}
@@ -6734,6 +6742,44 @@ func (w *Window) onStreamDelta(tab *sessionTab, conv *convTimeline, deltaLen int
 	}
 }
 
+func (w *Window) updateComposerAgentModel(agent string, model opencode.ModelRef) {
+	if agent == "" {
+		agent = "build"
+	}
+	agentLower := strings.ToLower(agent)
+
+	// Agent button label in composer row 2
+	if w.agentPillLabel != nil {
+		w.agentPillLabel.SetLabel(formatAgentDisplayName(agent))
+		for _, cls := range []string{
+			"glup-agent-build", "glup-agent-plan", "glup-agent-bare", "glup-agent-orchestrator",
+			"glup-agent-text-build", "glup-agent-text-plan", "glup-agent-text-bare", "glup-agent-text-orchestrator",
+		} {
+			w.agentPillLabel.RemoveCSSClass(cls)
+		}
+		switch agentLower {
+		case "build", "plan", "bare", "orchestrator":
+			w.agentPillLabel.AddCSSClass("glup-agent-text-" + agentLower)
+		}
+	}
+
+	// Model button label in composer row 2
+	modelKey := model.String()
+	modelDisplay := w.modelNames[modelKey]
+	if modelDisplay == "" {
+		modelDisplay = w.modelNames[model.ID]
+	}
+	if modelDisplay == "" {
+		modelDisplay = model.ID
+	}
+	if modelDisplay == "" {
+		modelDisplay = "Default Model"
+	}
+	if w.modelStatusLabel != nil {
+		w.modelStatusLabel.SetLabel(modelDisplay)
+	}
+}
+
 func (w *Window) updateBottomBar(tab *sessionTab) {
 	w.ensureMcpStatusLoaded(w.activeDirectory())
 	w.refreshMcpStatusChip()
@@ -6748,6 +6794,8 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 		if w.tokRateStatusLabel != nil {
 			w.tokRateStatusLabel.SetVisible(false)
 		}
+		w.updateComposerAgentModel(w.lastSelectedAgent, w.lastSelectedModel)
+		w.rebuildAgentPills()
 		w.rebuildContextInfo(nil)
 		return
 	}
@@ -6775,42 +6823,8 @@ func (w *Window) updateBottomBar(tab *sessionTab) {
 		}
 	}
 	conv := tab.activeConv()
-	agent := conv.session.Agent
-	if agent == "" {
-		agent = "build"
-	}
-	agentLower := strings.ToLower(agent)
-
-	// Agent button label in composer row 2
-	if w.agentPillLabel != nil {
-		w.agentPillLabel.SetLabel(formatAgentDisplayName(agent))
-		for _, cls := range []string{
-			"glup-agent-build", "glup-agent-plan", "glup-agent-bare", "glup-agent-orchestrator",
-			"glup-agent-text-build", "glup-agent-text-plan", "glup-agent-text-bare", "glup-agent-text-orchestrator",
-		} {
-			w.agentPillLabel.RemoveCSSClass(cls)
-		}
-		switch agentLower {
-		case "build", "plan", "bare", "orchestrator":
-			w.agentPillLabel.AddCSSClass("glup-agent-text-" + agentLower)
-		}
-	}
-
-	// Model button label in composer row 2
+	w.updateComposerAgentModel(conv.session.Agent, conv.session.Model)
 	modelKey := conv.session.Model.String()
-	modelDisplay := w.modelNames[modelKey]
-	if modelDisplay == "" {
-		modelDisplay = w.modelNames[conv.session.Model.ID]
-	}
-	if modelDisplay == "" {
-		modelDisplay = conv.session.Model.ID
-	}
-	if modelDisplay == "" {
-		modelDisplay = "Default Model"
-	}
-	if w.modelStatusLabel != nil {
-		w.modelStatusLabel.SetLabel(modelDisplay)
-	}
 
 	// Left: Project badge and separate Git branch badge
 	dir := tab.main.session.Location.Directory
@@ -7814,6 +7828,8 @@ func (w *Window) rebuildAgentPills() {
 		if conv := tab.activeConv(); conv != nil && conv.session.Agent != "" {
 			activeAgent = conv.session.Agent
 		}
+	} else if w.lastSelectedAgent != "" {
+		activeAgent = w.lastSelectedAgent
 	}
 	for _, ag := range primary {
 		agentID := ag.ID
@@ -7917,6 +7933,8 @@ func (w *Window) rebuildModelList() {
 		if conv := tab.activeConv(); conv != nil {
 			activeModel = conv.session.Model
 		}
+	} else {
+		activeModel = w.lastSelectedModel
 	}
 
 	for _, m := range sortedModels {
@@ -8026,14 +8044,24 @@ func (w *Window) filterModelList(query string) {
 }
 
 func (w *Window) switchAgent(agentID string) {
+	w.lastSelectedAgent = strings.TrimSpace(agentID)
+	w.saveState()
+	if w.notifyCoord != nil {
+		w.notifyCoord.syncLastSelection(w, w.lastSelectedAgent, w.lastSelectedModel)
+	}
+
 	tab := w.currentTab()
 	if tab == nil {
+		w.updateBottomBar(nil)
 		return
 	}
 	conv := tab.activeConv()
 	sessionID := conv.session.ID
 	conv.session.Agent = agentID
 	w.updateBottomBar(tab)
+	if w.client == nil {
+		return
+	}
 
 	gtkutil.Async(w.ctx, func() func() {
 		err := w.client.SwitchAgent(w.ctx, sessionID, agentID)
@@ -8047,16 +8075,31 @@ func (w *Window) switchAgent(agentID string) {
 }
 
 func (w *Window) switchModel(model opencode.ModelRef) {
+	w.lastSelectedModel = model
+	w.updateModelLastUsed(model, time.Now().UnixMilli())
+	w.saveState()
+	if w.notifyCoord != nil {
+		w.notifyCoord.syncLastSelection(w, w.lastSelectedAgent, w.lastSelectedModel)
+	}
+
 	tab := w.currentTab()
 	if tab == nil {
+		if w.modelListBox != nil {
+			w.rebuildModelList()
+		}
+		w.updateBottomBar(nil)
 		return
 	}
 	conv := tab.activeConv()
 	sessionID := conv.session.ID
 	conv.session.Model = model
-	w.updateModelLastUsed(model, time.Now().UnixMilli())
-	w.rebuildModelList()
+	if w.modelListBox != nil {
+		w.rebuildModelList()
+	}
 	w.updateBottomBar(tab)
+	if w.client == nil {
+		return
+	}
 
 	gtkutil.Async(w.ctx, func() func() {
 		err := w.client.SwitchModel(w.ctx, sessionID, model)
@@ -8097,37 +8140,9 @@ func (w *Window) createNewSession() {
 	w.createNewSessionInDir(cwd)
 }
 
-func (w *Window) inheritedAgentAndModel() (string, opencode.ModelRef) {
-	var agent string
-	var model opencode.ModelRef
-
-	extractFromConv := func(conv *convTimeline) {
-		if conv == nil {
-			return
-		}
-		if agent == "" && conv.session.Agent != "" {
-			agent = conv.session.Agent
-		}
-		if model.ID == "" && conv.session.Model.ID != "" {
-			model = conv.session.Model
-		}
-		for i := len(conv.messages) - 1; i >= 0 && (agent == "" || model.ID == ""); i-- {
-			msg := conv.messages[i]
-			if agent == "" && msg.Agent != "" {
-				agent = msg.Agent
-			}
-			if model.ID == "" && msg.Model.ID != "" {
-				model = msg.Model
-			}
-		}
-	}
-
-	if tab := w.currentTab(); tab != nil {
-		extractFromConv(tab.activeConv())
-		if tab.main != tab.activeConv() {
-			extractFromConv(tab.main)
-		}
-	}
+func (w *Window) newSessionAgentAndModel() (string, opencode.ModelRef) {
+	agent := strings.TrimSpace(w.lastSelectedAgent)
+	model := w.lastSelectedModel
 
 	if model.ID != "" && model.ProviderID == "" {
 		for _, m := range w.models {
@@ -8158,13 +8173,13 @@ func (w *Window) createNewSessionInDirAndThen(dir string, onReady func()) {
 	}
 	cwd = filepath.Clean(cwd)
 
-	inheritedAgent, inheritedModel := w.inheritedAgentAndModel()
+	selectedAgent, selectedModel := w.newSessionAgentAndModel()
 	req := opencode.CreateSessionRequest{
 		Directory: cwd,
-		Agent:     inheritedAgent,
+		Agent:     selectedAgent,
 	}
-	if inheritedModel.ID != "" && inheritedModel.ProviderID != "" {
-		req.Model = &inheritedModel
+	if selectedModel.ID != "" && selectedModel.ProviderID != "" {
+		req.Model = &selectedModel
 	}
 
 	gtkutil.Async(w.ctx, func() func() {

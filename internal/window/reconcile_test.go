@@ -1588,12 +1588,15 @@ func TestBackgroundShellFilteringAndOutput(t *testing.T) {
 	}
 	win.client = nil
 
-	// 3. Test inheritedAgentAndModel inherits agent and model from current conversation
+	// 3. Test newSessionAgentAndModel uses the last user-selected agent/model,
+	// not whatever agent/model the currently focused conversation happens to have.
 	tab1.main.session.Agent = "plan"
 	tab1.main.session.Model = opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-argon-high"}
-	inhAgent, inhModel := win.inheritedAgentAndModel()
-	if inhAgent != "plan" || inhModel.ProviderID != "google" || inhModel.ID != "antigravity-gemini-4-argon-high" {
-		t.Errorf("inheritedAgentAndModel() = (%q, %+v), want (plan, google/antigravity-gemini-4-argon-high)", inhAgent, inhModel)
+	win.lastSelectedAgent = "build"
+	win.lastSelectedModel = opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-hydrogen-high"}
+	selAgent, selModel := win.newSessionAgentAndModel()
+	if selAgent != "build" || selModel.ProviderID != "google" || selModel.ID != "antigravity-gemini-4-hydrogen-high" {
+		t.Errorf("newSessionAgentAndModel() = (%q, %+v), want (build, google/antigravity-gemini-4-hydrogen-high)", selAgent, selModel)
 	}
 }
 
@@ -4616,4 +4619,174 @@ func TestStartupUnvisitedSubagentSpinnerAndResolution(t *testing.T) {
 	if bgTab.sidebarIndicator.spinner.Visible() {
 		t.Fatalf("expected sidebar spinner for ses_root_bg to hide once all running subagents go idle")
 	}
+}
+
+func TestNewSessionUsesLastSelectedAgentAndModel(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var mu sync.Mutex
+	var createdReqs []opencode.CreateSessionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session":
+			var req opencode.CreateSessionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			createdReqs = append(createdReqs, req)
+			idx := len(createdReqs)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:       fmt.Sprintf("ses_new_%d", idx),
+				Title:    fmt.Sprintf("New Session %d", idx),
+				Agent:    req.Agent,
+				Model:    derefOrZeroModel(req.Model),
+				Location: opencode.Location{Directory: "/tmp/proj"},
+			})
+		case "/api/session/ses_root/agent", "/api/session/ses_root/model":
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	coord := newNotificationCoordinator(nil)
+	makeWin := func() *Window {
+		w := &Window{
+			ctx:              t.Context(),
+			client:           &opencode.Client{BaseURL: srv.URL},
+			statePath:        stateFile,
+			viewStack:        adw.NewViewStack(),
+			agentPillLabel:   gtk.NewLabel("Build"),
+			modelStatusLabel: gtk.NewLabel("Model"),
+			agentListBox:     gtk.NewListBox(),
+			modelListBox:     gtk.NewListBox(),
+			modelSearchEntry: gtk.NewSearchEntry(),
+			tabs:             make(map[string]*sessionTab),
+			childToRoot:      make(map[string]string),
+			visibleSessions:  make(map[string]bool),
+			archivedSessions: make(map[string]bool),
+			projectSessions:  make(map[string][]opencode.Session),
+			modelNames: map[string]string{
+				"google/antigravity-gemini-4-hydrogen-high":   "Gemini 4 Hydrogen (High)",
+				"google/antigravity-gemini-4-hydrogen-medium": "Gemini 4 Hydrogen (Medium)",
+				"anthropic/claude-fable-5-2":                  "Claude Fable 5.2",
+			},
+			modelLastUsed: make(map[string]int64),
+			modelLimits:   make(map[string]int),
+			branchCache:   make(map[string]string),
+			notifyCoord:   coord,
+		}
+		coord.registerWindow(w)
+		return w
+	}
+
+	win := makeWin()
+	sibling := makeWin()
+
+	// 1. Selecting on the empty greeter (no active tab) remembers and persists selection + updates labels + syncs sibling.
+	win.switchAgent("plan")
+	win.switchModel(opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-hydrogen-high"})
+	if got := win.agentPillLabel.Label(); got != "Plan" {
+		t.Fatalf("greeter agentPillLabel = %q, want Plan", got)
+	}
+	if got := win.modelStatusLabel.Label(); got != "Gemini 4 Hydrogen (High)" {
+		t.Fatalf("greeter modelStatusLabel = %q, want 'Gemini 4 Hydrogen (High)'", got)
+	}
+	if sibling.lastSelectedAgent != "plan" || sibling.lastSelectedModel.ID != "antigravity-gemini-4-hydrogen-high" {
+		t.Fatalf("sibling last selection not synced: (%q, %+v)", sibling.lastSelectedAgent, sibling.lastSelectedModel)
+	}
+
+	reloaded := &Window{
+		ctx:       t.Context(),
+		statePath: stateFile,
+		viewStack: adw.NewViewStack(),
+		tabs:      make(map[string]*sessionTab),
+	}
+	reloaded.loadState()
+	if reloaded.lastSelectedAgent != "plan" || reloaded.lastSelectedModel.ProviderID != "google" || reloaded.lastSelectedModel.ID != "antigravity-gemini-4-hydrogen-high" {
+		t.Fatalf("reloaded last selection = (%q, %+v), want (plan, google/antigravity-gemini-4-hydrogen-high)", reloaded.lastSelectedAgent, reloaded.lastSelectedModel)
+	}
+
+	// 2. Add a root session and open a spawned subagent with a completely different agent and model.
+	rootSess := opencode.Session{
+		ID:       "ses_root",
+		Title:    "Root Session",
+		Agent:    "build",
+		Model:    opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-hydrogen-high"},
+		Location: opencode.Location{Directory: "/tmp/proj"},
+	}
+	tab := win.addSessionTab(rootSess)
+	tab.main.loaded = true
+	win.viewStack.SetVisibleChildName("ses_root")
+
+	subSess := opencode.Session{
+		ID:       "ses_sub",
+		ParentID: "ses_root",
+		Title:    "Explore Subagent",
+		Agent:    "explore",
+		Model:    opencode.ModelRef{ProviderID: "anthropic", ID: "claude-fable-5-2"},
+		Location: opencode.Location{Directory: "/tmp/proj"},
+	}
+	win.openSubagent(tab, subSess)
+	if got := win.agentPillLabel.Label(); got != "Explore" {
+		t.Fatalf("subagent agentPillLabel = %q, want Explore", got)
+	}
+	if got := win.modelStatusLabel.Label(); got != "Claude Fable 5.2" {
+		t.Fatalf("subagent modelStatusLabel = %q, want 'Claude Fable 5.2'", got)
+	}
+
+	// 3. Creating a new session while focused on the subagent must use the last user-selected agent/model,
+	// NOT the subagent's agent ("explore") or model ("claude-fable-5-2").
+	win.createNewSessionInDir("/tmp/proj")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(createdReqs)
+		mu.Unlock()
+		if n == 1 && win.tabs["ses_new_1"] != nil && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(createdReqs) != 1 {
+		t.Fatalf("expected 1 CreateSessionRequest, got %d", len(createdReqs))
+	}
+	req := createdReqs[0]
+	if req.Agent != "plan" {
+		t.Fatalf("CreateSessionRequest.Agent = %q, want 'plan'", req.Agent)
+	}
+	if req.Model == nil || req.Model.ProviderID != "google" || req.Model.ID != "antigravity-gemini-4-hydrogen-high" {
+		t.Fatalf("CreateSessionRequest.Model = %+v, want google/antigravity-gemini-4-hydrogen-high", req.Model)
+	}
+
+	// 4. Focusing another root session with a different agent/model via SSE does not overwrite lastSelected*.
+	otherSess := opencode.Session{
+		ID:       "ses_other",
+		Title:    "Other Session",
+		Agent:    "orchestrator",
+		Model:    opencode.ModelRef{ProviderID: "google", ID: "antigravity-gemini-4-hydrogen-medium"},
+		Location: opencode.Location{Directory: "/tmp/proj"},
+	}
+	otherTab := win.addSessionTab(otherSess)
+	otherTab.main.loaded = true
+	win.selectSession(otherSess)
+	if win.lastSelectedAgent != "plan" || win.lastSelectedModel.ID != "antigravity-gemini-4-hydrogen-high" {
+		t.Fatalf("selectSession overwrote lastSelected*: (%q, %+v)", win.lastSelectedAgent, win.lastSelectedModel)
+	}
+}
+
+func derefOrZeroModel(m *opencode.ModelRef) opencode.ModelRef {
+	if m == nil {
+		return opencode.ModelRef{}
+	}
+	return *m
 }

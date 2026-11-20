@@ -82,7 +82,7 @@ GTK4 / Libadwaita UI, state, and event orchestration:
 - `composer.go`: Multiline expand/collapse, `composerEnterAction` (Enter / Shift+Enter / Alt+Enter / Ctrl+Enter), client-side Markdown span tagging (`scanComposerMarkdownSpans`).
 - `completion.go`: `CompletionProvider` & `CompletionProposal` (`coreglib.RegisterSubclass` for `GtkSourceCompletion`), `/` commands (`builtinSlashCommands` + server commands), `@` skills/agents/workspace files, `parseMentions`.
 - `mcp.go`, `mcp_oauth.go`: `mcpManager`, `mcpDetailView` (resources, config, 500ms `McpLogTailer` polling), `Ctrl+Shift+M` shortcut, and `mcpOAuthDialog` (`adw.Dialog`).
-- `state.go`: Atomic JSON persistence (`$GLUPPENCODE_STATE_FILE` or `$XDG_DATA_HOME/opencode/gluppencode.json`) for `visibleSessions`, `archivedSessions`, `collapsedProjects`, `projectOrder`, `inputHistory`, `sidebarWidth`, `GreeterProfile`, and `Preferences`.
+- `state.go`: Atomic JSON persistence (`$GLUPPENCODE_STATE_FILE` or `$XDG_DATA_HOME/opencode/gluppencode.json`) for `visibleSessions`, `archivedSessions`, `collapsedProjects`, `projectOrder`, `inputHistory`, `sidebarWidth`, `lastSelectedAgent`, `lastSelectedModel`, `GreeterProfile`, and `Preferences`.
 - `draft.go`: Per-session composer draft + binary attachment persistence (`.../gluppencode/drafts/<sessionID>/`) guarded by `draftWriteGen` and `draftWriteMu`.
 - `preferences.go`: `adw.PreferencesDialog` and live `applyPreferenceDelta` sync across windows.
 - `notifications.go`: Per-`gtk.Application` `notificationCoordinator` (`RegisterAppActions`, `app.open-session`, focus withdrawal, cross-window preference sync).

@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"libdb.so/gluppencode/internal/opencode"
 )
 
 const (
@@ -173,14 +175,16 @@ type GreeterProfile struct {
 
 // persistedState represents the local UI state stored in ~/.local/share/opencode/gluppencode.json.
 type persistedState struct {
-	VisibleSessions   map[string]bool `json:"visibleSessions,omitempty"`
-	ArchivedSessions  map[string]bool `json:"archivedSessions,omitempty"`
-	CollapsedProjects map[string]bool `json:"collapsedProjects,omitempty"`
-	ProjectOrder      []string        `json:"projectOrder,omitempty"`
-	InputHistory      []string        `json:"inputHistory,omitempty"`
-	SidebarWidth      int             `json:"sidebarWidth,omitempty"`
-	Greeter           *GreeterProfile `json:"greeter,omitempty"`
-	Preferences       Preferences     `json:"preferences,omitempty"`
+	VisibleSessions   map[string]bool    `json:"visibleSessions,omitempty"`
+	ArchivedSessions  map[string]bool    `json:"archivedSessions,omitempty"`
+	CollapsedProjects map[string]bool    `json:"collapsedProjects,omitempty"`
+	ProjectOrder      []string           `json:"projectOrder,omitempty"`
+	InputHistory      []string           `json:"inputHistory,omitempty"`
+	SidebarWidth      int                `json:"sidebarWidth,omitempty"`
+	LastSelectedAgent string             `json:"lastSelectedAgent,omitempty"`
+	LastSelectedModel *opencode.ModelRef `json:"lastSelectedModel,omitempty"`
+	Greeter           *GreeterProfile    `json:"greeter,omitempty"`
+	Preferences       Preferences        `json:"preferences,omitempty"`
 }
 
 func defaultStateFilePath() string {
@@ -244,6 +248,15 @@ func loadPersistedState(path string) persistedState {
 		st.InputHistory = slices.Clone(st.InputHistory[len(st.InputHistory)-maxInputHistory:])
 	}
 	st.SidebarWidth = clampSidebarWidth(st.SidebarWidth)
+	st.LastSelectedAgent = strings.TrimSpace(st.LastSelectedAgent)
+	if st.LastSelectedModel != nil {
+		st.LastSelectedModel.ID = strings.TrimSpace(st.LastSelectedModel.ID)
+		st.LastSelectedModel.ProviderID = strings.TrimSpace(st.LastSelectedModel.ProviderID)
+		st.LastSelectedModel.Variant = strings.TrimSpace(st.LastSelectedModel.Variant)
+		if st.LastSelectedModel.ID == "" {
+			st.LastSelectedModel = nil
+		}
+	}
 	st.Preferences = normalizePreferences(st.Preferences)
 	return st
 }
@@ -277,6 +290,12 @@ func (w *Window) loadState() {
 	w.projectOrder = st.ProjectOrder
 	w.inputHistory = st.InputHistory
 	w.sidebarWidth = st.SidebarWidth
+	w.lastSelectedAgent = st.LastSelectedAgent
+	if st.LastSelectedModel != nil {
+		w.lastSelectedModel = *st.LastSelectedModel
+	} else {
+		w.lastSelectedModel = opencode.ModelRef{}
+	}
 	w.greeterProfile = st.Greeter
 	w.prefs = st.Preferences
 	w.applySidebarWidth()
@@ -305,6 +324,11 @@ func (w *Window) saveState() {
 			collapsed[dir] = true
 		}
 	}
+	var lastModel *opencode.ModelRef
+	if w.lastSelectedModel.ID != "" {
+		m := w.lastSelectedModel
+		lastModel = &m
+	}
 	st := persistedState{
 		VisibleSessions:   visible,
 		ArchivedSessions:  archived,
@@ -312,6 +336,8 @@ func (w *Window) saveState() {
 		ProjectOrder:      w.projectOrder,
 		InputHistory:      w.inputHistory,
 		SidebarWidth:      clampSidebarWidth(w.sidebarWidth),
+		LastSelectedAgent: strings.TrimSpace(w.lastSelectedAgent),
+		LastSelectedModel: lastModel,
 		Greeter:           w.greeterProfile,
 		Preferences:       normalizePreferences(w.prefs),
 	}

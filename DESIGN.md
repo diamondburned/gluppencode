@@ -37,7 +37,7 @@ The following requirements serve as the design source of truth for Gluppencode:
      - Floats over the bottom of the timeline inside a `GtkOverlay`, paired with a dynamic bottom fade ramp (`timelineBottomFade`) and bottom scroll inset (`applyComposerInset`).
      - Attachment tray (`AdwWrapBox`) for pending image attachments (file chooser or `Ctrl+V` clipboard paste).
      - `GtkSourceView` (`inputView`) with placeholder (`Ask anything, @ to mention, / for actions`), live client-side Markdown span highlighting, multiline expand/collapse toggle (`composerExpandBtn`), Up/Down input history, and `GtkSourceCompletion` popups for `/` commands (built-in + server) and `@` mentions (skills, agents, workspace files).
-     - Bottom controls row: `+` attach button, flat `^ <Agent>` and searchable `^ <Model>` popovers (positioned above the composer with recent/filtered models), expand button, and circular Send / Stop action buttons.
+     - Bottom controls row: `+` attach button, flat `^ <Agent>` and searchable `^ <Model>` popovers (positioned above the composer with recent/filtered models; explicitly selected agent/model values are remembered and reused for new sessions instead of inheriting from the focused session or subagent), expand button, and circular Send / Stop action buttons.
      - Supports configurable `Enter` vs `Ctrl+Enter` send mode (with `Shift+Enter` always inserting newlines and `Alt+Enter` queueing in expanded multiline mode), immediate **Steer** (`Ctrl+Enter`) vs **Queue** (`Enter`) delivery (`opencode.InboxDelivery`), drag-and-drop queue reordering, and built-in slash commands (`/undo`, `/redo`, `/new`, `/cd`, `/compact`, `/mcp` / `/mcps`).
    - **Persistent Bottom Status Bar (`statusBarBox`)**:
      - Left chips (`.glup-status-chip`): project directory (`folder-symbolic`), cached Git branch (`git-branch-symbolic`, resolved locally from `.git/HEAD` or worktree pointers), and MCP summary (`bolt-symbolic`).
@@ -72,7 +72,7 @@ The following requirements serve as the design source of truth for Gluppencode:
 8. **Multi-Window Support, State & Preferences**:
    - Spawning multiple instances or pressing `Ctrl+Shift+N` opens independent top-level windows, each with its own cancellable context terminating background tickers and SSE loops on close.
    - Multi-window `notificationCoordinator` (`notifications.go`) syncs preference changes and desktop notifications across open windows.
-   - Atomic JSON persistence (`state.go`) stores visible/archived sessions, collapsed/ordered projects, sidebar width, input history, greeter profile, and user preferences (`$GLUPPENCODE_STATE_FILE` or `$XDG_DATA_HOME/opencode/gluppencode.json`), alongside per-session draft directories (`gluppencode/drafts/<sessionID>/` in `draft.go`).
+   - Atomic JSON persistence (`state.go`) stores visible/archived sessions, collapsed/ordered projects, sidebar width, input history, last user-selected agent/model, greeter profile, and user preferences (`$GLUPPENCODE_STATE_FILE` or `$XDG_DATA_HOME/opencode/gluppencode.json`), alongside per-session draft directories (`gluppencode/drafts/<sessionID>/` in `draft.go`).
    - `adw.PreferencesDialog` (`preferences.go`) configures chat width, max visible sessions, color scheme, `GtkSourceView` / Chroma syntax theme, shell tail lines, diff truncation lines, `Ctrl+Enter` send mode, Take Charge directive, greeter overrides, notifications, and server URL override.
 
 9. **Prefix-Cached & Batched Streaming Markdown (`internal/mdstream`)**:
