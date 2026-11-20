@@ -8900,6 +8900,13 @@ func (w *Window) recordInputHistory(text string) {
 	w.historyDraft = ""
 }
 
+func (w *Window) canUseInputDisplayLines() bool {
+	return w.inputView != nil && w.inputBuffer != nil &&
+		w.inputView.Width() > 0 &&
+		w.inputView.Buffer() != nil &&
+		w.inputView.Buffer().Native() == w.inputBuffer.Native()
+}
+
 func (w *Window) isInputCursorOnTopLine() bool {
 	if w.inputBuffer == nil || w.inputBuffer.HasSelection() {
 		return false
@@ -8909,7 +8916,17 @@ func (w *Window) isInputCursorOnTopLine() bool {
 		return true
 	}
 	iter := w.inputBuffer.IterAtMark(mark)
-	return iter == nil || iter.Line() == 0
+	if iter == nil {
+		return true
+	}
+	if iter.Line() != 0 {
+		return false
+	}
+	if w.canUseInputDisplayLines() {
+		probe := iter.Copy()
+		return !w.inputView.BackwardDisplayLine(probe)
+	}
+	return true
 }
 
 func (w *Window) isInputCursorOnBottomLine() bool {
@@ -8925,7 +8942,14 @@ func (w *Window) isInputCursorOnBottomLine() bool {
 		return true
 	}
 	lastLine := max(0, w.inputBuffer.LineCount()-1)
-	return iter.Line() >= lastLine
+	if iter.Line() < lastLine {
+		return false
+	}
+	if w.canUseInputDisplayLines() {
+		probe := iter.Copy()
+		return !w.inputView.ForwardDisplayLine(probe)
+	}
+	return true
 }
 
 func (w *Window) setHistoryBufferText(text string) {

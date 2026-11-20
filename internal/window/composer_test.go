@@ -529,3 +529,148 @@ func TestEscapeDoublePressStopSession(t *testing.T) {
 		t.Fatal("expected updateBusyState(false) to disarm stop confirmation")
 	}
 }
+
+func TestComposerInputHistoryWrappedLines(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+	adw.Init()
+	gtksource.Init()
+
+	inputView := gtksource.NewView()
+	inputBuf := inputView.Buffer().Cast().(*gtksource.Buffer)
+	inputView.SetWrapMode(gtk.WrapWordChar)
+	inputView.SetSizeRequest(180, -1)
+
+	win := adw.NewWindow()
+	win.SetDefaultSize(200, 200)
+	box := gtk.NewBox(gtk.OrientationVertical, 0)
+	box.Append(inputView)
+	win.SetContent(box)
+	win.Present()
+	defer win.Close()
+
+	pumpMainLoop(150 * time.Millisecond)
+	if inputView.Width() == 0 {
+		t.Skip("no surface allocation (broadway without client)")
+	}
+
+	w := &Window{
+		inputView:    inputView,
+		inputBuffer:  inputBuf,
+		inputHistory: []string{"older prompt", "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega"},
+	}
+
+	draft := "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty twenty-one twenty-two"
+	inputBuf.SetText(draft)
+	pumpMainLoop(50 * time.Millisecond)
+
+	var lineStarts []int
+	for off := 0; off < inputBuf.CharCount(); off++ {
+		if inputView.StartsDisplayLine(inputBuf.IterAtOffset(off)) {
+			lineStarts = append(lineStarts, off)
+		}
+	}
+	if len(lineStarts) < 3 {
+		t.Fatalf("expected >= 3 wrapped display lines at width=%d, got %v", inputView.Width(), lineStarts)
+	}
+
+	// Display line 0: top=true, bottom=false.
+	for _, off := range []int{lineStarts[0], (lineStarts[0] + lineStarts[1] - 1) / 2, lineStarts[1] - 1} {
+		inputBuf.PlaceCursor(inputBuf.IterAtOffset(off))
+		if !w.isInputCursorOnTopLine() || w.isInputCursorOnBottomLine() {
+			t.Fatalf("line 0 offset %d: got top=%v bottom=%v, want top=true bottom=false",
+				off, w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+		}
+	}
+
+	// Middle display line: top=false, bottom=false.
+	for _, off := range []int{lineStarts[1], (lineStarts[1] + lineStarts[2] - 1) / 2} {
+		inputBuf.PlaceCursor(inputBuf.IterAtOffset(off))
+		if w.isInputCursorOnTopLine() || w.isInputCursorOnBottomLine() {
+			t.Fatalf("middle line offset %d: got top=%v bottom=%v, want top=false bottom=false",
+				off, w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+		}
+	}
+
+	// Last display line: top=false, bottom=true.
+	lastStart := lineStarts[len(lineStarts)-1]
+	for _, off := range []int{lastStart, inputBuf.CharCount()} {
+		inputBuf.PlaceCursor(inputBuf.IterAtOffset(off))
+		if w.isInputCursorOnTopLine() || !w.isInputCursorOnBottomLine() {
+			t.Fatalf("last line offset %d: got top=%v bottom=%v, want top=false bottom=true",
+				off, w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+		}
+	}
+
+	// Pressing Up while cursor is on wrapped bottom line must NOT override the prompt.
+	if w.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatal("expected Up on wrapped bottom line to move cursor up instead of overriding prompt")
+	}
+	start, end := inputBuf.Bounds()
+	if got := inputBuf.Text(start, end, false); got != draft {
+		t.Fatalf("expected draft %q to remain intact, got %q", draft, got)
+	}
+
+	// Move cursor to display line 0 and press Up: recalls wrapped history entry.
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(3))
+	if !w.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatal("expected Up on display line 0 to recall history")
+	}
+	start, end = inputBuf.Bounds()
+	wantRecalled := w.inputHistory[1]
+	if got := inputBuf.Text(start, end, false); got != wantRecalled {
+		t.Fatalf("expected recalled history %q, got %q", wantRecalled, got)
+	}
+
+	// Immediately pressing Up again (cursor at end of recalled wrapped entry) must NOT jump again.
+	if w.handleInputHistoryKey(gdk.KEY_Up, 0) {
+		t.Fatal("expected Up at end of wrapped recalled history entry to move cursor up, not jump history")
+	}
+	start, end = inputBuf.Bounds()
+	if got := inputBuf.Text(start, end, false); got != wantRecalled {
+		t.Fatalf("expected recalled history %q to remain intact, got %q", wantRecalled, got)
+	}
+
+	// Move cursor to display line 0 of recalled entry: Down must NOT jump history.
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(2))
+	if w.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatal("expected Down on display line 0 of wrapped entry to move cursor down, not jump history")
+	}
+
+	// Move cursor to end of recalled entry: Down restores live draft.
+	_, end = inputBuf.Bounds()
+	inputBuf.PlaceCursor(end)
+	if !w.handleInputHistoryKey(gdk.KEY_Down, 0) {
+		t.Fatal("expected Down on bottom display line to restore draft")
+	}
+	start, end = inputBuf.Bounds()
+	if got := inputBuf.Text(start, end, false); got != draft {
+		t.Fatalf("expected restored draft %q, got %q", draft, got)
+	}
+
+	// Explicit newline edge cases: leading and trailing empty lines.
+	inputBuf.SetText("\nhello")
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(0))
+	if !w.isInputCursorOnTopLine() || w.isInputCursorOnBottomLine() {
+		t.Fatalf("leading newline offset 0: got top=%v bottom=%v, want top=true bottom=false",
+			w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+	}
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(1))
+	if w.isInputCursorOnTopLine() || !w.isInputCursorOnBottomLine() {
+		t.Fatalf("leading newline offset 1: got top=%v bottom=%v, want top=false bottom=true",
+			w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+	}
+
+	inputBuf.SetText("hello\n")
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(5))
+	if !w.isInputCursorOnTopLine() || w.isInputCursorOnBottomLine() {
+		t.Fatalf("trailing newline offset 5: got top=%v bottom=%v, want top=true bottom=false",
+			w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+	}
+	inputBuf.PlaceCursor(inputBuf.IterAtOffset(6))
+	if w.isInputCursorOnTopLine() || !w.isInputCursorOnBottomLine() {
+		t.Fatalf("trailing newline offset 6: got top=%v bottom=%v, want top=false bottom=true",
+			w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
+	}
+}
