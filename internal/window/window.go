@@ -858,8 +858,10 @@ type Window struct {
 	sidebarSetupDone     bool
 	syncingSidebarSelect bool
 	fileOpener           func(string)
+	fileOpenWith         func(string)
 	clipboardSetter      func(string)
 	uriLauncher          func(string) error
+	mdViewers            map[string]*markdownViewer
 
 	takeCharge         bool
 	takeChargeInFlight map[string]bool
@@ -1042,10 +1044,16 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		takeChargeInFlight:    make(map[string]bool),
 		resolvedSessionTitles: make(map[string]string),
 		resolvingSessions:     make(map[string][]func(string)),
+		mdViewers:             make(map[string]*markdownViewer),
 	}
 	w.ctx = mdstream.WithAsyncSessionResolver(w.ctx, w.resolveSessionTitleAsync)
 	w.ctx = mdstream.WithLinkHandler(w.ctx, w.handleMarkdownLink)
 	w.ctx = WithDiffMaxLines(w.ctx, w.effectiveDiffTruncationLines)
+	w.ctx = WithToolFileActions(w.ctx, ToolFileActions{
+		CopyPath:        w.copyTextToClipboard,
+		OpenWith:        w.openFileWith,
+		PreviewMarkdown: w.openMarkdownViewer,
+	})
 	w.copySessionIDBtn.ConnectClicked(func() {
 		if w.contextSessionIDLabel == nil {
 			return
@@ -1176,6 +1184,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 		w.cancelAllCompletionSettles()
 		w.unregisterFromNotifications()
+		for _, v := range slices.Collect(maps.Values(w.mdViewers)) {
+			v.Close()
+		}
 		cancel()
 		for _, tab := range w.tabs {
 			tab.main.closeStreams()
@@ -3341,6 +3352,57 @@ func (w *Window) openProjectInFiles(rawDir string) {
 	}
 	launcher := gtk.NewFileLauncher(gio.NewFileForPath(dir))
 	launcher.Launch(w.ctx, parent, nil)
+}
+
+func (w *Window) openFileWith(rawPath string) {
+	path := strings.TrimSpace(rawPath)
+	if path == "" {
+		return
+	}
+	if w.fileOpenWith != nil {
+		w.fileOpenWith(path)
+		return
+	}
+	var parent *gtk.Window
+	if w.ApplicationWindow != nil {
+		parent = &w.Window
+	}
+	launcher := gtk.NewFileLauncher(gio.NewFileForPath(path))
+	launcher.SetAlwaysAsk(true)
+	launcher.Launch(w.ctx, parent, func(res gio.AsyncResulter) {
+		_ = launcher.LaunchFinish(res)
+	})
+}
+
+func (w *Window) openMarkdownViewer(rawPath string) {
+	path := filepath.Clean(strings.TrimSpace(rawPath))
+	if path == "" || path == "." {
+		return
+	}
+	if w.mdViewers == nil {
+		w.mdViewers = make(map[string]*markdownViewer)
+	}
+	if existing, ok := w.mdViewers[path]; ok && existing != nil && !existing.closed {
+		existing.Present()
+		return
+	}
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	v := newMarkdownViewer(
+		ctx,
+		path,
+		w.copyTextToClipboard,
+		w.openFileWith,
+		w.openMarkdownViewer,
+		w.handleMarkdownLink,
+		func() {
+			delete(w.mdViewers, path)
+		},
+	)
+	w.mdViewers[path] = v
+	v.Present()
 }
 
 func (w *Window) copyTextToClipboard(text string) {
@@ -6512,6 +6574,7 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 		aw := NewAssistantMessageWidget(w.ctx, msg.Agent, msg.Model.String(), func(subID string) {
 			w.openSubagentByID(tab, subID)
 		})
+		aw.SetBaseDir(conv.session.Location.Directory)
 		aw.LoadContent(msg.Content)
 		for _, tw := range aw.tools {
 			if shID := tw.ShellID(); shID != "" {
@@ -10209,6 +10272,7 @@ func (w *Window) ensureAssistantWidget(tab *sessionTab, conv *convTimeline, msgI
 	aw := NewAssistantMessageWidget(w.ctx, agent, model, func(subID string) {
 		w.openSubagentByID(tab, subID)
 	})
+	aw.SetBaseDir(conv.session.Location.Directory)
 	conv.assistantMap[msgID] = aw
 	conv.messageWidgets[msgID] = aw
 	var msg opencode.Message

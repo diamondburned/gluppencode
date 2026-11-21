@@ -78,7 +78,8 @@ OpenCode V2 HTTP + SSE client and local MCP helpers (pure Go, no GTK dependency)
 GTK4 / Libadwaita UI, state, and event orchestration:
 - `window.ui`, `message.ui`, `tool.ui`, `style.css`: Declarative GtkBuilder widget templates and application CSS.
 - `window.go`: Main `Window` struct, tab/subagent lifecycle, sidebar, composer dispatch, message reconciliation, status bar/sheet, and SSE dispatch (see entrypoint map below).
-- `message.go`: Timeline widgets — `UserMessageWidget` (undo/steer/cancel + drag-reorder), `AssistantMessageWidget`, `ToolWidget` (diffs, lazy expandable tool details, live shell tail, subagent jump), `CompactionWidget`, `SyntheticSubagentWidget` (subagent and shell completion rows), `SystemNoticeWidget`, `AgentSwitchedWidget` (also used by `NewModelSwitchedWidget` and `NewLocationSwitchedWidget`), `RevertBannerWidget`, `QuestionFormWidget`, `PermissionPromptWidget`.
+- `message.go`: Timeline widgets — `UserMessageWidget` (undo/steer/cancel + drag-reorder), `AssistantMessageWidget`, `ToolWidget` (diffs, lazy expandable tool details, live shell tail, subagent jump, right-click file actions `ToolFileActions` + top Markdown `Preview`), `CompactionWidget`, `SyntheticSubagentWidget` (subagent and shell completion rows), `SystemNoticeWidget`, `AgentSwitchedWidget` (also used by `NewModelSwitchedWidget` and `NewLocationSwitchedWidget`), `RevertBannerWidget`, `QuestionFormWidget`, `PermissionPromptWidget`.
+- `markdown_viewer.go`: `markdownViewer` / `showMarkdownViewer` live Markdown preview window (`adw.Window` + `mdstream.View` + `gio.FileMonitor` debounced live reload, relative `.md` link navigation, Copy Path, Open With…).
 - `composer.go`: Multiline expand/collapse, `composerEnterAction` (Enter / Shift+Enter / Alt+Enter / Ctrl+Enter), client-side Markdown span tagging (`scanComposerMarkdownSpans`).
 - `completion.go`: `CompletionProvider` & `CompletionProposal` (`coreglib.RegisterSubclass` for `GtkSourceCompletion`), `/` commands (`builtinSlashCommands` + server commands), `@` skills/agents/workspace files, `parseMentions`.
 - `mcp.go`, `mcp_oauth.go`: `mcpManager`, `mcpDetailView` (resources, config, 500ms `McpLogTailer` polling), `Ctrl+Shift+M` shortcut, and `mcpOAuthDialog` (`adw.Dialog`).
@@ -88,7 +89,7 @@ GTK4 / Libadwaita UI, state, and event orchestration:
 - `notifications.go`: Per-`gtk.Application` `notificationCoordinator` (`RegisterAppActions`, `app.open-session`, focus withdrawal, cross-window preference sync).
 - `suspend.go`: Idle tab suspension (`tabSuspendAfter`, `isTabSuspended`, `awakeTabDirs`).
 - `greeter.go`, `fuzzy.go`, `image.go`: `GreeterWidget` + async `GreeterProfile` generation, `fuzzyMatchScore`, image texture decoding + `newImageThumbnail` + `showImageViewer`.
-- `*_test.go`: Unit and GTK widget reconciliation tests covering timeline/SSE reconciliation, activity phases, sidebar, MCP UI, drafts, composer/completion, notifications, tab suspension, and fuzzy matching.
+- `*_test.go`: Unit and GTK widget reconciliation tests covering timeline/SSE reconciliation, activity phases, sidebar, MCP UI, drafts, composer/completion, notifications, tab suspension, tool file actions / Markdown viewer, and fuzzy matching.
 
 ---
 

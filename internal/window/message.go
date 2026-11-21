@@ -4,6 +4,8 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
+	"math"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -279,6 +281,7 @@ type ToolWidget struct {
 	titleLabel      *gtk.Label
 	subtitleLabel   *gtk.Label
 	badgesBox       *gtk.Box
+	previewBtn      *gtk.Button
 	actionBtn       *gtk.Button
 	spinner         *adw.Spinner
 	statusLabel     *gtk.Label
@@ -308,7 +311,15 @@ type ToolWidget struct {
 	liveShellOutput    string
 	appliedShellOutput string
 	childSessionID     string
-	readPath           string
+	baseDir            string
+	rawFilePath        string
+	filePath           string
+	fileActions        ToolFileActions
+	contextPopover     *gtk.Popover
+	contextPreviewBtn  *gtk.Button
+	contextCopyBtn     *gtk.Button
+	contextOpenWithBtn *gtk.Button
+	fileMenuWired      bool
 	onOpenSubagent     func(string)
 	expanderWired      bool
 	lazyInputText      string
@@ -325,6 +336,78 @@ type ToolWidget struct {
 	diffRendered       bool
 	diffExpanded       bool
 	diffMaxLines       func() int
+}
+
+// ToolFileActions provides host callbacks for file-based tool call actions.
+type ToolFileActions struct {
+	CopyPath        func(path string)
+	OpenWith        func(path string)
+	PreviewMarkdown func(path string)
+}
+
+type toolFileActionsKey struct{}
+
+// WithToolFileActions returns a context carrying file action handlers for ToolWidgets.
+func WithToolFileActions(ctx context.Context, actions ToolFileActions) context.Context {
+	return context.WithValue(ctx, toolFileActionsKey{}, actions)
+}
+
+func toolFileActionsFromContext(ctx context.Context) ToolFileActions {
+	if ctx == nil {
+		return ToolFileActions{}
+	}
+	actions, _ := ctx.Value(toolFileActionsKey{}).(ToolFileActions)
+	return actions
+}
+
+func isFilePathTool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "read", "write", "edit", "multiedit", "multi_edit", "patch", "apply_patch":
+		return true
+	default:
+		return false
+	}
+}
+
+func isMarkdownPath(path string) bool {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(path))) {
+	case ".md", ".markdown", ".mdown", ".mkd", ".mdx":
+		return true
+	default:
+		return false
+	}
+}
+
+func resolveToolFilePath(baseDir, rawPath string) string {
+	p := strings.TrimSpace(rawPath)
+	if p == "" {
+		return ""
+	}
+	if strings.HasPrefix(p, "~/") {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			p = filepath.Join(home, p[2:])
+		}
+	}
+	if filepath.IsAbs(p) {
+		return filepath.Clean(p)
+	}
+	baseDir = strings.TrimSpace(baseDir)
+	if baseDir != "" {
+		return filepath.Clean(filepath.Join(baseDir, p))
+	}
+	return filepath.Clean(p)
+}
+
+func firstToolInputString(m map[string]any, keys ...string) string {
+	if m == nil {
+		return ""
+	}
+	for _, k := range keys {
+		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 type diffMaxLinesKey struct{}
@@ -373,6 +456,7 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 	titleLabel := builder.GetObject("titleLabel").Cast().(*gtk.Label)
 	subtitleLabel := builder.GetObject("subtitleLabel").Cast().(*gtk.Label)
 	badgesBox := builder.GetObject("badgesBox").Cast().(*gtk.Box)
+	previewBtn := builder.GetObject("previewBtn").Cast().(*gtk.Button)
 	actionBtn := builder.GetObject("actionBtn").Cast().(*gtk.Button)
 	spinner := builder.GetObject("spinner").Cast().(*adw.Spinner)
 	statusLabel := builder.GetObject("statusLabel").Cast().(*gtk.Label)
@@ -397,6 +481,7 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		titleLabel:      titleLabel,
 		subtitleLabel:   subtitleLabel,
 		badgesBox:       badgesBox,
+		previewBtn:      previewBtn,
 		actionBtn:       actionBtn,
 		spinner:         spinner,
 		statusLabel:     statusLabel,
@@ -410,9 +495,17 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		outputBuf:       outputView.Buffer(),
 		toolID:          id,
 		toolName:        name,
+		fileActions:     toolFileActionsFromContext(ctx),
 		onOpenSubagent:  onOpenSubagent,
 		diffMaxLines:    diffMaxLinesFromContext(ctx),
 	}
+
+	setPreviewMarkdownButtonContent(previewBtn)
+	previewBtn.ConnectClicked(func() {
+		if tw.canPreviewMarkdown() {
+			tw.triggerPreviewMarkdown()
+		}
+	})
 
 	actionBtn.ConnectClicked(func() {
 		if tw.childSessionID != "" && tw.onOpenSubagent != nil {
@@ -420,6 +513,7 @@ func NewToolWidget(ctx context.Context, id, name string, onOpenSubagent func(str
 		}
 	})
 
+	tw.setupFileContextMenu()
 	tw.applyToolKind()
 	return tw
 }
@@ -470,6 +564,7 @@ func (t *ToolWidget) applyToolKind() {
 			t.headerRow.SetCursorFromName("pointer")
 		}
 	}
+	t.syncFileActions()
 }
 
 func formatToolTitle(name string) string {
@@ -560,6 +655,19 @@ func setViewSessionButtonContent(btn *gtk.Button) {
 	box.Append(lbl)
 	box.Append(icon)
 	btn.SetChild(box)
+	btn.SetTooltipText("Open subagent session")
+}
+
+func setPreviewMarkdownButtonContent(btn *gtk.Button) {
+	box := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	box.SetVAlign(gtk.AlignCenter)
+	icon := gtk.NewImageFromIconName("visibility-symbolic")
+	icon.SetPixelSize(12)
+	lbl := gtk.NewLabel("Preview")
+	box.Append(icon)
+	box.Append(lbl)
+	btn.SetChild(box)
+	btn.SetTooltipText("Open live Markdown preview")
 }
 
 func (t *ToolWidget) setChildSessionID(id string) {
@@ -572,6 +680,188 @@ func (t *ToolWidget) setChildSessionID(id string) {
 	if t.headerRow != nil {
 		t.headerRow.AddCSSClass("glup-tool-clickable")
 		t.headerRow.SetCursorFromName("pointer")
+	}
+}
+
+// SetBaseDir sets the session working directory used to resolve relative tool file paths.
+func (t *ToolWidget) SetBaseDir(dir string) {
+	if t == nil {
+		return
+	}
+	dir = strings.TrimSpace(dir)
+	if t.baseDir == dir {
+		return
+	}
+	t.baseDir = dir
+	if t.rawFilePath != "" {
+		t.filePath = resolveToolFilePath(t.baseDir, t.rawFilePath)
+		t.syncFileActions()
+	}
+}
+
+// FilePath returns the resolved file path associated with this tool widget, if any.
+func (t *ToolWidget) FilePath() string {
+	if t == nil {
+		return ""
+	}
+	return t.filePath
+}
+
+func (t *ToolWidget) setToolFilePath(raw string) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return
+	}
+	t.rawFilePath = raw
+	t.filePath = resolveToolFilePath(t.baseDir, raw)
+	t.syncFileActions()
+}
+
+func (t *ToolWidget) canShowFileContextMenu() bool {
+	return t != nil && isFilePathTool(t.toolName) && t.filePath != ""
+}
+
+func (t *ToolWidget) canPreviewMarkdown() bool {
+	return t.canShowFileContextMenu() && isMarkdownPath(t.filePath)
+}
+
+func (t *ToolWidget) triggerCopyPath() {
+	path := t.FilePath()
+	if path == "" {
+		return
+	}
+	if t.fileActions.CopyPath != nil {
+		t.fileActions.CopyPath(path)
+		return
+	}
+	if d := gdk.DisplayGetDefault(); d != nil {
+		d.Clipboard().SetText(path)
+	}
+}
+
+func (t *ToolWidget) triggerOpenWith() {
+	path := t.FilePath()
+	if path == "" {
+		return
+	}
+	if t.fileActions.OpenWith != nil {
+		t.fileActions.OpenWith(path)
+		return
+	}
+	openFileWithDefault(t.ctx, path)
+}
+
+func (t *ToolWidget) triggerPreviewMarkdown() {
+	path := t.FilePath()
+	if path == "" || !isMarkdownPath(path) {
+		return
+	}
+	if t.fileActions.PreviewMarkdown != nil {
+		t.fileActions.PreviewMarkdown(path)
+		return
+	}
+	showMarkdownViewer(t.ctx, path)
+}
+
+func (t *ToolWidget) setupFileContextMenu() {
+	if t == nil || t.Box == nil || t.fileMenuWired {
+		return
+	}
+	t.fileMenuWired = true
+
+	menuBox := gtk.NewBox(gtk.OrientationVertical, 2)
+	menuBox.AddCSSClass("glup-popover-content")
+	menuBox.AddCSSClass("glup-project-menu")
+
+	popover := gtk.NewPopover()
+	popover.SetHasArrow(true)
+	popover.SetAutohide(true)
+	popover.SetPosition(gtk.PosBottom)
+	popover.SetChild(menuBox)
+	popover.SetParent(t.Box)
+
+	t.Box.ConnectDestroy(func() {
+		if popover.Parent() != nil {
+			popover.Unparent()
+		}
+	})
+
+	previewBtn, _ := newProjectHeaderMenuButton("visibility-symbolic", "Preview Markdown")
+	previewBtn.SetVisible(false)
+	previewBtn.ConnectClicked(func() {
+		popover.Popdown()
+		t.triggerPreviewMarkdown()
+	})
+	menuBox.Append(previewBtn)
+
+	copyBtn, _ := newProjectHeaderMenuButton("edit-copy-symbolic", "Copy Path")
+	copyBtn.ConnectClicked(func() {
+		popover.Popdown()
+		t.triggerCopyPath()
+	})
+	menuBox.Append(copyBtn)
+
+	openWithBtn, _ := newProjectHeaderMenuButton("open-in-new-symbolic", "Open With…")
+	openWithBtn.ConnectClicked(func() {
+		popover.Popdown()
+		t.triggerOpenWith()
+	})
+	menuBox.Append(openWithBtn)
+
+	t.contextPopover = popover
+	t.contextPreviewBtn = previewBtn
+	t.contextCopyBtn = copyBtn
+	t.contextOpenWithBtn = openWithBtn
+
+	rightClick := gtk.NewGestureClick()
+	rightClick.SetButton(3)
+	rightClick.ConnectPressed(func(_ int, x, y float64) {
+		if !t.canShowFileContextMenu() {
+			return
+		}
+		rightClick.SetState(gtk.EventSequenceClaimed)
+		t.openFileContextMenuAt(x, y)
+	})
+	t.Box.AddController(rightClick)
+
+	longPress := gtk.NewGestureLongPress()
+	longPress.SetTouchOnly(true)
+	longPress.ConnectPressed(func(x, y float64) {
+		if !t.canShowFileContextMenu() {
+			return
+		}
+		longPress.SetState(gtk.EventSequenceClaimed)
+		t.openFileContextMenuAt(x, y)
+	})
+	t.Box.AddController(longPress)
+}
+
+func (t *ToolWidget) openFileContextMenuAt(x, y float64) {
+	if t == nil || t.contextPopover == nil || !t.canShowFileContextMenu() {
+		return
+	}
+	t.syncFileActions()
+	if x > 0 || y > 0 {
+		rect := gdk.NewRectangle(int(math.Round(x)), int(math.Round(y)), 1, 1)
+		t.contextPopover.SetPointingTo(&rect)
+	} else {
+		t.contextPopover.SetPointingTo(nil)
+	}
+	if t.Box != nil && t.Box.Root() != nil {
+		t.contextPopover.Popup()
+	}
+}
+
+func (t *ToolWidget) syncFileActions() {
+	if t == nil {
+		return
+	}
+	canPreview := t.canPreviewMarkdown()
+	if t.contextPreviewBtn != nil {
+		t.contextPreviewBtn.SetVisible(canPreview)
+	}
+	if t.previewBtn != nil {
+		t.previewBtn.SetVisible(canPreview)
 	}
 }
 
@@ -788,6 +1078,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		t.toolIcon.SetFromIconName("document-edit-symbolic")
 		t.titleLabel.SetLabel(formatToolTitle(t.toolName))
 		if filePath != "" {
+			t.setToolFilePath(filePath)
 			t.subtitleLabel.SetLabel(shortPath(filePath))
 		}
 		t.clearBadges()
@@ -864,8 +1155,8 @@ func (t *ToolWidget) SetInput(raw any) {
 	case "read":
 		t.toolIcon.SetFromIconName("document-open-symbolic")
 		t.titleLabel.SetLabel("Read")
-		path, _ := m["path"].(string)
-		t.readPath = path
+		path := firstToolInputString(m, "path", "filePath", "file_path", "file", "filename")
+		t.setToolFilePath(path)
 		t.subtitleLabel.SetLabel(shortPath(path))
 		offset := toInt(m["offset"])
 		limit := toInt(m["limit"])
@@ -1387,12 +1678,12 @@ func (t *ToolWidget) renderOutputImages(items []opencode.ToolContentItem) bool {
 		}
 	}
 	// Fallback for read tool if items did not contain an inline image payload but points to an image file on disk.
-	if !hasImage && strings.EqualFold(t.toolName, "read") && t.readPath != "" {
-		ext := strings.ToLower(filepath.Ext(t.readPath))
+	if !hasImage && strings.EqualFold(t.toolName, "read") && t.filePath != "" {
+		ext := strings.ToLower(filepath.Ext(t.filePath))
 		switch ext {
 		case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
-			if tex, err := decodeImageTexture(t.readPath); err == nil {
-				name := filepath.Base(t.readPath)
+			if tex, err := decodeImageTexture(t.filePath); err == nil {
+				name := filepath.Base(t.filePath)
 				thumb := newImageThumbnail(t.ctx, name, tex)
 				t.imageBox.Append(thumb)
 				t.imageWidgets = append(t.imageWidgets, thumb)
@@ -1492,6 +1783,7 @@ type AssistantMessageWidget struct {
 
 	agent          string
 	model          string
+	baseDir        string
 	onOpenSubagent func(string)
 }
 
@@ -1544,6 +1836,21 @@ func (w *AssistantMessageWidget) SetMeta(agent, model string) {
 	}
 	if model != "" {
 		w.model = model
+	}
+}
+
+// SetBaseDir sets the session working directory for resolving relative tool file paths.
+func (w *AssistantMessageWidget) SetBaseDir(dir string) {
+	if w == nil {
+		return
+	}
+	dir = strings.TrimSpace(dir)
+	if w.baseDir == dir {
+		return
+	}
+	w.baseDir = dir
+	for _, tw := range w.tools {
+		tw.SetBaseDir(dir)
 	}
 }
 
@@ -1654,6 +1961,9 @@ func (w *AssistantMessageWidget) EnsureTool(id, name string) *ToolWidget {
 		name = "tool"
 	}
 	tw := NewToolWidget(w.ctx, id, name, w.onOpenSubagent)
+	if w.baseDir != "" {
+		tw.SetBaseDir(w.baseDir)
+	}
 	w.tools[id] = tw
 	w.partsBox.Append(tw)
 	return tw

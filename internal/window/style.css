@@ -256,10 +256,11 @@ list.glup-sidebar-list > row.glup-sidebar-show-more-row:hover {
 }
 
 .glup-tool-badges {
-	margin-left: 4px;
+	margin-left: 0;
 }
 
 .glup-tool-badge {
+	min-height: 0;
 	font-size: 0.78em;
 	padding: 1px 6px;
 	border-radius: 4px;
@@ -287,10 +288,22 @@ list.glup-sidebar-list > row.glup-sidebar-show-more-row:hover {
 	border: 1px solid alpha(@accent_color, 0.28);
 }
 
-.glup-tool-action-btn {
-	font-size: 0.8em;
+button.glup-tool-action-btn,
+button.flat.glup-tool-action-btn {
+	min-height: 0;
+	min-width: 0;
+	font-size: 0.78em;
+	font-weight: 600;
 	padding: 1px 6px;
+	margin: 0;
+	border: none;
+	border-radius: 4px;
 	color: @accent_color;
+}
+
+button.glup-tool-action-btn:hover,
+button.flat.glup-tool-action-btn:hover {
+	background-color: alpha(@accent_bg_color, 0.14);
 }
 
 .glup-tool-status {
@@ -1166,6 +1179,14 @@ menubutton.glup-window-title-btn windowtitle .subtitle {
 	color: @accent_color;
 	background-color: alpha(@accent_bg_color, 0.16);
 	border-color: alpha(@accent_color, 0.35);
+}
+
+.glup-md-viewer-body {
+	background-color: @window_bg_color;
+}
+
+.glup-md-viewer-content {
+	padding: 20px 24px 36px 24px;
 }
 
 .glup-question-custom-row {
