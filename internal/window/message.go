@@ -306,13 +306,21 @@ type ToolWidget struct {
 	shellID            string
 	shellFile          string
 	liveShellOutput    string
+	appliedShellOutput string
 	childSessionID     string
 	readPath           string
 	onOpenSubagent     func(string)
 	expanderWired      bool
+	lazyInputText      string
+	lazyInputDelta     string
+	lazyInputVisible   bool
+	lazyInputDirty     bool
 	lazyOutputItems    []opencode.ToolContentItem
 	lazyOutputErr      any
 	lazyOutputDirty    bool
+	lazyImagesDirty    bool
+	hasLazyImage       bool
+	lazyShellLiveDirty bool
 	rawDiffText        string
 	diffRendered       bool
 	diffExpanded       bool
@@ -435,8 +443,8 @@ func (t *ToolWidget) applyToolKind() {
 				return
 			}
 			expanded := t.detailsExpander.Expanded()
-			if expanded && t.lazyOutputDirty {
-				t.flushLazyOutput()
+			if expanded {
+				t.flushLazyDetails()
 			}
 			if t.detailsBox != nil {
 				hasDetails := (t.inputView != nil && t.inputView.Visible()) || (t.outputScroll != nil && t.outputScroll.Visible())
@@ -593,12 +601,93 @@ func (t *ToolWidget) SetBackgroundStatus(status string) {
 	t.syncStatus()
 }
 
-// SetShellLiveOutput sets the live scrollable monospace output buffer for a shell tool.
-func (t *ToolWidget) SetShellLiveOutput(text string) {
-	if t.liveShellOutput == text && t.outputScroll != nil && t.outputScroll.Visible() {
+func (t *ToolWidget) isDetailsCollapsed() bool {
+	return t.detailsExpander != nil && !t.detailsExpander.Expanded()
+}
+
+func (t *ToolWidget) flushLazyDetails() {
+	if t.lazyInputDirty {
+		text := t.lazyInputText
+		visible := t.lazyInputVisible
+		t.lazyInputText = ""
+		t.lazyInputDelta = ""
+		t.lazyInputVisible = false
+		t.lazyInputDirty = false
+		if t.inputBuf != nil {
+			t.inputBuf.SetText(text)
+		}
+		if t.inputView != nil {
+			t.inputView.SetVisible(visible)
+		}
+	} else if t.lazyInputDelta != "" {
+		delta := t.lazyInputDelta
+		t.lazyInputDelta = ""
+		if t.inputBuf != nil {
+			end := t.inputBuf.EndIter()
+			t.inputBuf.Insert(end, delta)
+		}
+	}
+
+	if t.lazyOutputDirty {
+		t.flushLazyOutput()
+	} else if t.lazyShellLiveDirty {
+		t.lazyShellLiveDirty = false
+		t.applyShellLiveOutput(t.liveShellOutput)
+	}
+}
+
+func (t *ToolWidget) setInputText(text string, visible bool) {
+	if !visible {
+		t.lazyInputText = ""
+		t.lazyInputDelta = ""
+		t.lazyInputVisible = false
+		t.lazyInputDirty = false
+		if t.inputBuf != nil && t.inputBuf.CharCount() > 0 {
+			t.inputBuf.SetText("")
+		}
+		if t.inputView != nil {
+			t.inputView.SetVisible(false)
+		}
 		return
 	}
-	wasAtBottom := t.liveShellOutput == ""
+	if t.isDetailsCollapsed() {
+		t.lazyInputText = text
+		t.lazyInputDelta = ""
+		t.lazyInputVisible = true
+		t.lazyInputDirty = true
+		return
+	}
+	t.lazyInputText = ""
+	t.lazyInputDelta = ""
+	t.lazyInputVisible = false
+	t.lazyInputDirty = false
+	if t.inputBuf != nil {
+		t.inputBuf.SetText(text)
+	}
+	if t.inputView != nil {
+		t.inputView.SetVisible(true)
+	}
+}
+
+// SetShellLiveOutput sets the live scrollable monospace output buffer for a shell tool.
+func (t *ToolWidget) SetShellLiveOutput(text string) {
+	if t.isDetailsCollapsed() {
+		if t.liveShellOutput == text && t.lazyShellLiveDirty {
+			return
+		}
+		t.liveShellOutput = text
+		t.lazyShellLiveDirty = true
+		return
+	}
+	if t.liveShellOutput == text && t.appliedShellOutput == text && t.outputScroll != nil && t.outputScroll.Visible() {
+		return
+	}
+	t.lazyShellLiveDirty = false
+	t.applyShellLiveOutput(text)
+}
+
+func (t *ToolWidget) applyShellLiveOutput(text string) {
+	wasAtBottom := t.appliedShellOutput == ""
 	var vadj *gtk.Adjustment
 	if t.outputScroll != nil {
 		vadj = t.outputScroll.VAdjustment()
@@ -606,8 +695,9 @@ func (t *ToolWidget) SetShellLiveOutput(text string) {
 			wasAtBottom = true
 		}
 	}
-	prev := t.liveShellOutput
+	prev := t.appliedShellOutput
 	t.liveShellOutput = text
+	t.appliedShellOutput = text
 	if t.outputBuf != nil {
 		if prev != "" && strings.HasPrefix(text, prev) {
 			endIter := t.outputBuf.EndIter()
@@ -711,7 +801,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		if !t.diffRendered || t.rawDiffText != diffText {
 			t.renderInlineDiff(diffText)
 		}
-		t.inputView.SetVisible(false)
+		t.setInputText("", false)
 		return
 	}
 
@@ -752,9 +842,7 @@ func (t *ToolWidget) SetInput(raw any) {
 			t.titleLabel.SetLabel(agentTitle)
 			t.subtitleLabel.SetLabel(desc)
 		}
-		if t.inputView != nil {
-			t.inputView.SetVisible(false)
-		}
+		t.setInputText("", false)
 
 	case "shell", "bash":
 		t.toolIcon.SetFromIconName("terminal-symbolic")
@@ -768,10 +856,9 @@ func (t *ToolWidget) SetInput(raw any) {
 			t.subtitleLabel.SetLabel(firstLine)
 		}
 		if cmd != "" {
-			t.inputBuf.SetText("$ " + cmd)
-			t.inputView.SetVisible(true)
+			t.setInputText("$ "+cmd, true)
 		} else {
-			t.inputView.SetVisible(false)
+			t.setInputText("", false)
 		}
 
 	case "read":
@@ -789,7 +876,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		} else if offset > 0 {
 			t.addBadge(fmt.Sprintf("offset=%d", offset), "")
 		}
-		t.inputView.SetVisible(false)
+		t.setInputText("", false)
 
 	case "grep", "glob":
 		t.toolIcon.SetFromIconName("system-search-symbolic")
@@ -805,7 +892,7 @@ func (t *ToolWidget) SetInput(raw any) {
 			sub += " include=" + include
 		}
 		t.subtitleLabel.SetLabel(sub)
-		t.inputView.SetVisible(false)
+		t.setInputText("", false)
 
 	case "execute":
 		t.toolIcon.SetFromIconName("system-run-symbolic")
@@ -814,10 +901,9 @@ func (t *ToolWidget) SetInput(raw any) {
 		firstLine := strings.TrimSpace(strings.SplitN(code, "\n", 2)[0])
 		t.subtitleLabel.SetLabel(firstLine)
 		if code != "" {
-			t.inputBuf.SetText(code)
-			t.inputView.SetVisible(true)
+			t.setInputText(code, true)
 		} else {
-			t.inputView.SetVisible(false)
+			t.setInputText("", false)
 		}
 
 	case "question":
@@ -826,10 +912,9 @@ func (t *ToolWidget) SetInput(raw any) {
 		sub, details := formatQuestionToolInput(m)
 		t.subtitleLabel.SetLabel(sub)
 		if details != "" {
-			t.inputBuf.SetText(details)
-			t.inputView.SetVisible(true)
+			t.setInputText(details, true)
 		} else {
-			t.inputView.SetVisible(false)
+			t.setInputText("", false)
 		}
 
 	default:
@@ -842,10 +927,9 @@ func (t *ToolWidget) SetInput(raw any) {
 			for k, v := range m {
 				sb.WriteString(fmt.Sprintf("%s: %v\n", k, v))
 			}
-			t.inputBuf.SetText(strings.TrimRight(sb.String(), "\n"))
-			t.inputView.SetVisible(true)
+			t.setInputText(strings.TrimRight(sb.String(), "\n"), true)
 		} else {
-			t.inputView.SetVisible(false)
+			t.setInputText("", false)
 		}
 	}
 }
@@ -1167,16 +1251,68 @@ func (t *ToolWidget) AppendInputDelta(delta string) {
 	if isNonExpandableTool(t.toolName) || t.inputBuf == nil {
 		return
 	}
+	if t.isDetailsCollapsed() {
+		if t.lazyInputDirty {
+			t.lazyInputText += delta
+		} else {
+			t.lazyInputDelta += delta
+		}
+		return
+	}
 	end := t.inputBuf.EndIter()
 	t.inputBuf.Insert(end, delta)
 }
 
+func (t *ToolWidget) extractShellMetaFromItems(items []opencode.ToolContentItem) {
+	if t.toolName != "shell" && t.toolName != "bash" {
+		return
+	}
+	for _, item := range items {
+		if t.shellID == "" {
+			if shID := extractShellID(item.Text); shID != "" {
+				t.shellID = shID
+			}
+		}
+		if t.shellFile == "" {
+			if f := extractShellOutputFile(item.Text); f != "" {
+				t.shellFile = f
+			}
+		}
+	}
+}
+
+func (t *ToolWidget) extractSubagentIDFromItems(items []opencode.ToolContentItem) {
+	if !isSubagentTool(t.toolName) || t.childSessionID != "" {
+		return
+	}
+	for _, item := range items {
+		if id := extractSessionID(item.Text); id != "" {
+			t.setChildSessionID(id)
+			break
+		}
+	}
+}
+
 // SetOutput renders the tool's output content items, images, and errors.
-// For read tools, output text and images are stored lazily and only populated when expanded.
+// While detailsExpander is collapsed and no error occurred, output text buffers
+// (and read-tool images) are deferred until the expander is opened so GTK TextView
+// does not shape/wrap large hidden outputs on session load.
 func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
-	if strings.EqualFold(t.toolName, "read") && t.detailsExpander != nil && !t.detailsExpander.Expanded() {
-		if t.imageBox != nil {
-			t.imageBox.SetVisible(false)
+	t.lazyShellLiveDirty = false
+	if t.isDetailsCollapsed() && errVal == nil {
+		if isSubagentTool(t.toolName) {
+			t.extractSubagentIDFromItems(items)
+			return
+		}
+		if strings.EqualFold(t.toolName, "read") {
+			if t.imageBox != nil {
+				t.imageBox.SetVisible(false)
+			}
+			t.lazyImagesDirty = true
+		} else {
+			t.extractShellMetaFromItems(items)
+			t.lazyImagesDirty = false
+			t.hasLazyImage = t.renderOutputImages(items)
 		}
 		t.lazyOutputItems = slices.Clone(items)
 		t.lazyOutputErr = errVal
@@ -1186,6 +1322,8 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 	t.lazyOutputItems = nil
 	t.lazyOutputErr = nil
 	t.lazyOutputDirty = false
+	t.lazyImagesDirty = false
+	t.hasLazyImage = false
 	t.renderOutput(items, errVal)
 }
 
@@ -1195,13 +1333,26 @@ func (t *ToolWidget) flushLazyOutput() {
 	}
 	items := t.lazyOutputItems
 	errVal := t.lazyOutputErr
+	imagesDirty := t.lazyImagesDirty
+	hasImage := t.hasLazyImage
 	t.lazyOutputItems = nil
 	t.lazyOutputErr = nil
 	t.lazyOutputDirty = false
-	t.renderOutput(items, errVal)
+	t.lazyImagesDirty = false
+	t.hasLazyImage = false
+	if imagesDirty || strings.EqualFold(t.toolName, "read") {
+		t.renderOutput(items, errVal)
+	} else {
+		t.renderOutputText(items, errVal, hasImage)
+	}
 }
 
 func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) {
+	hasImage := t.renderOutputImages(items)
+	t.renderOutputText(items, errVal, hasImage)
+}
+
+func (t *ToolWidget) renderOutputImages(items []opencode.ToolContentItem) bool {
 	for _, img := range t.imageWidgets {
 		t.imageBox.Remove(img)
 	}
@@ -1254,16 +1405,12 @@ func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) 
 	} else {
 		t.imageBox.SetVisible(hasImage)
 	}
+	return hasImage
+}
 
+func (t *ToolWidget) renderOutputText(items []opencode.ToolContentItem, errVal any, hasImage bool) {
 	if isSubagentTool(t.toolName) {
-		if t.childSessionID == "" {
-			for _, item := range items {
-				if id := extractSessionID(item.Text); id != "" {
-					t.setChildSessionID(id)
-					break
-				}
-			}
-		}
+		t.extractSubagentIDFromItems(items)
 		return
 	}
 
@@ -1294,16 +1441,21 @@ func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) 
 	out := strings.ToValidUTF8(strings.TrimSpace(sb.String()), "\uFFFD")
 	if t.liveShellOutput != "" && errVal == nil {
 		t.outputBuf.SetText(t.liveShellOutput)
+		t.appliedShellOutput = t.liveShellOutput
 		t.outputScroll.SetVisible(true)
 	} else if out != "" {
 		t.outputBuf.SetText(out)
+		t.appliedShellOutput = ""
 		t.outputScroll.SetVisible(true)
 		if errVal != nil && t.detailsExpander != nil {
 			t.detailsExpander.SetVisible(true)
 			t.detailsExpander.SetExpanded(true)
 		}
 	} else {
-		t.outputBuf.SetText("")
+		if t.outputBuf.CharCount() > 0 {
+			t.outputBuf.SetText("")
+		}
+		t.appliedShellOutput = ""
 		t.outputScroll.SetVisible(false)
 	}
 	if t.detailsBox != nil && t.detailsExpander != nil && t.detailsExpander.Expanded() {

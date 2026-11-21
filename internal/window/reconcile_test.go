@@ -1377,6 +1377,113 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	}
 }
 
+func TestToolWidgetLazyDetails(t *testing.T) {
+	if !gtk.InitCheck() {
+		return
+	}
+
+	newExpandableTw := func(id, name string) *ToolWidget {
+		tw := &ToolWidget{
+			Box:             gtk.NewBox(gtk.OrientationVertical, 0),
+			ctx:             t.Context(),
+			headerRow:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+			summaryRow:      gtk.NewBox(gtk.OrientationHorizontal, 0),
+			detailsBox:      gtk.NewBox(gtk.OrientationVertical, 0),
+			toolIcon:        gtk.NewImage(),
+			titleLabel:      gtk.NewLabel(""),
+			subtitleLabel:   gtk.NewLabel(""),
+			badgesBox:       gtk.NewBox(gtk.OrientationHorizontal, 0),
+			actionBtn:       gtk.NewButton(),
+			spinner:         adw.NewSpinner(),
+			statusLabel:     gtk.NewLabel(""),
+			imageBox:        gtk.NewBox(gtk.OrientationHorizontal, 0),
+			diffBox:         gtk.NewBox(gtk.OrientationVertical, 0),
+			detailsExpander: gtk.NewExpander(""),
+			inputView:       gtk.NewTextView(),
+			outputScroll:    gtk.NewScrolledWindow(),
+			outputView:      gtk.NewTextView(),
+			toolID:          id,
+			toolName:        name,
+		}
+		tw.inputBuf = tw.inputView.Buffer()
+		tw.outputBuf = tw.outputView.Buffer()
+		tw.headerRow.Append(tw.detailsExpander)
+		tw.Append(tw.headerRow)
+		tw.Append(tw.detailsBox)
+		tw.Append(tw.imageBox)
+		tw.applyToolKind()
+		return tw
+	}
+
+	bufStr := func(buf *gtk.TextBuffer) string {
+		return buf.Text(buf.StartIter(), buf.EndIter(), false)
+	}
+
+	// 1. execute tool defers both input and output TextBuffer population until expanded,
+	// while still updating header summary and showing non-read output images eagerly.
+	execTw := newExpandableTw("call_exec_1", "execute")
+	execTw.SetInput(map[string]any{"code": "return 1 + 1"})
+	execTw.SetOutput([]opencode.ToolContentItem{
+		{Type: "text", Text: strings.Repeat("x", 12800)},
+		{Type: "file", Mime: "image/png", Name: "chart.png", Data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
+	}, nil)
+	if execTw.subtitleLabel.Label() != "return 1 + 1" {
+		t.Fatalf("expected subtitle updated eagerly, got %q", execTw.subtitleLabel.Label())
+	}
+	if got := bufStr(execTw.inputBuf); got != "" {
+		t.Fatalf("expected collapsed execute inputBuf to remain empty, got %q", got)
+	}
+	if got := bufStr(execTw.outputBuf); got != "" {
+		t.Fatalf("expected collapsed execute outputBuf to remain empty, got %q", got)
+	}
+	if len(execTw.imageWidgets) != 1 || !execTw.imageBox.Visible() {
+		t.Fatalf("expected non-read tool output image to display eagerly, got len=%d visible=%v", len(execTw.imageWidgets), execTw.imageBox.Visible())
+	}
+	execTw.detailsExpander.SetExpanded(true)
+	if got := bufStr(execTw.inputBuf); got != "return 1 + 1" {
+		t.Fatalf("expected expanded execute inputBuf populated, got %q", got)
+	}
+	if got := len(bufStr(execTw.outputBuf)); got != 12800 {
+		t.Fatalf("expected expanded execute outputBuf length 12800, got %d", got)
+	}
+	if !execTw.detailsBox.Visible() {
+		t.Fatalf("expected detailsBox visible when expanded")
+	}
+
+	// 2. shell tool extracts shellID/shellFile eagerly when collapsed, defers live/output text until expanded.
+	shTw := newExpandableTw("call_sh_lazy", "shell")
+	shTw.SetInput(map[string]any{"command": "echo hi"})
+	shTw.SetOutput([]opencode.ToolContentItem{{
+		Type: "text",
+		Text: "Command moved to the background (shell ID: sh_lazy1).\nOutput is streaming to: /tmp/opencode/lazy.out",
+	}}, nil)
+	if shTw.ShellID() != "sh_lazy1" || shTw.ShellFile() != "/tmp/opencode/lazy.out" {
+		t.Fatalf("expected shell metadata extracted while collapsed, got id=%q file=%q", shTw.ShellID(), shTw.ShellFile())
+	}
+	shTw.SetShellLiveOutput("line 1\nline 2")
+	if got := bufStr(shTw.outputBuf); got != "" {
+		t.Fatalf("expected collapsed shell outputBuf to stay empty, got %q", got)
+	}
+	shTw.detailsExpander.SetExpanded(true)
+	if got := bufStr(shTw.outputBuf); got != "line 1\nline 2" {
+		t.Fatalf("expected expanded shell outputBuf to flush live output, got %q", got)
+	}
+
+	// 3. Error output auto-expands and populates both input and output immediately.
+	errTw := newExpandableTw("call_exec_err", "execute")
+	errTw.SetInput(map[string]any{"code": "boom()"})
+	errTw.SetOutput(nil, "syntax error")
+	if !errTw.detailsExpander.Expanded() {
+		t.Fatalf("expected error tool output to auto-expand detailsExpander")
+	}
+	if got := bufStr(errTw.inputBuf); got != "boom()" {
+		t.Fatalf("expected error tool inputBuf flushed on auto-expand, got %q", got)
+	}
+	if got := bufStr(errTw.outputBuf); got != "Error: syntax error" {
+		t.Fatalf("expected error tool outputBuf populated, got %q", got)
+	}
+}
+
 func TestBackgroundShellFilteringAndOutput(t *testing.T) {
 	// 1. Test FormatShellTailLines fixed 7-line buffer
 	emptyBuf := FormatShellTailLines("", 7)
