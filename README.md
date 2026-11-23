@@ -1,5 +1,10 @@
 <div align="center">
   <h1>gluppencode</h1>
+  <p>
+    <a href="https://sladge.net">
+      <img src="https://sladge.net/badge.svg" alt="AI Slop Inside"/>
+    </a>
+  </p>
   <img src=".github/home-screenshot.png" alt="gluppencode screenshot" width="600"/>
 </div>
 
