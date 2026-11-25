@@ -87,7 +87,7 @@ GTK4 / Libadwaita UI, state, and event orchestration:
 - `draft.go`: Per-session composer draft + binary attachment persistence (`.../gluppencode/drafts/<sessionID>/`) guarded by `draftWriteGen` and `draftWriteMu`.
 - `preferences.go`: `adw.PreferencesDialog` and live `applyPreferenceDelta` sync across windows.
 - `notifications.go`: Per-`gtk.Application` `notificationCoordinator` (`RegisterAppActions`, `app.open-session`, focus withdrawal, cross-window preference sync).
-- `suspend.go`: Idle tab suspension (`tabSuspendAfter`, `isTabSuspended`, `awakeTabDirs`).
+- `suspend.go`: Idle tab suspension and deep timeline unloading (`tabSuspendAfter`, `tabDeepUnloadAfter`, `isTabSuspended`, `canDeepUnloadTab`, `unloadLongSuspendedTabs`, `awakeTabDirs`).
 - `greeter.go`, `fuzzy.go`, `image.go`: `GreeterWidget` + async `GreeterProfile` generation, `fuzzyMatchScore`, image texture decoding + `newImageThumbnail` + `showImageViewer`.
 - `*_test.go`: Unit and GTK widget reconciliation tests covering timeline/SSE reconciliation, activity phases, sidebar, MCP UI, drafts, composer/completion, notifications, tab suspension, tool file actions / Markdown viewer, and fuzzy matching.
 
@@ -117,7 +117,7 @@ GTK4 / Libadwaita UI, state, and event orchestration:
    - `draftWriteGen` prevents in-flight async draft writes from resurrecting drafts after a send/clear.
 3. **Queue Reorder Guard**: Server-side inbox reordering (`syncQueuedOrderOnServer`) re-admits the queued suffix with `NoResume: true` and cancels originals; `reorderPendingPrompt` rejects concurrent reorders while any prompt has `rewriting == true` to prevent duplicate inbox items.
 4. **No Blind POST Replay**: `opencode.Client.do` retries at most once and only when `Rediscover` finds a changed server URL or password, never replaying non-idempotent POSTs against the same endpoint.
-5. **Tab Suspension**: `suspend.go` skips background form/permission polling and reconnect resyncs for idle tabs unvisited beyond `tabSuspendAfter` (`5m`), waking immediately on visit or SSE activity.
+5. **Tab Suspension & Deep Unloading**: `suspend.go` skips background form/permission polling and reconnect resyncs for idle tabs unvisited beyond `tabSuspendAfter` (`5m`), waking immediately on visit or SSE activity; tabs idle beyond `tabDeepUnloadAfter` (`15m`) unload their rendered timeline widgets via `unloadLongSuspendedTabs` and reload on revisit.
 6. **Secret Stripping**: `opencode.ConfigEntry.UnmarshalJSON` drops MCP OAuth secrets and env/header values on decode and redacts credentials/sensitive query params via `SanitizeMcpURL`.
 
 ---

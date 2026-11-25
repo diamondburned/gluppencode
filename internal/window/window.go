@@ -90,29 +90,34 @@ type convTimeline struct {
 	permissionWidgets  map[string]*PermissionPromptWidget
 	seenMsgIDs         map[string]bool
 	messages           []opencode.Message
-	nextCursor         string
-	hasOlder           bool
-	loadingOlder       bool
-	loadingInitial     bool
-	loaded             bool
-	active             bool
-	activityGen        uint64
-	activityPhase      activityPhase
-	retryAttempt       int
-	compacting         bool
-	runningUserShell   bool
-	runningTools       int
-	executingTools     map[string]string
-	finishedTools      map[string]bool
-	blockingTools      map[string]time.Time
-	blockingShellTools map[string]bool
-	blockingShellIDs   map[string]string
-	backgroundShellIDs map[string]bool
-	toolNames          map[string]string
-	streamStart        time.Time
-	streamEnd          time.Time
-	streamedChars      int
-	lastTokRate        string
+	nextCursor          string
+	hasOlder            bool
+	trimmedHead         bool
+	loadingOlder        bool
+	loadingInitial      bool
+	loaded              bool
+	active              bool
+	activityGen         uint64
+	activityPhase       activityPhase
+	retryAttempt        int
+	compacting          bool
+	runningUserShell    bool
+	runningTools        int
+	executingTools      map[string]string
+	finishedTools       map[string]bool
+	blockingTools       map[string]time.Time
+	blockingShellTools  map[string]bool
+	blockingShellIDs    map[string]string
+	backgroundShellIDs  map[string]bool
+	toolNames           map[string]string
+	shellToolsByID      map[string]map[string]*ToolWidget
+	activeBgShellTools  map[string]*ToolWidget
+	subagentToolsByID   map[string]map[string]*ToolWidget
+	turnDurationTargets map[string]string
+	streamStart         time.Time
+	streamEnd           time.Time
+	streamedChars       int
+	lastTokRate         string
 }
 
 func isShellToolName(name string) bool {
@@ -411,6 +416,83 @@ func (c *convTimeline) inferActivityStateFromMessages(msgs []opencode.Message) {
 	}
 }
 
+func (c *convTimeline) indexToolWidget(tw *ToolWidget) {
+	if c == nil || tw == nil || tw.toolID == "" {
+		return
+	}
+	if shID := tw.ShellID(); shID != "" {
+		if c.shellToolsByID == nil {
+			c.shellToolsByID = make(map[string]map[string]*ToolWidget)
+		}
+		byTool := c.shellToolsByID[shID]
+		if byTool == nil {
+			byTool = make(map[string]*ToolWidget)
+			c.shellToolsByID[shID] = byTool
+		}
+		byTool[tw.toolID] = tw
+	}
+	if tw.IsBackgroundRunning() {
+		if c.activeBgShellTools == nil {
+			c.activeBgShellTools = make(map[string]*ToolWidget)
+		}
+		c.activeBgShellTools[tw.toolID] = tw
+	} else {
+		delete(c.activeBgShellTools, tw.toolID)
+	}
+	if subID := tw.ChildSessionID(); subID != "" {
+		if c.subagentToolsByID == nil {
+			c.subagentToolsByID = make(map[string]map[string]*ToolWidget)
+		}
+		byTool := c.subagentToolsByID[subID]
+		if byTool == nil {
+			byTool = make(map[string]*ToolWidget)
+			c.subagentToolsByID[subID] = byTool
+		}
+		byTool[tw.toolID] = tw
+	}
+}
+
+func (c *convTimeline) indexAssistantTools(aw *AssistantMessageWidget) {
+	if c == nil || aw == nil {
+		return
+	}
+	for _, tw := range aw.tools {
+		c.indexToolWidget(tw)
+	}
+}
+
+func (c *convTimeline) removeAssistantToolIndexes(aw *AssistantMessageWidget) {
+	if c == nil || aw == nil {
+		return
+	}
+	for toolID, tw := range aw.tools {
+		delete(c.activeBgShellTools, toolID)
+		if tw != nil {
+			if shID := tw.ShellID(); shID != "" {
+				if byTool := c.shellToolsByID[shID]; byTool != nil {
+					delete(byTool, toolID)
+					if len(byTool) == 0 {
+						delete(c.shellToolsByID, shID)
+					}
+				}
+			}
+			if subID := tw.ChildSessionID(); subID != "" {
+				if byTool := c.subagentToolsByID[subID]; byTool != nil {
+					delete(byTool, toolID)
+					if len(byTool) == 0 {
+						delete(c.subagentToolsByID, subID)
+					}
+				}
+			}
+		}
+		delete(c.toolNames, toolID)
+		delete(c.finishedTools, toolID)
+		delete(c.executingTools, toolID)
+		delete(c.blockingTools, toolID)
+		delete(c.blockingShellTools, toolID)
+	}
+}
+
 func (c *convTimeline) markSyntheticTargetCompleted(msg opencode.Message) {
 	if c == nil {
 		return
@@ -428,14 +510,11 @@ func (c *convTimeline) markSyntheticTargetCompleted(msg opencode.Message) {
 			if body := stripSubagentTags(msg.Text); body != "" {
 				formatted = FormatShellOutput(body)
 			}
-			for _, aw := range c.assistantMap {
-				for _, tw := range aw.tools {
-					if tw.ShellID() == shID {
-						tw.SetBackgroundStatus("completed")
-						if formatted != "" {
-							tw.SetShellLiveOutput(formatted)
-						}
-					}
+			for _, tw := range c.shellToolsByID[shID] {
+				tw.SetBackgroundStatus("completed")
+				delete(c.activeBgShellTools, tw.toolID)
+				if formatted != "" {
+					tw.SetShellLiveOutput(formatted)
 				}
 			}
 		}
@@ -450,20 +529,190 @@ func (c *convTimeline) markSyntheticTargetCompleted(msg opencode.Message) {
 		subID = matches[1]
 	}
 	if subID != "" {
-		for _, aw := range c.assistantMap {
-			for _, tw := range aw.tools {
-				if tw.ChildSessionID() == subID {
-					tw.SetBackgroundStatus("completed")
-				}
-			}
+		for _, tw := range c.subagentToolsByID[subID] {
+			tw.SetBackgroundStatus("completed")
+			delete(c.activeBgShellTools, tw.toolID)
 		}
 	}
 }
 
+func (c *convTimeline) finishStreams() {
+	if c == nil {
+		return
+	}
+	for _, aw := range c.assistantMap {
+		aw.FinishStreams()
+	}
+}
+
 func (c *convTimeline) closeStreams() {
+	if c == nil {
+		return
+	}
 	for _, aw := range c.assistantMap {
 		aw.CloseStreams()
 	}
+}
+
+const (
+	maxTimelineMessages       = 120
+	keepTimelineMessages      = 60
+	maxActiveTimelineMessages = 240
+)
+
+func (c *convTimeline) resetTimelineWidgets() {
+	if c == nil {
+		return
+	}
+	c.closeStreams()
+	if c.timelineBox != nil {
+		for _, w := range c.messageWidgets {
+			if w != nil {
+				c.timelineBox.Remove(w)
+			}
+		}
+		for _, sb := range c.slashBubbles {
+			if sb != nil {
+				c.timelineBox.Remove(sb)
+			}
+		}
+		for _, p := range c.pendingPrompts {
+			if p != nil && p.widget != nil && p.attached {
+				c.timelineBox.Remove(p.widget)
+				p.attached = false
+			}
+		}
+		for _, qw := range c.formWidgets {
+			if qw != nil {
+				c.timelineBox.Remove(qw)
+			}
+		}
+		for _, pw := range c.permissionWidgets {
+			if pw != nil {
+				c.timelineBox.Remove(pw)
+			}
+		}
+		if c.thinkingLabel != nil && c.thinkingAttached {
+			c.timelineBox.Remove(c.thinkingLabel)
+			c.thinkingAttached = false
+		}
+		if c.revertBanner != nil {
+			c.timelineBox.Remove(c.revertBanner)
+		}
+	}
+	c.slashBubbles = nil
+	c.assistantMap = make(map[string]*AssistantMessageWidget)
+	c.compactionMap = make(map[string]*CompactionWidget)
+	c.messageWidgets = make(map[string]gtk.Widgetter)
+	c.formWidgets = make(map[string]*QuestionFormWidget)
+	c.pendingForms = nil
+	c.permissionWidgets = make(map[string]*PermissionPromptWidget)
+	c.pendingPermissions = nil
+	c.revertBanner = nil
+	c.seenMsgIDs = make(map[string]bool)
+	c.executingTools = make(map[string]string)
+	c.finishedTools = make(map[string]bool)
+	c.compacting = false
+	c.runningUserShell = false
+	c.blockingTools = make(map[string]time.Time)
+	c.blockingShellTools = make(map[string]bool)
+	c.blockingShellIDs = make(map[string]string)
+	c.backgroundShellIDs = make(map[string]bool)
+	c.toolNames = make(map[string]string)
+	c.shellToolsByID = make(map[string]map[string]*ToolWidget)
+	c.activeBgShellTools = make(map[string]*ToolWidget)
+	c.subagentToolsByID = make(map[string]map[string]*ToolWidget)
+	c.turnDurationTargets = make(map[string]string)
+	c.trimmedHead = false
+}
+
+func (c *convTimeline) unload() {
+	if c == nil {
+		return
+	}
+	c.activityGen++
+	c.resetTimelineWidgets()
+	c.loaded = false
+	c.loadingInitial = false
+	c.loadingOlder = false
+	c.messages = nil
+	c.nextCursor = ""
+	c.hasOlder = false
+	if c.greeter != nil {
+		c.greeter.SetVisible(false)
+	}
+}
+
+func (w *Window) unloadTabTimelines(tab *sessionTab) {
+	if w == nil || tab == nil {
+		return
+	}
+	if tab.main != nil {
+		tab.main.unload()
+	}
+	for subID, sub := range tab.subTimelines {
+		if sub != nil {
+			sub.unload()
+		}
+		if subID != tab.activeSubID {
+			if tab.stack != nil && sub != nil && sub.scroll != nil {
+				tab.stack.Remove(sub.scroll)
+			}
+			delete(tab.subTimelines, subID)
+		}
+	}
+}
+
+func (c *convTimeline) maybeTrimTimelineHead() int {
+	if c == nil || !c.loaded || c.loadingInitial || c.loadingOlder || c.session.Revert != nil {
+		return 0
+	}
+	if c.scroll != nil && !c.scroll.IsBottomed() {
+		return 0
+	}
+	if c.active {
+		return c.trimTimelineHead(maxActiveTimelineMessages, maxTimelineMessages)
+	}
+	return c.trimTimelineHead(maxTimelineMessages, keepTimelineMessages)
+}
+
+func (c *convTimeline) trimTimelineHead(maxKeep, keep int) int {
+	if c == nil || keep <= 0 || maxKeep < keep || len(c.messages) <= maxKeep || c.session.Revert != nil {
+		return 0
+	}
+	trimCount := len(c.messages) - keep
+	if trimCount <= 0 {
+		return 0
+	}
+	for _, msg := range c.messages[:trimCount] {
+		if msg.ID == "" {
+			continue
+		}
+		if w := c.messageWidgets[msg.ID]; w != nil {
+			if c.timelineBox != nil {
+				c.timelineBox.Remove(w)
+			}
+			delete(c.messageWidgets, msg.ID)
+		}
+		if aw := c.assistantMap[msg.ID]; aw != nil {
+			aw.CloseStreams()
+			c.removeAssistantToolIndexes(aw)
+			delete(c.assistantMap, msg.ID)
+		}
+		delete(c.compactionMap, msg.ID)
+		delete(c.seenMsgIDs, msg.ID)
+		delete(c.turnDurationTargets, msg.ID)
+	}
+	kept := make([]opencode.Message, keep)
+	copy(kept, c.messages[trimCount:])
+	c.messages = kept
+	c.trimmedHead = true
+	c.hasOlder = true
+	c.nextCursor = ""
+	if c.scroll != nil {
+		c.scroll.ScrollToBottomIfBottomed()
+	}
+	return trimCount
 }
 
 // steeredInFlight reports whether the user steered p before its inbox ID was known
@@ -527,6 +776,7 @@ type switcherIndicator struct {
 	label        *gtk.Label
 	closeBtn     *gtk.Button
 	rowPtr       uintptr
+	lastTimemark string
 }
 
 type sessionTab struct {
@@ -888,6 +1138,17 @@ type Window struct {
 	notifyCoord           *notificationCoordinator
 	completionSettleDelay time.Duration
 
+	sseMu               sync.Mutex
+	sseQueue            []opencode.Event
+	sseDrainPending     bool
+	telemetryTimerOn    bool
+	lastTokRateUpdate   time.Time
+	modelListDirty      bool
+	reconcileInFlight   map[string]bool
+	reconcileDirty      map[string]bool
+	subagentInFlight    map[string]bool
+	subagentDirty       map[string]bool
+
 	escStopArmedSess string
 	escStopGen       uint64
 	escStopTimer     glib.SourceHandle
@@ -1093,7 +1354,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.rebuildAgentPills()
 	})
 	w.modelPopover.ConnectMap(func() {
-		w.rebuildModelList()
+		w.rebuildModelListNow()
 		w.modelSearchEntry.GrabFocus()
 	})
 	w.modelPopover.ConnectClosed(func() {
@@ -1361,12 +1622,13 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	adwWin.SetContent(w.windowStack)
 	w.syncNavigationChrome()
 
-	// 30s ticker to update tab relative timemarks.
-	glib.TimeoutSecondsAdd(30, func() bool {
+	// 30s ticker to update tab relative timemarks and deep-unload idle tabs.
+	glib.TimeoutSecondsAddPriority(30, glib.PRIORITY_LOW, func() bool {
 		if w.ctx.Err() != nil {
 			return false
 		}
 		w.updateSwitcherIndicators()
+		w.unloadLongSuspendedTabs()
 		return true
 	})
 
@@ -1903,6 +2165,7 @@ func (w *Window) archiveSession(sessID string) {
 	if !ok {
 		w.deleteSessionDraftsForTab(sessID, nil)
 		w.withdrawSessionNotifications(sessID)
+		w.pruneSessionAuxiliaryState(sessID, nil)
 		w.syncSidebar()
 		return
 	}
@@ -1918,6 +2181,7 @@ func (w *Window) archiveSession(sessID string) {
 	w.deleteSessionDraftsForTab(sessID, tab)
 	w.cancelCompletionSettle(tab)
 	w.withdrawSessionNotifications(sessID)
+	w.pruneSessionAuxiliaryState(sessID, tab)
 	tab.main.closeStreams()
 	for _, sub := range tab.subTimelines {
 		sub.closeStreams()
@@ -1941,6 +2205,32 @@ func (w *Window) archiveSession(sessID string) {
 		w.updateWindowManagerTitle()
 	}
 	w.syncSidebar()
+}
+
+func (w *Window) pruneSessionAuxiliaryState(rootID string, tab *sessionTab) {
+	if w == nil || rootID == "" {
+		return
+	}
+	delete(w.sessionTouched, rootID)
+	delete(w.resolvedSessionTitles, rootID)
+	for cid, rid := range w.childToRoot {
+		if rid == rootID {
+			delete(w.childToRoot, cid)
+			delete(w.resolvedSessionTitles, cid)
+		}
+	}
+	if tab != nil {
+		for subID := range tab.subTimelines {
+			delete(w.childToRoot, subID)
+			delete(w.resolvedSessionTitles, subID)
+		}
+		for _, sub := range tab.subagents {
+			if sub.ID != "" {
+				delete(w.childToRoot, sub.ID)
+				delete(w.resolvedSessionTitles, sub.ID)
+			}
+		}
+	}
 }
 
 func (w *Window) clearProjectSessions(rawDir string) {
@@ -2010,8 +2300,17 @@ func (w *Window) clearProjectSessions(rawDir string) {
 				w.viewStack.Remove(tab.stack)
 			}
 			delete(w.tabs, id)
+			w.pruneSessionAuxiliaryState(id, tab)
+		} else {
+			w.pruneSessionAuxiliaryState(id, nil)
 		}
 		w.withdrawSessionNotifications(id)
+	}
+	for id := range toArchive {
+		if _, hadTab := w.tabs[id]; !hadTab {
+			w.pruneSessionAuxiliaryState(id, nil)
+			w.withdrawSessionNotifications(id)
+		}
 	}
 	w.tabOrder = nextOrder
 	w.populating = prevPopulating
@@ -2752,6 +3051,8 @@ func (w *Window) resolveSessionTitleAsync(sessionID string, onResolved func(titl
 			delete(w.resolvingSessions, sessionID)
 			if w.resolvedSessionTitles == nil {
 				w.resolvedSessionTitles = make(map[string]string)
+			} else if len(w.resolvedSessionTitles) >= 512 {
+				clear(w.resolvedSessionTitles)
 			}
 			var title string
 			if err == nil && sess != nil {
@@ -2893,13 +3194,17 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 		permissionWidgets:  make(map[string]*PermissionPromptWidget),
 		ignoredCancelIDs:   make(map[string]bool),
 		seenMsgIDs:         make(map[string]bool),
-		executingTools:     make(map[string]string),
-		finishedTools:      make(map[string]bool),
-		blockingTools:      make(map[string]time.Time),
-		blockingShellTools: make(map[string]bool),
-		blockingShellIDs:   make(map[string]string),
-		backgroundShellIDs: make(map[string]bool),
-		toolNames:          make(map[string]string),
+		executingTools:      make(map[string]string),
+		finishedTools:       make(map[string]bool),
+		blockingTools:       make(map[string]time.Time),
+		blockingShellTools:  make(map[string]bool),
+		blockingShellIDs:    make(map[string]string),
+		backgroundShellIDs:  make(map[string]bool),
+		toolNames:           make(map[string]string),
+		shellToolsByID:      make(map[string]map[string]*ToolWidget),
+		activeBgShellTools:  make(map[string]*ToolWidget),
+		subagentToolsByID:   make(map[string]map[string]*ToolWidget),
+		turnDurationTargets: make(map[string]string),
 	}
 
 	vadj := scroll.VAdjustment()
@@ -3991,14 +4296,17 @@ func (w *Window) recordRootReplyDelta(tab *sessionTab, msgID, delta string) {
 	if strings.TrimSpace(delta) != "" {
 		tab.turnHasReply = true
 	}
+	const maxPreviewBytes = 1024
 	if msgID != "" {
 		if tab.turnReplyByMsgID == nil {
 			tab.turnReplyByMsgID = make(map[string]string)
 		}
-		tab.turnReplyByMsgID[msgID] += delta
+		if len(tab.turnReplyByMsgID[msgID]) < maxPreviewBytes {
+			tab.turnReplyByMsgID[msgID] += delta
+		}
 		tab.turnReplyMsgID = msgID
 		tab.turnReplyPreview = tab.turnReplyByMsgID[msgID]
-	} else {
+	} else if len(tab.turnReplyPreview) < maxPreviewBytes {
 		tab.turnReplyPreview += delta
 	}
 }
@@ -4008,6 +4316,10 @@ func (w *Window) recordRootReplyEnded(tab *sessionTab, msgID, text string) {
 		return
 	}
 	tab.turnHasReply = true
+	const maxPreviewBytes = 1024
+	if len(text) > maxPreviewBytes {
+		text = text[:maxPreviewBytes]
+	}
 	if msgID != "" {
 		if tab.turnReplyByMsgID == nil {
 			tab.turnReplyByMsgID = make(map[string]string)
@@ -4819,7 +5131,7 @@ func (w *Window) isTabWorking(tab *sessionTab) bool {
 	if tab == nil {
 		return false
 	}
-	return w.isTabAgentWorking(tab) || len(w.visibleBackgroundShellsForTab(tab)) > 0
+	return w.isTabAgentWorking(tab) || w.hasVisibleBackgroundShellsForTab(tab)
 }
 
 func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *sessionTab) {
@@ -4833,7 +5145,7 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 	focused := (sessID == w.currentRootSessionID())
 	hasPendingInput := tabHasPendingInput(tab)
 	agentWorking := !hasPendingInput && w.isTabAgentWorking(tab)
-	hasBgShells := !hasPendingInput && !agentWorking && len(w.visibleBackgroundShellsForTab(tab)) > 0
+	hasBgShells := !hasPendingInput && !agentWorking && w.hasVisibleBackgroundShellsForTab(tab)
 	hovered := ind.rowPtr != 0 && w.hoveredRow[ind.rowPtr]
 	showClose := ind.closeBtn != nil && (hovered || focused)
 	if ind.closeBtn != nil {
@@ -4875,10 +5187,14 @@ func (w *Window) updateIndicator(ind *switcherIndicator, sessID string, tab *ses
 		}
 		timemark := formatRelativeTimemark(updatedMs)
 		if timemark != "" {
-			ind.label.SetLabel(timemark)
+			if ind.lastTimemark != timemark {
+				ind.lastTimemark = timemark
+				ind.label.SetLabel(timemark)
+			}
 			ind.label.SetVisible(true)
 			ind.box.SetVisible(true)
 		} else {
+			ind.lastTimemark = ""
 			ind.label.SetVisible(false)
 			ind.box.SetVisible(false)
 		}
@@ -5245,22 +5561,12 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		w.projectSessions[dir] = append(w.projectSessions[dir], s)
 	}
 
-	for _, tab := range w.tabs {
-		w.cancelCompletionSettle(tab)
-		tab.main.closeStreams()
-		for _, sub := range tab.subTimelines {
-			sub.closeStreams()
-		}
-		w.cleanupTabSidebarState(tab)
-		w.viewStack.Remove(tab.stack)
-	}
-	w.tabs = make(map[string]*sessionTab)
-	w.childToRoot = make(map[string]string)
-	w.tabOrder = make([]string, 0, len(topSessions))
-
+	hadExistingTabs := len(w.tabs) > 0
 	projCount := make(map[string]int)
 	maxVis := w.effectiveMaxVisibleSessions()
 	var firstID, firstUncollapsedID string
+	var desiredSessions []opencode.Session
+	desiredSet := make(map[string]bool)
 	for _, sess := range topSessions {
 		dir := normalizeProjectDir(sess.Location.Directory)
 		count := projCount[dir]
@@ -5273,8 +5579,36 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 			if firstUncollapsedID == "" && !w.collapsedProjects[dir] {
 				firstUncollapsedID = sess.ID
 			}
-			tab := w.addSessionTab(sess)
-			w.tabOrder = append(w.tabOrder, sess.ID)
+			desiredSessions = append(desiredSessions, sess)
+			desiredSet[sess.ID] = true
+			projCount[dir] = count + 1
+		}
+	}
+
+	for id, tab := range w.tabs {
+		if desiredSet[id] {
+			continue
+		}
+		w.cancelCompletionSettle(tab)
+		tab.main.closeStreams()
+		for _, sub := range tab.subTimelines {
+			sub.closeStreams()
+		}
+		w.cleanupTabSidebarState(tab)
+		if w.viewStack != nil && tab.stack != nil {
+			w.viewStack.Remove(tab.stack)
+		}
+		delete(w.tabs, id)
+		w.pruneSessionAuxiliaryState(id, tab)
+	}
+	w.childToRoot = make(map[string]string)
+	w.tabOrder = make([]string, 0, len(desiredSessions))
+
+	for _, sess := range desiredSessions {
+		_, isRunning := active[sess.ID]
+		tab, existed := w.tabs[sess.ID]
+		if !existed {
+			tab = w.addSessionTab(sess)
 			if isRunning {
 				w.setConvActive(sess.ID, true)
 			}
@@ -5282,8 +5616,74 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 				w.childToRoot[child.ID] = sess.ID
 				tab.subagents = append(tab.subagents, child)
 			}
-			projCount[dir] = count + 1
+		} else {
+			if sess.Title != "" && tab.main.session.Title != sess.Title {
+				tab.main.session.Title = sess.Title
+				tab.setTitle(sess.Title)
+			}
+			if sess.Location.Directory != "" {
+				tab.main.session.Location = sess.Location
+			}
+			if sess.Time.Created > 0 && tab.main.session.Time.Created == 0 {
+				tab.main.session.Time.Created = sess.Time.Created
+			}
+			if sess.Time.Updated > tab.main.session.Time.Updated {
+				tab.main.session.Time.Updated = sess.Time.Updated
+			}
+			if sess.Time.Busy > tab.main.session.Time.Busy {
+				tab.main.session.Time.Busy = sess.Time.Busy
+			}
+			if sess.Time.Idle > tab.main.session.Time.Idle {
+				tab.main.session.Time.Idle = sess.Time.Idle
+			}
+			if sess.Time.Viewed > tab.main.session.Time.Viewed {
+				tab.main.session.Time.Viewed = sess.Time.Viewed
+			}
+			if !tab.main.loaded {
+				tab.main.session.Revert = sess.Revert
+				if sess.Agent != "" {
+					tab.main.session.Agent = sess.Agent
+				}
+				if sess.Model.ID != "" {
+					tab.main.session.Model = sess.Model
+				}
+			}
+			if isRunning {
+				w.setConvActive(sess.ID, true)
+			} else if !tab.main.loaded {
+				w.setConvActive(sess.ID, false)
+			}
+			incomingChildren := childrenByRoot[sess.ID]
+			if len(incomingChildren) > 0 {
+				existingIdx := make(map[string]int, len(tab.subagents))
+				for i, c := range tab.subagents {
+					if c.ID != "" {
+						existingIdx[c.ID] = i
+					}
+				}
+				for _, child := range incomingChildren {
+					if idx, ok := existingIdx[child.ID]; ok {
+						tab.subagents[idx] = child
+					} else {
+						tab.subagents = append(tab.subagents, child)
+					}
+				}
+			}
+			for _, child := range tab.subagents {
+				if child.ID != "" {
+					w.childToRoot[child.ID] = sess.ID
+				}
+			}
+			for subID, subConv := range tab.subTimelines {
+				w.childToRoot[subID] = sess.ID
+				if subConv != nil {
+					if _, childActive := active[subID]; childActive {
+						w.setConvActive(subID, true)
+					}
+				}
+			}
 		}
+		w.tabOrder = append(w.tabOrder, sess.ID)
 	}
 
 	pendingOpenID := w.notifyCoord.consumePendingOpenSessionID()
@@ -5302,11 +5702,16 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 		}
 	}
 	w.populating = false
-	if targetID != "" {
+	selectionChanged := targetID != prevSelected
+	if targetID != "" && w.currentRootSessionID() != targetID {
 		w.viewStack.SetVisibleChildName(targetID)
 	}
 	w.pruneArchivedDrafts()
-	w.onVisibleTabChanged()
+	if !hadExistingTabs || selectionChanged || (targetID != "" && w.tabs[targetID] != nil && !w.tabs[targetID].main.loaded) {
+		w.onVisibleTabChanged()
+	} else if tab := w.tabs[targetID]; tab != nil {
+		w.refreshHeaderAndBottomBar(tab)
+	}
 	w.syncSidebar()
 	if pendingOpenID != "" {
 		w.openSessionByID(pendingOpenID)
@@ -5314,7 +5719,7 @@ func (w *Window) populateSessionTabs(sessions []opencode.Session, active map[str
 
 	glib.IdleAdd(func() {
 		w.syncSidebar()
-		if w.inputView != nil {
+		if (!hadExistingTabs || selectionChanged) && w.inputView != nil {
 			w.inputView.GrabFocus()
 		}
 	})
@@ -5937,7 +6342,20 @@ func (w *Window) onVisibleTabChanged() {
 	if w.populating {
 		return
 	}
+	prevRoot := w.shownRoot
 	w.noteVisibleRoot()
+	if prevRoot != "" && prevRoot != w.currentRootSessionID() {
+		if prevTab := w.tabs[prevRoot]; prevTab != nil {
+			if prevTab.main != nil {
+				prevTab.main.maybeTrimTimelineHead()
+			}
+			for _, sub := range prevTab.subTimelines {
+				if sub != nil {
+					sub.maybeTrimTimelineHead()
+				}
+			}
+		}
+	}
 	w.syncEmptyGreeterVisibility()
 	tab := w.currentTab()
 	if tab == nil {
@@ -5987,6 +6405,10 @@ func (w *Window) onVisibleTabChanged() {
 		tab.main.loadingInitial = true
 		w.loadConvMessages(tab, tab.main)
 		w.loadChildSubagents(tab.main.session.ID)
+	}
+	if sub := tab.activeConv(); sub != nil && sub != tab.main && !sub.loaded && !sub.loadingInitial && w.client != nil {
+		sub.loadingInitial = true
+		w.loadConvMessages(tab, sub)
 	}
 }
 
@@ -6380,12 +6802,9 @@ func (w *Window) setSubagentActive(childID string, active bool, outcome string) 
 		}
 	}
 	if !active && tab.main != nil {
-		for _, aw := range tab.main.assistantMap {
-			for _, tw := range aw.tools {
-				if tw.ChildSessionID() == childID {
-					tw.SetBackgroundStatus("completed")
-				}
-			}
+		for _, tw := range tab.main.subagentToolsByID[childID] {
+			tw.SetBackgroundStatus("completed")
+			delete(tab.main.activeBgShellTools, tw.toolID)
 		}
 	}
 	if w.currentTab() == tab {
@@ -6399,9 +6818,24 @@ func (w *Window) loadChildSubagents(rootSessionID string) {
 	if w.client == nil || rootSessionID == "" {
 		return
 	}
+	if w.subagentInFlight == nil {
+		w.subagentInFlight = make(map[string]bool)
+		w.subagentDirty = make(map[string]bool)
+	}
+	if w.subagentInFlight[rootSessionID] {
+		w.subagentDirty[rootSessionID] = true
+		return
+	}
+	w.subagentInFlight[rootSessionID] = true
 	gtkutil.Async(w.ctx, func() func() {
 		children, err := w.client.ListChildSessions(w.ctx, rootSessionID)
 		return func() {
+			delete(w.subagentInFlight, rootSessionID)
+			rerun := w.subagentDirty[rootSessionID]
+			delete(w.subagentDirty, rootSessionID)
+			if rerun {
+				defer w.loadChildSubagents(rootSessionID)
+			}
 			if err != nil {
 				slog.Error("failed to list child subagents", "rootID", rootSessionID, "err", err)
 				return
@@ -6480,60 +6914,8 @@ func (w *Window) loadConvMessages(tab *sessionTab, conv *convTimeline) {
 				return
 			}
 			conv.loaded = true
-			conv.closeStreams()
-			for _, w := range conv.messageWidgets {
-				if w != nil {
-					conv.timelineBox.Remove(w)
-				}
-			}
-			for _, sb := range conv.slashBubbles {
-				if sb != nil {
-					conv.timelineBox.Remove(sb)
-				}
-			}
-			conv.slashBubbles = nil
-			for _, p := range conv.pendingPrompts {
-				if p != nil && p.widget != nil && p.attached {
-					conv.timelineBox.Remove(p.widget)
-					p.attached = false
-				}
-			}
-			for _, qw := range conv.formWidgets {
-				if qw != nil {
-					conv.timelineBox.Remove(qw)
-				}
-			}
-			for _, pw := range conv.permissionWidgets {
-				if pw != nil {
-					conv.timelineBox.Remove(pw)
-				}
-			}
-			if conv.thinkingLabel != nil && conv.thinkingAttached {
-				conv.timelineBox.Remove(conv.thinkingLabel)
-				conv.thinkingAttached = false
-			}
-			if conv.revertBanner != nil {
-				conv.timelineBox.Remove(conv.revertBanner)
-			}
-			conv.assistantMap = make(map[string]*AssistantMessageWidget)
-			conv.compactionMap = make(map[string]*CompactionWidget)
-			conv.messageWidgets = make(map[string]gtk.Widgetter)
-			conv.formWidgets = make(map[string]*QuestionFormWidget)
-			conv.pendingForms = nil
-			conv.permissionWidgets = make(map[string]*PermissionPromptWidget)
-			conv.pendingPermissions = nil
-			conv.revertBanner = nil
 			prevBlocking := conv.blockingTools
-			conv.seenMsgIDs = make(map[string]bool)
-			conv.executingTools = make(map[string]string)
-			conv.finishedTools = make(map[string]bool)
-			conv.compacting = false
-			conv.runningUserShell = false
-			conv.blockingTools = make(map[string]time.Time)
-			conv.blockingShellTools = make(map[string]bool)
-			conv.blockingShellIDs = make(map[string]string)
-			conv.backgroundShellIDs = make(map[string]bool)
-			conv.toolNames = make(map[string]string)
+			conv.resetTimelineWidgets()
 
 			if page == nil {
 				conv.messages = nil
@@ -6650,9 +7032,50 @@ func (w *Window) loadOlderConvMessages(tab *sessionTab, conv *convTimeline) {
 	conv.loadingOlder = true
 	sessionID := conv.session.ID
 	cursor := conv.nextCursor
+	trimmedHead := conv.trimmedHead
+	oldestID := ""
+	if len(conv.messages) > 0 {
+		oldestID = conv.messages[0].ID
+	}
+	curCount := len(conv.messages)
 
 	gtkutil.Async(w.ctx, func() func() {
-		page, err := w.client.ListMessagesPage(w.ctx, sessionID, 50, cursor)
+		var (
+			page *opencode.MessagePage
+			err  error
+		)
+		if !trimmedHead {
+			page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, cursor)
+		} else {
+			reqLimit := min(200, max(50, curCount+50))
+			page, err = w.client.ListMessagesPage(w.ctx, sessionID, reqLimit, "")
+			if err == nil && page != nil && oldestID != "" {
+				for hops := 0; hops < 4; hops++ {
+					idx := slices.IndexFunc(page.Messages, func(m opencode.Message) bool {
+						return m.ID == oldestID
+					})
+					if idx > 0 {
+						page.Messages = page.Messages[:idx]
+						break
+					}
+					if idx == 0 {
+						if page.NextCursor == "" {
+							page.Messages = nil
+						} else {
+							page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, page.NextCursor)
+						}
+						break
+					}
+					if page.NextCursor == "" {
+						break
+					}
+					page, err = w.client.ListMessagesPage(w.ctx, sessionID, 50, page.NextCursor)
+					if err != nil || page == nil {
+						break
+					}
+				}
+			}
+		}
 		return func() {
 			conv.loadingOlder = false
 			if err != nil {
@@ -6661,8 +7084,10 @@ func (w *Window) loadOlderConvMessages(tab *sessionTab, conv *convTimeline) {
 			}
 			if page == nil {
 				conv.hasOlder = false
+				conv.trimmedHead = false
 				return
 			}
+			conv.trimmedHead = false
 			conv.nextCursor = page.NextCursor
 			conv.hasOlder = page.NextCursor != ""
 
@@ -6670,16 +7095,24 @@ func (w *Window) loadOlderConvMessages(tab *sessionTab, conv *convTimeline) {
 				return
 			}
 
+			var newOlder []opencode.Message
+			for _, msg := range page.Messages {
+				if msg.ID != "" && conv.seenMsgIDs[msg.ID] {
+					continue
+				}
+				newOlder = append(newOlder, msg)
+			}
+			if len(newOlder) == 0 {
+				return
+			}
+
 			unlock := conv.scroll.LockScroll()
 			defer glib.IdleAdd(unlock)
 
-			conv.messages = append(page.Messages, conv.messages...)
+			conv.messages = append(newOlder, conv.messages...)
 
-			for i := len(page.Messages) - 1; i >= 0; i-- {
-				msg := page.Messages[i]
-				if conv.seenMsgIDs[msg.ID] {
-					continue
-				}
+			for i := len(newOlder) - 1; i >= 0; i-- {
+				msg := newOlder[i]
 				conv.seenMsgIDs[msg.ID] = true
 				widget := w.buildMessageWidget(tab, conv, msg)
 				if widget != nil {
@@ -6754,6 +7187,7 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 				}
 			}
 		}
+		conv.indexAssistantTools(aw)
 		conv.assistantMap[msg.ID] = aw
 		return aw
 
@@ -6793,6 +7227,15 @@ func (w *Window) reconcileTail(sessionID string) {
 	if w.client == nil || conv == nil || !conv.loaded {
 		return
 	}
+	if w.reconcileInFlight == nil {
+		w.reconcileInFlight = make(map[string]bool)
+		w.reconcileDirty = make(map[string]bool)
+	}
+	if w.reconcileInFlight[sessionID] {
+		w.reconcileDirty[sessionID] = true
+		return
+	}
+	w.reconcileInFlight[sessionID] = true
 	startGen := conv.activityGen
 	gtkutil.Async(w.ctx, func() func() {
 		var (
@@ -6817,6 +7260,12 @@ func (w *Window) reconcileTail(sessionID string) {
 		}()
 		wg.Wait()
 		return func() {
+			delete(w.reconcileInFlight, sessionID)
+			rerun := w.reconcileDirty[sessionID]
+			delete(w.reconcileDirty, sessionID)
+			if rerun {
+				defer w.reconcileTail(sessionID)
+			}
 			if err != nil || page == nil {
 				return
 			}
@@ -6922,6 +7371,7 @@ func (w *Window) reconcileTail(sessionID string) {
 			)
 			conv.keepPendingAtBottom()
 			w.updateTurnDurations(conv)
+			conv.maybeTrimTimelineHead()
 
 			if appended {
 				conv.scroll.ScrollToBottomIfBottomed()
@@ -6952,14 +7402,44 @@ func (w *Window) onStreamDelta(tab *sessionTab, conv *convTimeline, deltaLen int
 		conv.streamStart = time.Now()
 	}
 	conv.streamedChars += deltaLen
-	dur := time.Since(conv.streamStart).Seconds()
+	now := time.Now()
+	dur := now.Sub(conv.streamStart).Seconds()
 	if dur >= 0.15 && conv.streamedChars > 0 {
 		rate := (float64(conv.streamedChars) / 4.0) / dur
 		conv.lastTokRate = fmt.Sprintf("%.1f tok/s", rate)
 		if w.currentTab() == tab && tab != nil && tab.activeConv() == conv {
-			w.tokRateStatusLabel.SetLabel(conv.lastTokRate)
-			w.tokRateStatusLabel.SetVisible(true)
+			if now.Sub(w.lastTokRateUpdate) >= 250*time.Millisecond {
+				w.lastTokRateUpdate = now
+				w.syncTokRateLabel(conv.lastTokRate)
+			} else if !w.telemetryTimerOn {
+				w.telemetryTimerOn = true
+				glib.TimeoutAddPriority(250, glib.PRIORITY_LOW, func() bool {
+					w.telemetryTimerOn = false
+					if w.ctx != nil && w.ctx.Err() != nil {
+						return false
+					}
+					if cur := w.currentTab(); cur != nil {
+						if ac := cur.activeConv(); ac != nil && ac.active && ac.lastTokRate != "" {
+							w.lastTokRateUpdate = time.Now()
+							w.syncTokRateLabel(ac.lastTokRate)
+						}
+					}
+					return false
+				})
+			}
 		}
+	}
+}
+
+func (w *Window) syncTokRateLabel(rate string) {
+	if w.tokRateStatusLabel == nil || rate == "" {
+		return
+	}
+	if w.tokRateStatusLabel.Text() != rate {
+		w.tokRateStatusLabel.SetLabel(rate)
+	}
+	if !w.tokRateStatusLabel.Visible() {
+		w.tokRateStatusLabel.SetVisible(true)
 	}
 }
 
@@ -7204,17 +7684,10 @@ func (w *Window) isForegroundShell(tab *sessionTab, sh opencode.ShellItem) bool 
 			if conv.blockingShellTools[sh.CallID] {
 				return true
 			}
-			for _, aw := range conv.assistantMap {
-				if tw, ok := aw.tools[sh.CallID]; ok && tw.IsBackgroundRunning() {
-					return false
-				}
-			}
 		}
-		for _, aw := range conv.assistantMap {
-			for _, tw := range aw.tools {
-				if tw.ShellID() == sh.ID && tw.IsBackgroundRunning() {
-					return false
-				}
+		for _, tw := range conv.shellToolsByID[sh.ID] {
+			if tw.IsBackgroundRunning() {
+				return false
 			}
 		}
 		if len(conv.blockingShellTools) > 0 && len(conv.blockingShellIDs) == 0 && sh.CallID == "" {
@@ -7230,6 +7703,40 @@ func (w *Window) isForegroundShell(tab *sessionTab, sh opencode.ShellItem) bool 
 	}
 	for _, sub := range tab.subTimelines {
 		if checkConv(sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) hasVisibleBackgroundShellsForTab(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	for _, sh := range w.activeShells {
+		if sh.Status != "" && sh.Status != "running" {
+			continue
+		}
+		if w.isShellInTab(tab, sh) && !w.isForegroundShell(tab, sh) {
+			return true
+		}
+	}
+	hasInConv := func(conv *convTimeline) bool {
+		if conv == nil {
+			return false
+		}
+		for _, tw := range conv.activeBgShellTools {
+			if tw.ShellID() != "" && tw.IsBackgroundRunning() {
+				return true
+			}
+		}
+		return false
+	}
+	if hasInConv(tab.main) {
+		return true
+	}
+	for _, sub := range tab.subTimelines {
+		if hasInConv(sub) {
 			return true
 		}
 	}
@@ -7269,24 +7776,22 @@ func (w *Window) visibleBackgroundShellsForTab(tab *sessionTab) []opencode.Shell
 		if locDir == "" {
 			locDir = tab.main.session.Location.Directory
 		}
-		for _, aw := range conv.assistantMap {
-			for _, tw := range aw.tools {
-				shID := tw.ShellID()
-				if shID == "" || seen[shID] || !tw.IsBackgroundRunning() {
-					continue
-				}
-				seen[shID] = true
-				cmd := strings.TrimSpace(tw.subtitleLabel.Label())
-				out = append(out, opencode.ShellItem{
-					ID:          shID,
-					SessionID:   conv.session.ID,
-					CallID:      tw.toolID,
-					Command:     cmd,
-					LocationDir: locDir,
-					File:        tw.ShellFile(),
-					Status:      "running",
-				})
+		for _, tw := range conv.activeBgShellTools {
+			shID := tw.ShellID()
+			if shID == "" || seen[shID] || !tw.IsBackgroundRunning() {
+				continue
 			}
+			seen[shID] = true
+			cmd := strings.TrimSpace(tw.subtitleLabel.Label())
+			out = append(out, opencode.ShellItem{
+				ID:          shID,
+				SessionID:   conv.session.ID,
+				CallID:      tw.toolID,
+				Command:     cmd,
+				LocationDir: locDir,
+				File:        tw.ShellFile(),
+				Status:      "running",
+			})
 		}
 	}
 	collectFromConv(tab.main)
@@ -7334,20 +7839,19 @@ func (w *Window) findShellOutputFile(shellID string) string {
 	}
 	for _, tab := range w.tabs {
 		if tab.main != nil {
-			for _, aw := range tab.main.assistantMap {
-				for _, tw := range aw.tools {
-					if tw.ShellID() == shellID && tw.ShellFile() != "" {
-						return tw.ShellFile()
-					}
+			for _, tw := range tab.main.shellToolsByID[shellID] {
+				if f := tw.ShellFile(); f != "" {
+					return f
 				}
 			}
 		}
 		for _, sub := range tab.subTimelines {
-			for _, aw := range sub.assistantMap {
-				for _, tw := range aw.tools {
-					if tw.ShellID() == shellID && tw.ShellFile() != "" {
-						return tw.ShellFile()
-					}
+			if sub == nil {
+				continue
+			}
+			for _, tw := range sub.shellToolsByID[shellID] {
+				if f := tw.ShellFile(); f != "" {
+					return f
 				}
 			}
 		}
@@ -7421,15 +7925,14 @@ func (w *Window) updateToolWidgetsForShell(shellID, formattedOutput, bgStatus st
 		if conv == nil {
 			return
 		}
-		for _, aw := range conv.assistantMap {
-			for _, tw := range aw.tools {
-				if tw.ShellID() == shellID {
-					if formattedOutput != "" {
-						tw.SetShellLiveOutput(formattedOutput)
-					}
-					if bgStatus != "" {
-						tw.SetBackgroundStatus(bgStatus)
-					}
+		for _, tw := range conv.shellToolsByID[shellID] {
+			if formattedOutput != "" {
+				tw.SetShellLiveOutput(formattedOutput)
+			}
+			if bgStatus != "" {
+				tw.SetBackgroundStatus(bgStatus)
+				if !tw.IsBackgroundRunning() {
+					delete(conv.activeBgShellTools, tw.toolID)
 				}
 			}
 		}
@@ -7579,6 +8082,13 @@ func (w *Window) refreshShells() {
 				}
 			}
 			w.activeShells = merged
+			if len(w.shellOutputs) > 32 {
+				for id := range w.shellOutputs {
+					if _, active := w.activeShells[id]; !active && !known[id] {
+						delete(w.shellOutputs, id)
+					}
+				}
+			}
 			if complete && hadTabs {
 				w.shellsLoaded = true
 				// A shell that was already running when the refresh started
@@ -7605,11 +8115,9 @@ func (w *Window) backgroundRunningShellIDs() map[string]bool {
 		if conv == nil {
 			return
 		}
-		for _, aw := range conv.assistantMap {
-			for _, tw := range aw.tools {
-				if id := tw.ShellID(); id != "" && tw.IsBackgroundRunning() {
-					ids[id] = true
-				}
+		for _, tw := range conv.activeBgShellTools {
+			if id := tw.ShellID(); id != "" && tw.IsBackgroundRunning() {
+				ids[id] = true
 			}
 		}
 	}
@@ -8118,6 +8626,21 @@ func (w *Window) updateModelLastUsed(ref opencode.ModelRef, ts int64) {
 }
 
 func (w *Window) rebuildModelList() {
+	if w.modelListBox == nil {
+		return
+	}
+	if w.modelPopover != nil && !w.modelPopover.Visible() && !w.modelPopover.Mapped() {
+		w.modelListDirty = true
+		return
+	}
+	w.rebuildModelListNow()
+}
+
+func (w *Window) rebuildModelListNow() {
+	if w.modelListBox == nil {
+		return
+	}
+	w.modelListDirty = false
 	w.modelListBox.RemoveAll()
 	w.modelRows = nil
 
@@ -8231,7 +8754,11 @@ func (w *Window) rebuildModelList() {
 	w.showAllModelsRow = showAllRow
 	w.showAllModelsLabel = showAllLbl
 
-	w.filterModelList(w.modelSearchEntry.Text())
+	var query string
+	if w.modelSearchEntry != nil {
+		query = w.modelSearchEntry.Text()
+	}
+	w.filterModelList(query)
 }
 
 func (w *Window) filterModelList(query string) {
@@ -9614,11 +10141,25 @@ func (w *Window) updateTurnDurations(conv *convTimeline) {
 	durations := computeTurnDurations(conv.messages, revertID, conv.active, func(id string) bool {
 		return conv.assistantMap[id] != nil
 	})
-	for id, aw := range conv.assistantMap {
-		if d, ok := durations[id]; ok {
-			aw.SetTurnDuration(formatTurnDurationNotice(d))
-		} else {
-			aw.SetTurnDuration("")
+	if conv.turnDurationTargets == nil {
+		conv.turnDurationTargets = make(map[string]string)
+	}
+	for id := range conv.turnDurationTargets {
+		if _, ok := durations[id]; !ok {
+			if aw := conv.assistantMap[id]; aw != nil {
+				aw.SetTurnDuration("")
+			}
+			delete(conv.turnDurationTargets, id)
+		}
+	}
+	for id, d := range durations {
+		text := formatTurnDurationNotice(d)
+		if conv.turnDurationTargets[id] == text {
+			continue
+		}
+		if aw := conv.assistantMap[id]; aw != nil {
+			aw.SetTurnDuration(text)
+			conv.turnDurationTargets[id] = text
 		}
 	}
 }
@@ -9937,6 +10478,11 @@ func (w *Window) commitRevertState(tab *sessionTab, conv *convTimeline) {
 		if targetIdx >= 0 {
 			for i := targetIdx; i < len(conv.messages); i++ {
 				id := conv.messages[i].ID
+				if aw := conv.assistantMap[id]; aw != nil {
+					aw.CloseStreams()
+					conv.removeAssistantToolIndexes(aw)
+				}
+				delete(conv.turnDurationTargets, id)
 				if widget, ok := conv.messageWidgets[id]; ok {
 					conv.timelineBox.Remove(widget)
 					delete(conv.messageWidgets, id)
@@ -10375,6 +10921,9 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 		}
 		w.updateTurnDurations(conv)
 		conv.keepPendingAtBottom()
+		if !active {
+			conv.maybeTrimTimelineHead()
+		}
 		if active && conv.scroll != nil {
 			conv.scroll.ScrollToBottomIfBottomed()
 		}
@@ -10472,14 +11021,129 @@ func (w *Window) resyncOnReconnect() {
 
 func (w *Window) runEventLoop() {
 	_ = w.client.SubscribeEventsLoop(w.ctx, 2*time.Second, func(ev opencode.Event) {
-		glib.IdleAdd(func() {
-			w.handleEvent(ev)
-		})
+		w.enqueueSSEEvent(ev)
 	}, func() {
-		glib.IdleAdd(func() {
+		glib.IdleAddPriority(glib.PRIORITY_LOW, func() {
 			w.resyncOnReconnect()
 		})
 	})
+}
+
+func (w *Window) enqueueSSEEvent(ev opencode.Event) {
+	w.sseMu.Lock()
+	w.sseQueue = append(w.sseQueue, ev)
+	shouldSchedule := !w.sseDrainPending
+	if shouldSchedule {
+		w.sseDrainPending = true
+	}
+	w.sseMu.Unlock()
+
+	if shouldSchedule {
+		glib.IdleAddPriority(glib.PRIORITY_LOW, w.drainSSEEvents)
+	}
+}
+
+func (w *Window) drainSSEEvents() {
+	w.sseMu.Lock()
+	batch := w.sseQueue
+	w.sseQueue = nil
+	w.sseDrainPending = false
+	w.sseMu.Unlock()
+
+	if w.ctx != nil && w.ctx.Err() != nil {
+		return
+	}
+	for _, ev := range coalesceSSEEvents(batch) {
+		w.handleEvent(ev)
+	}
+}
+
+// coalesceSSEEvents merges consecutive high-frequency streaming delta events
+// for the same message part / tool call while preserving ordering around all
+// non-delta and boundary events.
+func coalesceSSEEvents(events []opencode.Event) []opencode.Event {
+	if len(events) <= 1 {
+		return events
+	}
+	out := make([]opencode.Event, 0, len(events))
+	var (
+		pendingText  *opencode.TextDeltaEvent
+		pendingType  string
+		pendingTool  *opencode.ToolEvent
+		flushPending = func() {
+			if pendingText != nil {
+				if data, err := json.Marshal(pendingText); err == nil {
+					out = append(out, opencode.Event{Type: pendingType, Data: data})
+				}
+				pendingText = nil
+				pendingType = ""
+			}
+			if pendingTool != nil {
+				if data, err := json.Marshal(pendingTool); err == nil {
+					out = append(out, opencode.Event{Type: "session.tool.input.delta", Data: data})
+				}
+				pendingTool = nil
+			}
+		}
+	)
+
+	for i := 0; i < len(events); i++ {
+		ev := events[i]
+		switch ev.Type {
+		case "session.text.delta", "session.reasoning.delta":
+			var d opencode.TextDeltaEvent
+			if json.Unmarshal(ev.Data, &d) != nil || d.SessionID == "" {
+				flushPending()
+				out = append(out, ev)
+				continue
+			}
+			if pendingText != nil && pendingType == ev.Type &&
+				pendingText.SessionID == d.SessionID &&
+				pendingText.AssistantMessageID == d.AssistantMessageID &&
+				pendingText.Ordinal == d.Ordinal {
+				pendingText.Delta += d.Delta
+				continue
+			}
+			flushPending()
+			// Fast path: if the next event is not a matching delta, keep raw event as-is.
+			if i+1 < len(events) && events[i+1].Type == ev.Type {
+				pendingText = &d
+				pendingType = ev.Type
+			} else {
+				out = append(out, ev)
+			}
+
+		case "session.tool.input.delta":
+			var d opencode.ToolEvent
+			if json.Unmarshal(ev.Data, &d) != nil || d.SessionID == "" {
+				flushPending()
+				out = append(out, ev)
+				continue
+			}
+			if pendingTool != nil &&
+				pendingTool.SessionID == d.SessionID &&
+				pendingTool.AssistantMessageID == d.AssistantMessageID &&
+				pendingTool.ID == d.ID {
+				if pendingTool.Name == "" && d.Name != "" {
+					pendingTool.Name = d.Name
+				}
+				pendingTool.Delta += d.Delta
+				continue
+			}
+			flushPending()
+			if i+1 < len(events) && events[i+1].Type == ev.Type {
+				pendingTool = &d
+			} else {
+				out = append(out, ev)
+			}
+
+		default:
+			flushPending()
+			out = append(out, ev)
+		}
+	}
+	flushPending()
+	return out
 }
 
 func (w *Window) handleEvent(ev opencode.Event) {
@@ -10653,6 +11317,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			delID := d.SessionID
 			if parentID, ok := w.childToRoot[delID]; ok {
 				delete(w.childToRoot, delID)
+				delete(w.resolvedSessionTitles, delID)
 				w.deleteDraft(delID)
 				if parentTab, ok := w.tabs[parentID]; ok {
 					filtered := parentTab.subagents[:0]
@@ -10791,6 +11456,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					w.deleteSessionDraftsForTab(delID, nil)
 				}
 				w.withdrawSessionNotifications(delID)
+				w.pruneSessionAuxiliaryState(delID, nil)
 				delete(w.lastViewAcked, delID)
 				w.syncSidebar()
 			}
@@ -10820,6 +11486,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, nowMs)
 			w.setConvActive(d.SessionID, false)
+			if ev.Type == "session.execution.failed" || ev.Type == "session.execution.interrupted" {
+				conv.finishStreams()
+			}
 			outcome := "succeeded"
 			if ev.Type == "session.execution.failed" {
 				outcome = "failed"
@@ -10852,9 +11521,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.error":
 		var d opencode.SessionErrorEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			if tab, conv := w.resolveEventConv(d.SessionID); tab != nil && conv != nil && conv == tab.main {
-				tab.turnFailed = true
-				w.cancelCompletionSettle(tab)
+			if tab, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				conv.finishStreams()
+				if tab != nil && conv == tab.main {
+					tab.turnFailed = true
+					w.cancelCompletionSettle(tab)
+				}
 			}
 		}
 
@@ -10888,6 +11560,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				nowMs := time.Now().UnixMilli()
 				w.updateSessionActivityState(d.SessionID, false)
 				tab, conv := w.resolveEventConv(d.SessionID)
+				conv.finishStreams()
 				w.setConvActive(d.SessionID, false)
 				w.setSubagentActive(d.SessionID, false, "succeeded")
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
@@ -11359,6 +12032,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					tw.SetStatus("running")
 					tw.SetInput(d.Input)
 					tw.SetMetadata(d.Metadata)
+					conv.indexToolWidget(tw)
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
@@ -11445,6 +12119,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						tw.SetOutput(d.Content, d.Error)
 					}
 					tw.SetMetadata(d.Metadata)
+					conv.indexToolWidget(tw)
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
@@ -11515,6 +12190,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					tw.SetStatus("completed")
 					tw.SetOutput(d.Content, nil)
 					tw.SetMetadata(d.Metadata)
+					conv.indexToolWidget(tw)
 					if shID == "" {
 						shID = tw.ShellID()
 					}
@@ -11578,6 +12254,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					tw.SetStatus("failed")
 					tw.SetOutput(d.Content, d.Error)
 					tw.SetMetadata(d.Metadata)
+					conv.indexToolWidget(tw)
 				}
 				if w.currentTab() == tab {
 					w.updateBottomBar(tab)
@@ -11656,7 +12333,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				delete(w.activeShells, id)
 				delete(w.shellOutputLabels, id)
 				w.updateToolWidgetsForShell(id, w.shellOutputs[id], "completed")
-				if hadSh {
+				if ev.Type == "shell.deleted" {
+					delete(w.shellOutputs, id)
+				} else if hadSh {
 					if prevSh.EffectiveFile() == "" {
 						prevSh.File = w.findShellOutputFile(id)
 					}

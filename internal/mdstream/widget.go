@@ -2,6 +2,7 @@ package mdstream
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"html"
 	"regexp"
@@ -231,11 +232,14 @@ type View struct {
 	committedWidgets []gtk.Widgetter
 	tailWidgets      []gtk.Widgetter
 
-	mu       sync.Mutex
-	engine   *Engine
-	streamer *Streamer
-	closed   atomic.Bool
-	epoch    uint64
+	mu            sync.Mutex
+	engine        *Engine
+	streamer      *Streamer
+	closed        atomic.Bool
+	epoch         uint64
+	finalized     bool
+	finalizedLen  int
+	finalizedHash [32]byte
 }
 
 // NewView creates a new streaming Markdown GTK4 View.
@@ -255,12 +259,16 @@ func NewView(ctx context.Context) *View {
 	root.Append(committedBox)
 	root.Append(tailBox)
 
-	return &View{
+	v := &View{
 		Box:          root,
 		ctx:          ctx,
 		committedBox: committedBox,
 		tailBox:      tailBox,
 	}
+	root.ConnectDestroy(func() {
+		v.Close()
+	})
+	return v
 }
 
 // AppendDelta appends a streaming markdown delta to be parsed and rendered in batches.
@@ -269,6 +277,7 @@ func (v *View) AppendDelta(delta string) {
 		return
 	}
 	v.mu.Lock()
+	v.finalized = false
 	if v.streamer == nil {
 		if v.engine == nil {
 			v.engine = NewEngine()
@@ -296,12 +305,30 @@ func (v *View) SetStatic(markdown string) {
 	v.clearTail()
 
 	v.mu.Lock()
+	v.finalized = false
 	v.engine = NewEngine()
 	v.engine.Append(markdown)
 	p, _ := v.engine.Flush()
 	v.mu.Unlock()
 
 	v.applyPatch(p)
+}
+
+// FinishStream finalizes any active streaming worker with the text buffered so far
+// while keeping the rendered content intact. Unlike Finalize(""), it is a no-op if
+// no streamer is currently running.
+func (v *View) FinishStream() {
+	if v.closed.Load() {
+		return
+	}
+	v.mu.Lock()
+	s := v.streamer
+	v.streamer = nil
+	v.mu.Unlock()
+
+	if s != nil {
+		s.Finalize("")
+	}
 }
 
 // Finalize flushes any pending streaming tokens and commits all remaining blocks.
@@ -313,11 +340,23 @@ func (v *View) Finalize(fullText string) {
 	s := v.streamer
 	v.streamer = nil
 	eng := v.engine
+	wasFinalized := v.finalized
+	prevLen := v.finalizedLen
+	prevHash := v.finalizedHash
 	v.mu.Unlock()
 
 	if s != nil {
 		s.Finalize(fullText)
 		return
+	}
+
+	if wasFinalized {
+		if fullText == "" || (len(fullText) == prevLen && sha256.Sum256([]byte(fullText)) == prevHash) {
+			return
+		}
+		v.clearCommitted()
+		v.clearTail()
+		eng = nil
 	}
 
 	if eng == nil {
@@ -336,6 +375,9 @@ func (v *View) Close() {
 		return
 	}
 	v.stopStreamer()
+	v.mu.Lock()
+	v.engine = nil
+	v.mu.Unlock()
 }
 
 func (v *View) stopStreamer() {
@@ -391,6 +433,18 @@ func (v *View) applyPatch(patch RenderPatch) {
 			v.tailBox.Append(w)
 			v.tailBox.SetVisible(true)
 		}
+	}
+	if patch.Final {
+		v.mu.Lock()
+		if v.streamer == nil {
+			if v.engine != nil {
+				v.finalizedLen = len(v.engine.buf)
+				v.finalizedHash = sha256.Sum256(v.engine.buf)
+			}
+			v.finalized = true
+			v.engine = nil
+		}
+		v.mu.Unlock()
 	}
 }
 

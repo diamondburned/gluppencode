@@ -123,7 +123,7 @@ func NewUserMessageWidget(ctx context.Context, textContent string, files ...open
 	var userMD *mdstream.View
 	if trimmed != "" {
 		userMD = mdstream.NewView(ctx)
-		userMD.SetStatic(trimmed)
+		userMD.Finalize(trimmed)
 		userMD.SetVAlign(gtk.AlignCenter)
 		userMD.SetMarginEnd(26) // reserve space so bottom-right action icons never overlap text
 		contentBox.SetVAlign(gtk.AlignCenter)
@@ -1843,7 +1843,7 @@ func NewAssistantMessageWidget(ctx context.Context, agent, model string, onOpenS
 
 // SetTurnDuration sets or clears the end-of-turn duration notice on this assistant message.
 func (w *AssistantMessageWidget) SetTurnDuration(text string) {
-	if w == nil {
+	if w == nil || w.turnDurationText == text {
 		return
 	}
 	w.turnDurationText = text
@@ -1907,7 +1907,7 @@ func (w *AssistantMessageWidget) LoadContent(parts []opencode.ContentPart) {
 				continue
 			}
 			mv := w.newReasoningView()
-			mv.SetStatic(part.Text)
+			mv.Finalize(part.Text)
 			w.reasoningViews[i] = mv
 
 		case "tool":
@@ -1923,7 +1923,7 @@ func (w *AssistantMessageWidget) LoadContent(parts []opencode.ContentPart) {
 				continue
 			}
 			mv := mdstream.NewView(w.ctx)
-			mv.SetStatic(part.Text)
+			mv.Finalize(part.Text)
 			w.textViews[i] = mv
 			w.partsBox.Append(mv)
 		}
@@ -2001,6 +2001,17 @@ func (w *AssistantMessageWidget) EnsureTool(id, name string) *ToolWidget {
 	return tw
 }
 
+// FinishStreams finalizes any still-active streaming markdown workers in this message
+// without discarding the rendered content.
+func (w *AssistantMessageWidget) FinishStreams() {
+	for _, mv := range w.reasoningViews {
+		mv.FinishStream()
+	}
+	for _, mv := range w.textViews {
+		mv.FinishStream()
+	}
+}
+
 // CloseStreams cancels and cleans up all active streaming markdown workers in this message.
 func (w *AssistantMessageWidget) CloseStreams() {
 	for _, mv := range w.reasoningViews {
@@ -2075,7 +2086,7 @@ func (cw *CompactionWidget) Update(msg opencode.Message) {
 	if summary != "" && !cw.hasSummary {
 		cw.hasSummary = true
 		mv := mdstream.NewView(cw.ctx)
-		mv.SetStatic(summary)
+		mv.Finalize(summary)
 		cw.bodyBox.Append(mv)
 		cw.bodyBox.SetVisible(true)
 	}

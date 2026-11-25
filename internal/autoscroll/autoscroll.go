@@ -35,7 +35,10 @@ type Window struct {
 	pageSize            float64
 	lastValue           float64
 	targetScroll        float64
+	pendingPrevUpper    float64
 	settingProgrammatic bool
+	verifyPending       bool
+	scrollPending       bool
 	state               scrollState
 }
 
@@ -111,19 +114,23 @@ func NewWindow() *Window {
 		// grew and our deferred scrollTo hasn't run yet. Verify on the next
 		// idle frame whether we are still away from the bottom with no pending
 		// programmatic target.
-		glib.IdleAdd(func() {
-			if w.state.is(locked) {
-				return
-			}
-			curBottom := w.vadj.Upper() - w.vadj.PageSize()
-			if curBottom <= 0 || w.vadj.Value() >= curBottom-bottomEpsilon {
-				w.state = bottomed
-				return
-			}
-			if math.IsNaN(w.targetScroll) {
-				w.state = 0
-			}
-		})
+		if !w.verifyPending {
+			w.verifyPending = true
+			glib.IdleAdd(func() {
+				w.verifyPending = false
+				if w.state.is(locked) {
+					return
+				}
+				curBottom := w.vadj.Upper() - w.vadj.PageSize()
+				if curBottom <= 0 || w.vadj.Value() >= curBottom-bottomEpsilon {
+					w.state = bottomed
+					return
+				}
+				if math.IsNaN(w.targetScroll) {
+					w.state = 0
+				}
+			})
+		}
 	})
 
 	return &w
@@ -223,37 +230,43 @@ func (w *Window) SetChild(child gtk.Widgetter) {
 
 func (w *Window) scrollTo(targetScroll float64, deferFn bool) {
 	w.targetScroll = targetScroll
-	previousAdjs := getScrollAdjustments(w.vadj)
+	w.pendingPrevUpper = w.vadj.Upper()
 
-	doScroll := func() {
-		if w.targetScroll != targetScroll {
-			return
-		}
-		// If we were unbottomed while waiting for the idle callback, abort.
-		if deferFn && w.state == 0 {
-			w.targetScroll = math.NaN()
-			return
-		}
+	if !deferFn {
+		w.applyPendingScroll(false)
+		return
+	}
+	if !w.scrollPending {
+		w.scrollPending = true
+		glib.IdleAdd(func() {
+			w.scrollPending = false
+			w.applyPendingScroll(true)
+		})
+	}
+}
 
-		currentAdjs := getScrollAdjustments(w.vadj)
-		actualTarget := targetScroll
-		if w.state.is(bottomed) {
-			actualTarget = max(0, currentAdjs.upper-w.vadj.PageSize())
-		} else if currentAdjs.upper != previousAdjs.upper {
-			actualTarget += currentAdjs.upper - previousAdjs.upper
-		}
-
+func (w *Window) applyPendingScroll(deferred bool) {
+	if math.IsNaN(w.targetScroll) {
+		return
+	}
+	// If we were unbottomed while waiting for the idle callback, abort.
+	if deferred && w.state == 0 {
 		w.targetScroll = math.NaN()
-		w.settingProgrammatic = true
-		w.vadj.SetValue(actualTarget)
-		w.settingProgrammatic = false
+		return
 	}
 
-	if deferFn {
-		glib.IdleAdd(doScroll)
-	} else {
-		doScroll()
+	currentAdjs := getScrollAdjustments(w.vadj)
+	actualTarget := w.targetScroll
+	if w.state.is(bottomed) {
+		actualTarget = max(0, currentAdjs.upper-w.vadj.PageSize())
+	} else if currentAdjs.upper != w.pendingPrevUpper {
+		actualTarget += currentAdjs.upper - w.pendingPrevUpper
 	}
+
+	w.targetScroll = math.NaN()
+	w.settingProgrammatic = true
+	w.vadj.SetValue(actualTarget)
+	w.settingProgrammatic = false
 }
 
 type scrollAdjustments struct {

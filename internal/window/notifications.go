@@ -48,6 +48,7 @@ type notificationCoordinator struct {
 	windows              []*Window
 	sentFinished         map[string]string
 	sentActionIDs        map[string]bool
+	sentActionIDsByRoot  map[string][]string
 	activeFinishedIDs    map[string]bool
 	activeActionIDs      map[string]map[string]bool
 	pendingOpenSessionID string
@@ -59,11 +60,12 @@ type notificationCoordinator struct {
 
 func newNotificationCoordinator(gtkApp *gtk.Application) *notificationCoordinator {
 	return &notificationCoordinator{
-		gtkApp:            gtkApp,
-		sentFinished:      make(map[string]string),
-		sentActionIDs:     make(map[string]bool),
-		activeFinishedIDs: make(map[string]bool),
-		activeActionIDs:   make(map[string]map[string]bool),
+		gtkApp:              gtkApp,
+		sentFinished:        make(map[string]string),
+		sentActionIDs:       make(map[string]bool),
+		sentActionIDsByRoot: make(map[string][]string),
+		activeFinishedIDs:   make(map[string]bool),
+		activeActionIDs:     make(map[string]map[string]bool),
 	}
 }
 
@@ -369,6 +371,10 @@ func (c *notificationCoordinator) notifyActionNeeded(w *Window, rootID, targetID
 		return
 	}
 	c.sentActionIDs[actionID] = true
+	if c.sentActionIDsByRoot == nil {
+		c.sentActionIDsByRoot = make(map[string][]string)
+	}
+	c.sentActionIDsByRoot[rootID] = append(c.sentActionIDsByRoot[rootID], actionID)
 	if c.activeActionIDs[rootID] == nil {
 		c.activeActionIDs[rootID] = make(map[string]bool)
 	}
@@ -423,11 +429,18 @@ func (c *notificationCoordinator) withdrawSessionNotifications(rootID string) {
 		return
 	}
 	c.withdrawFinished(rootID)
+	delete(c.sentFinished, rootID)
 	if set := c.activeActionIDs[rootID]; set != nil {
 		for actionID := range set {
 			c.withdrawNotification(actionID)
 		}
 		delete(c.activeActionIDs, rootID)
+	}
+	if ids := c.sentActionIDsByRoot[rootID]; len(ids) > 0 {
+		for _, actionID := range ids {
+			delete(c.sentActionIDs, actionID)
+		}
+		delete(c.sentActionIDsByRoot, rootID)
 	}
 }
 

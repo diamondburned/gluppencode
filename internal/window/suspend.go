@@ -6,6 +6,10 @@ import "time"
 // without being visited before its tab is considered suspended.
 const tabSuspendAfter = 5 * time.Minute
 
+// tabDeepUnloadAfter is how long an idle, unvisited tab remains untouched before
+// its rendered timeline widgets and message buffer are unloaded from memory.
+const tabDeepUnloadAfter = 15 * time.Minute
+
 // A suspended tab is like an archived session as far as background polling is
 // concerned: reconnect resyncs and directory sweeps skip it, so the server does
 // not have to (re)boot its location just to refresh a session nobody is
@@ -26,8 +30,12 @@ func (w *Window) touchSession(rootID string) {
 // recentlyTouched reports whether a root session had activity or a visit within
 // tabSuspendAfter.
 func (w *Window) recentlyTouched(rootID string) bool {
+	return w.recentlyTouchedWithin(rootID, tabSuspendAfter)
+}
+
+func (w *Window) recentlyTouchedWithin(rootID string, d time.Duration) bool {
 	at, ok := w.sessionTouched[rootID]
-	return ok && time.Since(at) < tabSuspendAfter
+	return ok && time.Since(at) < d
 }
 
 // noteVisibleRoot stamps the tab being shown and the one just left, so a tab
@@ -111,4 +119,41 @@ func (w *Window) awakeTabDirs() []string {
 		dirs = append(dirs, d)
 	}
 	return dirs
+}
+
+func (w *Window) canDeepUnloadTab(tab *sessionTab) bool {
+	if w == nil || tab == nil || tab.main == nil {
+		return false
+	}
+	id := tab.main.session.ID
+	if id == "" || id == w.currentRootSessionID() || w.recentlyTouchedWithin(id, tabDeepUnloadAfter) {
+		return false
+	}
+	if w.isTabWorking(tab) || tabHasPending(tab) {
+		return false
+	}
+	if tab.main.loadingInitial || tab.main.loadingOlder {
+		return false
+	}
+	hasLoaded := tab.main.loaded || len(tab.main.messages) > 0
+	for _, sub := range tab.subTimelines {
+		if sub == nil {
+			continue
+		}
+		if sub.loadingInitial || sub.loadingOlder {
+			return false
+		}
+		if sub.loaded || len(sub.messages) > 0 {
+			hasLoaded = true
+		}
+	}
+	return hasLoaded || len(tab.subTimelines) > 0
+}
+
+func (w *Window) unloadLongSuspendedTabs() {
+	for _, tab := range w.tabs {
+		if w.canDeepUnloadTab(tab) {
+			w.unloadTabTimelines(tab)
+		}
+	}
 }

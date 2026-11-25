@@ -2689,10 +2689,12 @@ func TestRefreshShellsCompletesStaleWidgets(t *testing.T) {
 			}
 			tools := map[string]*ToolWidget{"t_dead": bgTool("t_dead", "sh_dead"), "t_live": bgTool("t_live", "sh_live")}
 			tab.main.assistantMap["m1"] = &AssistantMessageWidget{tools: tools}
+			tab.main.indexAssistantTools(tab.main.assistantMap["m1"])
 
 			win.refreshShells()
 			// A shell started while the listing is in flight must survive it.
 			tools["t_new"] = bgTool("t_new", "sh_new")
+			tab.main.indexToolWidget(tools["t_new"])
 			win.handleEvent(opencode.Event{Type: "shell.created", Data: json.RawMessage(`{"info":{"id":"sh_new","status":"running"}}`)})
 			close(release)
 
@@ -4589,6 +4591,7 @@ func TestTurnDurationAndScrollableInlineShellOutput(t *testing.T) {
 		shellID:      "sh_scroll_1",
 	}
 	aw1.tools["call_sh_1"] = twShell
+	conv.indexToolWidget(twShell)
 
 	win.activeShells["sh_scroll_1"] = opencode.ShellItem{
 		ID:        "sh_scroll_1",
@@ -4628,6 +4631,7 @@ func TestTurnDurationAndScrollableInlineShellOutput(t *testing.T) {
 		shellID:      "sh_scroll2",
 	}
 	aw1.tools["call_sh_2"] = twShell2
+	conv.indexToolWidget(twShell2)
 	conv.markSyntheticTargetCompleted(opencode.Message{
 		ID:   "syn_sh_2",
 		Type: "synthetic",
