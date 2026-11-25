@@ -331,6 +331,7 @@ type ToolWidget struct {
 	lazyOutputDirty    bool
 	lazyImagesDirty    bool
 	hasLazyImage       bool
+	readHasImageOutput bool
 	lazyShellLiveDirty bool
 	rawDiffText        string
 	diffRendered       bool
@@ -376,6 +377,38 @@ func isMarkdownPath(path string) bool {
 	default:
 		return false
 	}
+}
+
+func isImagePath(path string) bool {
+	switch strings.ToLower(filepath.Ext(strings.TrimSpace(path))) {
+	case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
+		return true
+	default:
+		return false
+	}
+}
+
+func isImageToolContentItem(item opencode.ToolContentItem) bool {
+	data := item.ImageData()
+	if data == "" {
+		return false
+	}
+	if strings.HasPrefix(item.Mime, "image/") || strings.HasPrefix(data, "data:image/") {
+		return true
+	}
+	if item.Type == "file" || item.Type == "" {
+		return isImagePath(item.Name)
+	}
+	return false
+}
+
+func hasImageOutput(items []opencode.ToolContentItem) bool {
+	for _, item := range items {
+		if isImageToolContentItem(item) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveToolFilePath(baseDir, rawPath string) string {
@@ -606,7 +639,7 @@ func setInitialToolIcon(icon *gtk.Image, name string) {
 	case "shell", "bash":
 		icon.SetFromIconName("terminal-symbolic")
 	case "read":
-		icon.SetFromIconName("document-open-symbolic")
+		icon.SetFromIconName("menu-book-symbolic")
 	case "grep", "glob":
 		icon.SetFromIconName("system-search-symbolic")
 	case "execute":
@@ -614,7 +647,7 @@ func setInitialToolIcon(icon *gtk.Image, name string) {
 	case "subagent", "task":
 		icon.SetFromIconName("system-users-symbolic")
 	case "question":
-		icon.SetFromIconName("forum-symbolic")
+		icon.SetFromIconName("dialog-question-symbolic")
 	default:
 		icon.SetFromIconName("utilities-terminal-symbolic")
 	}
@@ -1153,10 +1186,9 @@ func (t *ToolWidget) SetInput(raw any) {
 		}
 
 	case "read":
-		t.toolIcon.SetFromIconName("document-open-symbolic")
-		t.titleLabel.SetLabel("Read")
 		path := firstToolInputString(m, "path", "filePath", "file_path", "file", "filename")
 		t.setToolFilePath(path)
+		t.setReadAppearance(isImagePath(t.filePath) || isImagePath(path) || t.readHasImageOutput)
 		t.subtitleLabel.SetLabel(shortPath(path))
 		offset := toInt(m["offset"])
 		limit := toInt(m["limit"])
@@ -1198,7 +1230,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		}
 
 	case "question":
-		t.toolIcon.SetFromIconName("forum-symbolic")
+		t.toolIcon.SetFromIconName("dialog-question-symbolic")
 		t.titleLabel.SetLabel("Question")
 		sub, details := formatQuestionToolInput(m)
 		t.subtitleLabel.SetLabel(sub)
@@ -1600,6 +1632,8 @@ func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 				t.imageBox.SetVisible(false)
 			}
 			t.lazyImagesDirty = true
+			t.readHasImageOutput = hasImageOutput(items)
+			t.setReadAppearance(isImagePath(t.filePath) || t.readHasImageOutput)
 		} else {
 			t.extractShellMetaFromItems(items)
 			t.lazyImagesDirty = false
@@ -1638,8 +1672,22 @@ func (t *ToolWidget) flushLazyOutput() {
 	}
 }
 
+func (t *ToolWidget) setReadAppearance(isImage bool) {
+	if isImage {
+		t.toolIcon.SetFromIconName("image-symbolic")
+		t.titleLabel.SetLabel("View")
+		return
+	}
+	t.toolIcon.SetFromIconName("menu-book-symbolic")
+	t.titleLabel.SetLabel("Read")
+}
+
 func (t *ToolWidget) renderOutput(items []opencode.ToolContentItem, errVal any) {
 	hasImage := t.renderOutputImages(items)
+	if strings.EqualFold(t.toolName, "read") {
+		t.readHasImageOutput = hasImage || hasImageOutput(items)
+		t.setReadAppearance(isImagePath(t.filePath) || t.readHasImageOutput)
+	}
 	t.renderOutputText(items, errVal, hasImage)
 }
 
@@ -1651,44 +1699,28 @@ func (t *ToolWidget) renderOutputImages(items []opencode.ToolContentItem) bool {
 
 	var hasImage bool
 	for _, item := range items {
-		data := item.ImageData()
-		if data == "" {
+		if !isImageToolContentItem(item) {
 			continue
 		}
-		isImage := strings.HasPrefix(item.Mime, "image/") || strings.HasPrefix(data, "data:image/")
-		if !isImage && (item.Type == "file" || item.Type == "") {
-			ext := strings.ToLower(filepath.Ext(item.Name))
-			switch ext {
-			case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
-				isImage = true
+		if tex, err := decodeImageTexture(item.ImageData()); err == nil {
+			name := filepath.Base(item.Name)
+			if name == "" || name == "." {
+				name = "Image Output"
 			}
-		}
-		if isImage {
-			tex, err := decodeImageTexture(data)
-			if err == nil {
-				name := filepath.Base(item.Name)
-				if name == "" || name == "." {
-					name = "Image Output"
-				}
-				thumb := newImageThumbnail(t.ctx, name, tex)
-				t.imageBox.Append(thumb)
-				t.imageWidgets = append(t.imageWidgets, thumb)
-				hasImage = true
-			}
+			thumb := newImageThumbnail(t.ctx, name, tex)
+			t.imageBox.Append(thumb)
+			t.imageWidgets = append(t.imageWidgets, thumb)
+			hasImage = true
 		}
 	}
 	// Fallback for read tool if items did not contain an inline image payload but points to an image file on disk.
-	if !hasImage && strings.EqualFold(t.toolName, "read") && t.filePath != "" {
-		ext := strings.ToLower(filepath.Ext(t.filePath))
-		switch ext {
-		case ".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".bmp", ".ico", ".tiff", ".avif":
-			if tex, err := decodeImageTexture(t.filePath); err == nil {
-				name := filepath.Base(t.filePath)
-				thumb := newImageThumbnail(t.ctx, name, tex)
-				t.imageBox.Append(thumb)
-				t.imageWidgets = append(t.imageWidgets, thumb)
-				hasImage = true
-			}
+	if !hasImage && strings.EqualFold(t.toolName, "read") && isImagePath(t.filePath) {
+		if tex, err := decodeImageTexture(t.filePath); err == nil {
+			name := filepath.Base(t.filePath)
+			thumb := newImageThumbnail(t.ctx, name, tex)
+			t.imageBox.Append(thumb)
+			t.imageWidgets = append(t.imageWidgets, thumb)
+			hasImage = true
 		}
 	}
 	if strings.EqualFold(t.toolName, "read") && t.detailsExpander != nil {
@@ -2681,7 +2713,7 @@ func NewQuestionFormWidget(
 	hdr := gtk.NewBox(gtk.OrientationHorizontal, 8)
 	hdr.SetVAlign(gtk.AlignCenter)
 
-	icon := gtk.NewImageFromIconName("forum-symbolic")
+	icon := gtk.NewImageFromIconName("dialog-question-symbolic")
 	icon.AddCSSClass("glup-question-icon")
 	hdr.Append(icon)
 

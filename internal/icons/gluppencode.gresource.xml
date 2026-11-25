@@ -16,6 +16,7 @@
     <file preprocess="xml-stripblanks" alias="chevron-right-symbolic.svg">scalable/actions/chevron-right-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="cloud-off-symbolic.svg">scalable/actions/cloud-off-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="compress-symbolic.svg">scalable/actions/summarize-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="dialog-question-symbolic.svg">scalable/actions/dialog-question-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="document-edit-symbolic.svg">scalable/actions/document-edit-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="document-new-symbolic.svg">scalable/actions/document-new-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="document-open-symbolic.svg">scalable/actions/document-open-symbolic.svg</file>
@@ -31,8 +32,10 @@
     <file preprocess="xml-stripblanks" alias="git-branch-symbolic.svg">scalable/actions/git-branch-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="group-symbolic.svg">scalable/actions/group-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="help-about-symbolic.svg">scalable/actions/help-about-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="image-symbolic.svg">scalable/actions/image-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="list-add-symbolic.svg">scalable/actions/list-add-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="mail-reply-sender-symbolic.svg">scalable/actions/mail-reply-sender-symbolic.svg</file>
+    <file preprocess="xml-stripblanks" alias="menu-book-symbolic.svg">scalable/actions/menu-book-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="menu-large-symbolic.svg">scalable/actions/menu-large-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="object-select-symbolic.svg">scalable/actions/object-select-symbolic.svg</file>
     <file preprocess="xml-stripblanks" alias="open-in-new-symbolic.svg">scalable/actions/open-in-new-symbolic.svg</file>

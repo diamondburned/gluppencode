@@ -1353,6 +1353,12 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	readImgTw.Append(readImgTw.imageBox)
 	readImgTw.applyToolKind()
 	readImgTw.SetInput(map[string]any{"path": "opencode/offline-new2.png"})
+	if got := readImgTw.titleLabel.Text(); got != "View" {
+		t.Fatalf("expected image read titleLabel=%q before output, got %q", "View", got)
+	}
+	if got := readImgTw.toolIcon.IconName(); got != "image-symbolic" {
+		t.Fatalf("expected image read toolIcon=%q before output, got %q", "image-symbolic", got)
+	}
 	readImgTw.SetOutput([]opencode.ToolContentItem{
 		{Type: "text", Text: "Image read successfully"},
 		{Type: "file", Mime: "image/png", Name: "opencode/offline-new2.png", URI: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
@@ -1375,6 +1381,80 @@ func TestSystemNoticeAndSwitchMessages(t *testing.T) {
 	if readImgTw.imageBox.Visible() {
 		t.Fatalf("expected imageBox hidden when collapsed again")
 	}
+}
+
+func TestToolWidgetReadViewAndQuestionIcons(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK display not available in test environment")
+	}
+	adw.Init()
+
+	t.Run("read text file uses Read and menu-book-symbolic", func(t *testing.T) {
+		tw := NewToolWidget(t.Context(), "call_read_txt", "read", nil)
+		if got := tw.titleLabel.Text(); got != "Read" {
+			t.Fatalf("initial titleLabel = %q, want %q", got, "Read")
+		}
+		if got := tw.toolIcon.IconName(); got != "menu-book-symbolic" {
+			t.Fatalf("initial toolIcon = %q, want %q", got, "menu-book-symbolic")
+		}
+		tw.SetInput(map[string]any{"path": "internal/window/message.go"})
+		if got := tw.titleLabel.Text(); got != "Read" {
+			t.Fatalf("titleLabel = %q, want %q", got, "Read")
+		}
+		if got := tw.toolIcon.IconName(); got != "menu-book-symbolic" {
+			t.Fatalf("toolIcon = %q, want %q", got, "menu-book-symbolic")
+		}
+	})
+
+	t.Run("read image by path switches to View and image-symbolic while collapsed", func(t *testing.T) {
+		tw := NewToolWidget(t.Context(), "call_read_img_path", "read", nil)
+		tw.SetInput(map[string]any{"filePath": "/tmp/screenshot.webp"})
+		if got := tw.titleLabel.Text(); got != "View" {
+			t.Fatalf("titleLabel = %q, want %q", got, "View")
+		}
+		if got := tw.toolIcon.IconName(); got != "image-symbolic" {
+			t.Fatalf("toolIcon = %q, want %q", got, "image-symbolic")
+		}
+	})
+
+	t.Run("read extensionless file with image output switches to View and image-symbolic while collapsed", func(t *testing.T) {
+		tw := NewToolWidget(t.Context(), "call_read_img_mime", "read", nil)
+		tw.SetInput(map[string]any{"path": "/tmp/captured-frame"})
+		if got := tw.titleLabel.Text(); got != "Read" {
+			t.Fatalf("pre-output titleLabel = %q, want %q", got, "Read")
+		}
+		tw.SetOutput([]opencode.ToolContentItem{
+			{Type: "text", Text: "Image read successfully"},
+			{Type: "file", Mime: "image/png", Name: "frame", Data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="},
+		}, nil)
+		if got := tw.titleLabel.Text(); got != "View" {
+			t.Fatalf("post-output titleLabel = %q, want %q", got, "View")
+		}
+		if got := tw.toolIcon.IconName(); got != "image-symbolic" {
+			t.Fatalf("post-output toolIcon = %q, want %q", got, "image-symbolic")
+		}
+	})
+
+	t.Run("question tool uses Question and dialog-question-symbolic", func(t *testing.T) {
+		tw := NewToolWidget(t.Context(), "call_q_1", "question", nil)
+		if got := tw.titleLabel.Text(); got != "Question" {
+			t.Fatalf("initial titleLabel = %q, want %q", got, "Question")
+		}
+		if got := tw.toolIcon.IconName(); got != "dialog-question-symbolic" {
+			t.Fatalf("initial toolIcon = %q, want %q", got, "dialog-question-symbolic")
+		}
+		tw.SetInput(map[string]any{
+			"questions": []any{
+				map[string]any{"question": "Proceed with deploy?"},
+			},
+		})
+		if got := tw.titleLabel.Text(); got != "Question" {
+			t.Fatalf("titleLabel = %q, want %q", got, "Question")
+		}
+		if got := tw.toolIcon.IconName(); got != "dialog-question-symbolic" {
+			t.Fatalf("toolIcon = %q, want %q", got, "dialog-question-symbolic")
+		}
+	})
 }
 
 func TestToolWidgetLazyDetails(t *testing.T) {
