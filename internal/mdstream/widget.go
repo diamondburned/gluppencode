@@ -232,11 +232,10 @@ type View struct {
 	committedWidgets []gtk.Widgetter
 	tailWidgets      []gtk.Widgetter
 
-	mu             sync.Mutex
-	engine         *Engine
-	streamer       *Streamer
-	destroyHandler glib.SignalHandle
-	closed         atomic.Bool
+	mu            sync.Mutex
+	engine        *Engine
+	streamer      *Streamer
+	closed        atomic.Bool
 	epoch         uint64
 	finalized     bool
 	finalizedLen  int
@@ -266,26 +265,10 @@ func NewView(ctx context.Context) *View {
 		committedBox: committedBox,
 		tailBox:      tailBox,
 	}
-	return v
-}
-
-func (v *View) ensureDestroyHookLocked() {
-	if v.destroyHandler != 0 || v.closed.Load() {
-		return
-	}
-	v.destroyHandler = v.Box.ConnectDestroy(func() {
+	root.ConnectDestroy(func() {
 		v.Close()
 	})
-}
-
-func (v *View) disconnectDestroy() {
-	v.mu.Lock()
-	h := v.destroyHandler
-	v.destroyHandler = 0
-	v.mu.Unlock()
-	if h != 0 {
-		v.Box.HandlerDisconnect(h)
-	}
+	return v
 }
 
 // AppendDelta appends a streaming markdown delta to be parsed and rendered in batches.
@@ -303,7 +286,6 @@ func (v *View) AppendDelta(delta string) {
 		v.streamer = NewStreamerWithEngine(DefaultInterval, v.engine, func(patch RenderPatch) {
 			v.schedulePatch(epoch, patch)
 		})
-		v.ensureDestroyHookLocked()
 	}
 	s := v.streamer
 	v.mu.Unlock()
@@ -393,7 +375,6 @@ func (v *View) Close() {
 		return
 	}
 	v.stopStreamer()
-	v.disconnectDestroy()
 	v.mu.Lock()
 	v.engine = nil
 	v.mu.Unlock()
@@ -409,7 +390,6 @@ func (v *View) stopStreamer() {
 	if s != nil {
 		s.Close()
 	}
-	v.disconnectDestroy()
 }
 
 func (v *View) schedulePatch(epoch uint64, patch RenderPatch) {
@@ -455,7 +435,6 @@ func (v *View) applyPatch(patch RenderPatch) {
 		}
 	}
 	if patch.Final {
-		shouldDisconnect := false
 		v.mu.Lock()
 		if v.streamer == nil {
 			if v.engine != nil {
@@ -464,12 +443,8 @@ func (v *View) applyPatch(patch RenderPatch) {
 			}
 			v.finalized = true
 			v.engine = nil
-			shouldDisconnect = true
 		}
 		v.mu.Unlock()
-		if shouldDisconnect {
-			v.disconnectDestroy()
-		}
 	}
 }
 

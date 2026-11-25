@@ -6,7 +6,7 @@ require (
 	github.com/diamondburned/chatkit v0.0.0-20261031204703-9ef48f54f871
 	github.com/diamondburned/gotk4-adwaita/pkg v0.0.0-20261031204147-41c057c79b39
 	github.com/diamondburned/gotk4-sourceview/pkg v0.0.0-20261108103011-991c0e50d980
-	github.com/diamondburned/gotk4/pkg v0.4.2-0.20261031204942-a6ab0d7b121f
+	github.com/diamondburned/gotk4/pkg v0.4.2-0.20261125231704-4a0f31f5e4a4
 	github.com/diamondburned/gotkit v0.0.0-20261031204637-f5304451c287
 	github.com/yuin/goldmark v1.8.6
 )
