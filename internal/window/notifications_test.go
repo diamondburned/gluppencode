@@ -585,3 +585,317 @@ func TestMultiWindowNotificationsPrefsAndRouting(t *testing.T) {
 		t.Fatalf("expected win1 currentRootSessionID = ses_only_1, got %q", got)
 	}
 }
+
+func TestSessionViewAPIOutbound(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK cannot be initialized")
+	}
+
+	type viewCall struct {
+		sessionID string
+		idle      int64
+	}
+	var (
+		mu        sync.Mutex
+		viewCalls []viewCall
+		failNext  bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && len(r.URL.Path) > len("/api/session/") && r.URL.Path[len(r.URL.Path)-len("/view"):] == "/view" {
+			sessID := r.URL.Path[len("/api/session/") : len(r.URL.Path)-len("/view")]
+			var body struct {
+				Idle int64 `json:"idle"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			mu.Lock()
+			shouldFail := failNext
+			if shouldFail {
+				failNext = false
+			} else {
+				viewCalls = append(viewCalls, viewCall{sessionID: sessID, idle: body.Idle})
+			}
+			mu.Unlock()
+			if shouldFail {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	activeWin := false
+	coord := newNotificationCoordinator(nil)
+	coord.isActiveOverride = func(*Window) bool { return activeWin }
+
+	win, vs := newTestNotifyWindow(t, coord)
+	win.client = &opencode.Client{BaseURL: srv.URL, HTTP: srv.Client()}
+
+	tabA, _ := newTestTab(vs, "ses_a", "Session A")
+	tabA.main.session.Time.Idle = 1795550000000
+	tabB, _ := newTestTab(vs, "ses_b", "Session B")
+	tabB.main.session.Time.Idle = 1795550000500
+	tabB.main.session.Time.Viewed = 1795550000500
+	tabC, _ := newTestTab(vs, "ses_c", "Session C")
+	tabD, _ := newTestTab(vs, "ses_d", "Session D")
+	win.tabs["ses_a"] = tabA
+	win.tabs["ses_b"] = tabB
+	win.tabs["ses_c"] = tabC
+	win.tabs["ses_d"] = tabD
+
+	// 1. Selecting an unviewed idle tab while window is unfocused does not call ViewSession.
+	vs.SetVisibleChildName("ses_a")
+	win.onVisibleTabChanged()
+	pumpFor(30 * time.Millisecond)
+	mu.Lock()
+	if len(viewCalls) != 0 {
+		t.Fatalf("expected 0 view calls while unfocused, got %+v", viewCalls)
+	}
+	mu.Unlock()
+
+	// 2. Gaining window focus marks the displayed unviewed idle root tab viewed once.
+	activeWin = true
+	win.onWindowActiveChanged()
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(viewCalls) == 1
+	})
+	mu.Lock()
+	if viewCalls[0] != (viewCall{sessionID: "ses_a", idle: 1795550000000}) {
+		t.Fatalf("unexpected first view call: %+v", viewCalls[0])
+	}
+	mu.Unlock()
+
+	// 3. Repeated focus changes and tab flips back to ses_a (or already-viewed ses_b) do not spam.
+	win.onWindowActiveChanged()
+	vs.SetVisibleChildName("ses_b")
+	win.onVisibleTabChanged()
+	vs.SetVisibleChildName("ses_a")
+	win.onVisibleTabChanged()
+	pumpFor(40 * time.Millisecond)
+	mu.Lock()
+	if len(viewCalls) != 1 {
+		t.Fatalf("expected deduplication to keep 1 view call, got %+v", viewCalls)
+	}
+	mu.Unlock()
+
+	// 4. Background tab ses_c receives session.updated with Time.Idle while ses_a is active -> not viewed yet.
+	win.handleEvent(opencode.Event{
+		Type: "session.updated",
+		Data: json.RawMessage(`{"sessionID":"ses_c","session":{"id":"ses_c","time":{"idle":1795550001000}}}`),
+	})
+	pumpFor(30 * time.Millisecond)
+	mu.Lock()
+	if len(viewCalls) != 1 {
+		t.Fatalf("expected background update not to trigger view call, got %+v", viewCalls)
+	}
+	mu.Unlock()
+
+	// Switching to ses_c while window is active marks it viewed.
+	vs.SetVisibleChildName("ses_c")
+	win.onVisibleTabChanged()
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(viewCalls) == 2
+	})
+	mu.Lock()
+	if viewCalls[1] != (viewCall{sessionID: "ses_c", idle: 1795550001000}) {
+		t.Fatalf("unexpected second view call: %+v", viewCalls[1])
+	}
+	mu.Unlock()
+
+	// 5. Focused tab transitions to idle via session.updated + session.idle -> single call using server Time.Idle.
+	win.handleEvent(opencode.Event{Type: "session.execution.started", Data: json.RawMessage(`{"sessionID":"ses_c"}`)})
+	win.handleEvent(opencode.Event{
+		Type: "session.updated",
+		Data: json.RawMessage(`{"sessionID":"ses_c","session":{"id":"ses_c","time":{"idle":1795550002000}}}`),
+	})
+	win.handleEvent(opencode.Event{Type: "session.idle", Data: json.RawMessage(`{"sessionID":"ses_c"}`)})
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(viewCalls) == 3
+	})
+	pumpFor(30 * time.Millisecond)
+	mu.Lock()
+	if len(viewCalls) != 3 || viewCalls[2] != (viewCall{sessionID: "ses_c", idle: 1795550002000}) {
+		t.Fatalf("expected 3rd view call for ses_c @ 1795550002000, got %+v", viewCalls)
+	}
+	mu.Unlock()
+
+	// 6. Focused tab with Time.Idle == 0 does not call ViewSession until session.idle arrives (falling back to current ms).
+	vs.SetVisibleChildName("ses_d")
+	win.onVisibleTabChanged()
+	pumpFor(30 * time.Millisecond)
+	mu.Lock()
+	if len(viewCalls) != 3 {
+		t.Fatalf("expected no view call when Time.Idle == 0, got %+v", viewCalls)
+	}
+	mu.Unlock()
+
+	beforeMs := time.Now().UnixMilli()
+	win.handleEvent(opencode.Event{Type: "session.idle", Data: json.RawMessage(`{"sessionID":"ses_d"}`)})
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(viewCalls) == 4
+	})
+	mu.Lock()
+	gotD := viewCalls[3]
+	mu.Unlock()
+	if gotD.sessionID != "ses_d" || gotD.idle < beforeMs || tabD.main.session.Time.Idle != gotD.idle {
+		t.Fatalf("unexpected fallback view call %+v (tab idle=%d, beforeMs=%d)", gotD, tabD.main.session.Time.Idle, beforeMs)
+	}
+
+	// 7. Failed ViewSession clears dedup entry so subsequent focus retries.
+	mu.Lock()
+	failNext = true
+	mu.Unlock()
+	nextIdle := gotD.idle + 5000
+	win.handleEvent(opencode.Event{
+		Type: "session.updated",
+		Data: json.RawMessage(`{"sessionID":"ses_d","session":{"id":"ses_d","time":{"idle":` + jsonInt64(nextIdle) + `}}}`),
+	})
+	pumpFor(40 * time.Millisecond)
+	win.onWindowActiveChanged()
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(viewCalls) == 5
+	})
+	mu.Lock()
+	if viewCalls[4] != (viewCall{sessionID: "ses_d", idle: nextIdle}) {
+		t.Fatalf("expected retry call for ses_d @ %d, got %+v", nextIdle, viewCalls)
+	}
+	mu.Unlock()
+}
+
+func jsonInt64(v int64) string {
+	b, _ := json.Marshal(v)
+	return string(b)
+}
+
+func TestSessionViewedSSEHandling(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("GTK cannot be initialized")
+	}
+
+	var (
+		mu        sync.Mutex
+		sent      []sentNotif
+		withdrawn []string
+	)
+	coord := newNotificationCoordinator(nil)
+	coord.isActiveOverride = func(*Window) bool { return true }
+	coord.notifyFunc = func(id string, notif *gio.Notification) {
+		mu.Lock()
+		sent = append(sent, sentNotif{id: id, notif: notif})
+		mu.Unlock()
+	}
+	coord.withdrawFunc = func(id string) {
+		mu.Lock()
+		withdrawn = append(withdrawn, id)
+		mu.Unlock()
+	}
+
+	win, vs := newTestNotifyWindow(t, coord)
+	tabCur, _ := newTestTab(vs, "ses_cur", "Current")
+	tabBg, indBg := newTestTab(vs, "ses_bg", "Background")
+	tabBg.main.session.Time.Idle = 1795550000000
+	win.tabs["ses_cur"] = tabCur
+	win.tabs["ses_bg"] = tabBg
+	vs.SetVisibleChildName("ses_cur")
+	win.onVisibleTabChanged()
+
+	// Complete ses_bg in background to set finishedAttention and send notification.
+	win.handleEvent(opencode.Event{Type: "session.execution.started", Data: json.RawMessage(`{"sessionID":"ses_bg"}`)})
+	win.handleEvent(opencode.Event{Type: "session.text.delta", Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"msg_1","delta":"Done"}`)})
+	win.handleEvent(opencode.Event{Type: "session.execution.succeeded", Data: json.RawMessage(`{"sessionID":"ses_bg"}`)})
+	pumpUntil(t, 500*time.Millisecond, func() bool {
+		return tabBg.NeedsAttention() && indBg.dot.Visible()
+	})
+	if !tabBg.NeedsAttention() || !indBg.dot.Visible() {
+		t.Fatalf("expected ses_bg attention and dot visible")
+	}
+
+	// Older session.viewed (idle < Time.Idle) updates Time.Viewed without clearing badge/notification.
+	win.handleEvent(opencode.Event{
+		Type: "session.viewed",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","idle":1795549999999}`),
+	})
+	if tabBg.main.session.Time.Viewed != 1795549999999 {
+		t.Fatalf("expected Time.Viewed=1795549999999, got %d", tabBg.main.session.Time.Viewed)
+	}
+	if !tabBg.NeedsAttention() || !indBg.dot.Visible() {
+		t.Fatalf("expected older session.viewed not to clear attention")
+	}
+
+	// Matching session.viewed (idle >= Time.Idle) clears badge, indicator, and withdraws notification.
+	win.handleEvent(opencode.Event{
+		Type: "session.viewed",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","idle":1795550000000}`),
+	})
+	if tabBg.main.session.Time.Viewed != 1795550000000 {
+		t.Fatalf("expected Time.Viewed=1795550000000, got %d", tabBg.main.session.Time.Viewed)
+	}
+	if tabBg.NeedsAttention() || tabBg.page.NeedsAttention() || indBg.dot.Visible() {
+		t.Fatalf("expected session.viewed to clear NeedsAttention and dot")
+	}
+	mu.Lock()
+	if len(withdrawn) != 1 || withdrawn[0] != "finished:ses_bg" {
+		t.Fatalf("expected withdrawn [finished:ses_bg], got %+v", withdrawn)
+	}
+	mu.Unlock()
+
+	// Pending form keeps actionAttention across session.viewed until replied.
+	win.handleEvent(opencode.Event{
+		Type: "form.created",
+		Data: json.RawMessage(`{"form":{"id":"frm_1","sessionID":"ses_bg","title":"Pick"}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.viewed",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","idle":1795550001000}`),
+	})
+	if !tabBg.actionAttention || !tabBg.NeedsAttention() || !indBg.questionIcon.Visible() {
+		t.Fatalf("expected pending form actionAttention preserved on session.viewed")
+	}
+	win.handleEvent(opencode.Event{
+		Type: "form.replied",
+		Data: json.RawMessage(`{"id":"frm_1","sessionID":"ses_bg"}`),
+	})
+	if tabBg.NeedsAttention() {
+		t.Fatalf("expected form.replied to clear actionAttention")
+	}
+
+	// session.viewed arriving during completion settle window prevents stale finished badge/notification.
+	mu.Lock()
+	sentBefore := len(sent)
+	mu.Unlock()
+	win.handleEvent(opencode.Event{Type: "session.execution.started", Data: json.RawMessage(`{"sessionID":"ses_bg"}`)})
+	win.handleEvent(opencode.Event{Type: "session.text.delta", Data: json.RawMessage(`{"sessionID":"ses_bg","assistantMessageID":"msg_2","delta":"Second turn"}`)})
+	win.handleEvent(opencode.Event{
+		Type: "session.updated",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","session":{"id":"ses_bg","time":{"idle":1795550005000}}}`),
+	})
+	win.handleEvent(opencode.Event{Type: "session.execution.succeeded", Data: json.RawMessage(`{"sessionID":"ses_bg"}`)})
+	win.handleEvent(opencode.Event{
+		Type: "session.viewed",
+		Data: json.RawMessage(`{"sessionID":"ses_bg","idle":1795550005000}`),
+	})
+	pumpFor(60 * time.Millisecond)
+	if tabBg.NeedsAttention() || indBg.dot.Visible() {
+		t.Fatalf("expected settle-window session.viewed to suppress finished attention")
+	}
+	mu.Lock()
+	if len(sent) != sentBefore {
+		t.Fatalf("expected no new notification after settle-window session.viewed, got %+v", sent[sentBefore:])
+	}
+	mu.Unlock()
+}

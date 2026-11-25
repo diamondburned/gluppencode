@@ -84,6 +84,12 @@ type SessionIDEvent struct {
 	SessionID string `json:"sessionID"`
 }
 
+// SessionViewedEvent is emitted on "session.viewed".
+type SessionViewedEvent struct {
+	SessionID string `json:"sessionID"`
+	Idle      int64  `json:"idle"`
+}
+
 // AgentSelectedEvent is emitted on "session.agent.selected".
 type AgentSelectedEvent struct {
 	SessionID string `json:"sessionID"`

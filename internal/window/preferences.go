@@ -757,7 +757,7 @@ func (w *Window) updateSessionActivityState(sessionID string, busy bool) {
 				if nowMs <= w.allSessions[i].Time.Idle {
 					w.allSessions[i].Time.Busy = w.allSessions[i].Time.Idle + 1
 				}
-			} else {
+			} else if w.allSessions[i].Time.Idle == 0 || w.allSessions[i].Time.Idle < w.allSessions[i].Time.Busy {
 				w.allSessions[i].Time.Idle = nowMs
 				if nowMs < w.allSessions[i].Time.Busy {
 					w.allSessions[i].Time.Idle = w.allSessions[i].Time.Busy

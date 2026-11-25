@@ -814,6 +814,7 @@ type Window struct {
 
 	sessionTouched map[string]time.Time // root session ID -> last activity or visit; see suspend.go
 	shownRoot      string               // root session last shown by onVisibleTabChanged
+	lastViewAcked  map[string]int64     // root session ID -> last idle timestamp acknowledged via ViewSession
 	agents         []opencode.Agent
 	agentRows      []agentRowData
 	models         []opencode.ModelInfo
@@ -1163,15 +1164,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 
 	adwWin.NotifyProperty("is-active", func() {
 		if adwWin.IsActive() {
-			if rootID := w.currentRootSessionID(); rootID != "" {
-				if tab := w.tabs[rootID]; tab != nil && tab.finishedAttention {
-					tab.finishedAttention = false
-					tab.syncNeedsAttention()
-					w.updateWindowManagerTitle()
-					w.updateSwitcherIndicators()
-				}
-				w.withdrawFinishedNotification(rootID)
-			}
+			w.onWindowActiveChanged()
 		}
 	})
 
@@ -1701,6 +1694,12 @@ func (w *Window) ensureSessionTab(sess opencode.Session) *sessionTab {
 		if sess.Time.Updated > tab.main.session.Time.Updated {
 			w.touchSessionUpdated(tab, tab.main, sess.Time.Updated)
 		}
+		if sess.Time.Idle > tab.main.session.Time.Idle {
+			tab.main.session.Time.Idle = sess.Time.Idle
+		}
+		if sess.Time.Viewed > tab.main.session.Time.Viewed {
+			tab.main.session.Time.Viewed = sess.Time.Viewed
+		}
 		if needSync && !w.populating {
 			w.syncSidebar()
 		}
@@ -1863,6 +1862,7 @@ func (w *Window) archiveSession(sessID string) {
 	}
 	w.archivedSessions[sessID] = true
 	delete(w.visibleSessions, sessID)
+	delete(w.lastViewAcked, sessID)
 	w.saveState()
 
 	if w.projectSessions != nil {
@@ -1974,6 +1974,7 @@ func (w *Window) clearProjectSessions(rawDir string) {
 	for id := range toArchive {
 		w.archivedSessions[id] = true
 		delete(w.visibleSessions, id)
+		delete(w.lastViewAcked, id)
 		if _, hasTab := w.tabs[id]; !hasTab {
 			w.deleteSessionDraftsForTab(id, nil)
 		}
@@ -4209,6 +4210,9 @@ func (w *Window) finalizeRootTurnCompletion(tab *sessionTab, gen, turnSeq uint64
 	}
 	tab.turnSettled = true
 	rootID := tab.main.session.ID
+	if tab.main.session.Time.Idle > 0 && tab.main.session.Time.Viewed >= tab.main.session.Time.Idle && w.lastViewAcked[rootID] < tab.main.session.Time.Idle {
+		return
+	}
 	if rootID != w.currentRootSessionID() {
 		w.markTabNeedsAttention(tab, false)
 	}
@@ -5967,6 +5971,7 @@ func (w *Window) onVisibleTabChanged() {
 		w.withdrawFinishedNotification(tab.main.session.ID)
 	}
 	tab.setNeedsAttention(false)
+	w.maybeMarkCurrentTabViewed()
 
 	w.switchComposerDraft(tab.activeConv().session.ID)
 	w.refreshHeaderAndBottomBar(tab)
@@ -5982,6 +5987,159 @@ func (w *Window) onVisibleTabChanged() {
 		tab.main.loadingInitial = true
 		w.loadConvMessages(tab, tab.main)
 		w.loadChildSubagents(tab.main.session.ID)
+	}
+}
+
+func (w *Window) isWindowActive() bool {
+	if w == nil {
+		return false
+	}
+	if w.notifyCoord != nil {
+		return w.notifyCoord.isWindowActive(w)
+	}
+	return w.ApplicationWindow != nil && w.IsActive()
+}
+
+func (w *Window) onWindowActiveChanged() {
+	if w == nil || !w.isWindowActive() {
+		return
+	}
+	if rootID := w.currentRootSessionID(); rootID != "" {
+		if tab := w.tabs[rootID]; tab != nil && tab.finishedAttention {
+			tab.finishedAttention = false
+			tab.syncNeedsAttention()
+			w.updateWindowManagerTitle()
+			w.updateSwitcherIndicators()
+		}
+		w.withdrawFinishedNotification(rootID)
+	}
+	w.maybeMarkCurrentTabViewed()
+}
+
+func (w *Window) maybeMarkCurrentTabViewed() {
+	if w == nil || w.client == nil || !w.isWindowActive() {
+		return
+	}
+	tab := w.currentTab()
+	if tab == nil || tab.main == nil {
+		return
+	}
+	w.markSessionViewed(tab)
+}
+
+func (w *Window) markSessionViewed(tab *sessionTab) {
+	if w == nil || w.client == nil || tab == nil || tab.main == nil {
+		return
+	}
+	sess := tab.main.session
+	if sess.ID == "" || sess.Time.Idle <= 0 || sess.Time.Idle <= sess.Time.Viewed {
+		return
+	}
+	if w.lastViewAcked == nil {
+		w.lastViewAcked = make(map[string]int64)
+	}
+	if sess.Time.Idle <= w.lastViewAcked[sess.ID] {
+		return
+	}
+	idle := sess.Time.Idle
+	sessionID := sess.ID
+	w.lastViewAcked[sessionID] = idle
+
+	ctx := w.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	gtkutil.Async(ctx, func() func() {
+		err := w.client.ViewSession(ctx, sessionID, idle)
+		return func() {
+			if err != nil {
+				slog.Debug("failed to mark session viewed", "sessionID", sessionID, "idle", idle, "err", err)
+				if w.lastViewAcked[sessionID] == idle {
+					delete(w.lastViewAcked, sessionID)
+				}
+			}
+		}
+	})
+}
+
+func (w *Window) ensureRootIdleTimestamp(tab *sessionTab, nowMs int64) {
+	if w == nil || tab == nil || tab.main == nil || tab.main.session.Time.Idle != 0 {
+		return
+	}
+	if nowMs <= 0 {
+		nowMs = time.Now().UnixMilli()
+	}
+	tab.main.session.Time.Idle = nowMs
+	sessID := tab.main.session.ID
+	for i := range w.allSessions {
+		if w.allSessions[i].ID == sessID && w.allSessions[i].Time.Idle == 0 {
+			w.allSessions[i].Time.Idle = nowMs
+		}
+	}
+}
+
+func (w *Window) applySessionViewed(sessionID string, idle int64) {
+	if w == nil || sessionID == "" || idle <= 0 {
+		return
+	}
+	var allMatchedIdle int64
+	var foundInAll bool
+	for i := range w.allSessions {
+		if w.allSessions[i].ID == sessionID {
+			if idle > w.allSessions[i].Time.Viewed {
+				w.allSessions[i].Time.Viewed = idle
+			}
+			allMatchedIdle = w.allSessions[i].Time.Idle
+			foundInAll = true
+		}
+	}
+	for dir, list := range w.projectSessions {
+		for i := range list {
+			if list[i].ID == sessionID && idle > list[i].Time.Viewed {
+				list[i].Time.Viewed = idle
+				w.projectSessions[dir] = list
+			}
+		}
+	}
+	if parentID, ok := w.childToRoot[sessionID]; ok {
+		if parentTab, ok := w.tabs[parentID]; ok && parentTab != nil {
+			for i := range parentTab.subagents {
+				if parentTab.subagents[i].ID == sessionID && idle > parentTab.subagents[i].Time.Viewed {
+					parentTab.subagents[i].Time.Viewed = idle
+				}
+			}
+			if subConv := parentTab.subTimelines[sessionID]; subConv != nil && idle > subConv.session.Time.Viewed {
+				subConv.session.Time.Viewed = idle
+			}
+		}
+		return
+	}
+	tab, ok := w.tabs[sessionID]
+	if !ok || tab == nil || tab.main == nil {
+		if foundInAll && idle >= allMatchedIdle {
+			w.withdrawFinishedNotification(sessionID)
+		}
+		return
+	}
+	if idle > tab.main.session.Time.Viewed {
+		tab.main.session.Time.Viewed = idle
+	}
+	if idle >= tab.main.session.Time.Idle {
+		changed := false
+		if tab.finishedAttention {
+			tab.finishedAttention = false
+			changed = true
+		}
+		if !tabHasPendingInput(tab) && tab.actionAttention {
+			tab.actionAttention = false
+			changed = true
+		}
+		if changed {
+			tab.syncNeedsAttention()
+			w.updateWindowManagerTitle()
+			w.updateSwitcherIndicators()
+		}
+		w.withdrawFinishedNotification(sessionID)
 	}
 }
 
@@ -10402,6 +10560,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					if sess.Time.Idle != 0 {
 						w.allSessions[i].Time.Idle = sess.Time.Idle
 					}
+					if sess.Time.Viewed > w.allSessions[i].Time.Viewed {
+						w.allSessions[i].Time.Viewed = sess.Time.Viewed
+					}
 					if sess.Time.Updated != 0 {
 						w.allSessions[i].Time.Updated = sess.Time.Updated
 					}
@@ -10434,6 +10595,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				if sess.Time.Idle != 0 {
 					tab.main.session.Time.Idle = sess.Time.Idle
 				}
+				if sess.Time.Viewed > tab.main.session.Time.Viewed {
+					tab.main.session.Time.Viewed = sess.Time.Viewed
+				}
 				if sess.Tokens.Input+sess.Tokens.Output+sess.Tokens.Cache.Read > 0 {
 					tab.main.session.Tokens = sess.Tokens
 				}
@@ -10459,8 +10623,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				} else {
 					w.updateSwitcherIndicators()
 				}
+				if sess.Time.Viewed > 0 {
+					w.applySessionViewed(sess.ID, sess.Time.Viewed)
+				}
 				if w.currentTab() == tab {
 					w.refreshHeaderAndBottomBar(tab)
+					w.maybeMarkCurrentTabViewed()
 				}
 			} else if parentID, ok := w.childToRoot[sess.ID]; ok {
 				if parentTab, ok := w.tabs[parentID]; ok {
@@ -10471,6 +10639,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					}
 				}
 			}
+		}
+
+	case "session.viewed":
+		var d opencode.SessionViewedEvent
+		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			w.applySessionViewed(d.SessionID, d.Idle)
 		}
 
 	case "session.deleted":
@@ -10617,6 +10791,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					w.deleteSessionDraftsForTab(delID, nil)
 				}
 				w.withdrawSessionNotifications(delID)
+				delete(w.lastViewAcked, delID)
 				w.syncSidebar()
 			}
 		}
@@ -10640,9 +10815,10 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.execution.succeeded", "session.execution.failed", "session.execution.interrupted", "session.idle":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			nowMs := time.Now().UnixMilli()
 			w.updateSessionActivityState(d.SessionID, false)
 			tab, conv := w.resolveEventConv(d.SessionID)
-			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
+			w.touchSessionUpdated(tab, conv, nowMs)
 			w.setConvActive(d.SessionID, false)
 			outcome := "succeeded"
 			if ev.Type == "session.execution.failed" {
@@ -10657,6 +10833,10 @@ func (w *Window) handleEvent(ev opencode.Event) {
 			}
 			if tab != nil {
 				if conv != nil && conv == tab.main {
+					w.ensureRootIdleTimestamp(tab, nowMs)
+					if tab == w.currentTab() {
+						w.maybeMarkCurrentTabViewed()
+					}
 					if ev.Type == "session.execution.failed" || ev.Type == "session.execution.interrupted" {
 						tab.turnFailed = true
 						w.cancelCompletionSettle(tab)
@@ -10705,12 +10885,19 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				w.setConvActive(d.SessionID, true)
 				w.setSubagentActive(d.SessionID, true, "")
 			case "idle":
+				nowMs := time.Now().UnixMilli()
 				w.updateSessionActivityState(d.SessionID, false)
 				tab, conv := w.resolveEventConv(d.SessionID)
 				w.setConvActive(d.SessionID, false)
 				w.setSubagentActive(d.SessionID, false, "succeeded")
 				if rootID, ok := w.childToRoot[d.SessionID]; ok {
 					w.loadChildSubagents(rootID)
+				}
+				if tab != nil && conv != nil && conv == tab.main {
+					w.ensureRootIdleTimestamp(tab, nowMs)
+					if tab == w.currentTab() {
+						w.maybeMarkCurrentTabViewed()
+					}
 				}
 				if tab != nil && ((conv != nil && conv == tab.main) || w.childToRoot[d.SessionID] != "") {
 					w.maybeScheduleRootTurnCompletion(tab)

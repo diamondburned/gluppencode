@@ -2484,6 +2484,15 @@ func TestActivityStatusEventDecoding(t *testing.T) {
 				t.Errorf("unexpected SessionErrorEvent: %+v", ev)
 			}
 		},
+		"SessionViewedEvent": func(t *testing.T) {
+			var ev SessionViewedEvent
+			if err := json.Unmarshal([]byte(`{"sessionID":"ses_1","idle":1795550000000}`), &ev); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			if ev.SessionID != "ses_1" || ev.Idle != 1795550000000 {
+				t.Errorf("unexpected SessionViewedEvent: %+v", ev)
+			}
+		},
 	}
 
 	for name, fn := range tests {
@@ -2491,6 +2500,82 @@ func TestActivityStatusEventDecoding(t *testing.T) {
 			t.Parallel()
 			fn(t)
 		})
+	}
+}
+
+func TestViewSessionEndpointAndSSE(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var (
+		capturedPath string
+		capturedBody map[string]any
+		rawBody      string
+	)
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				switch {
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_view_1/view":
+					capturedPath = req.URL.Path
+					b, err := io.ReadAll(req.Body)
+					if err != nil {
+						t.Fatalf("read body: %v", err)
+					}
+					rawBody = string(b)
+					if err := json.Unmarshal(b, &capturedBody); err != nil {
+						t.Fatalf("decode body: %v", err)
+					}
+					return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_missing/view":
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Body:       io.NopCloser(strings.NewReader(`{"error":"SessionNotFoundError"}`)),
+					}, nil
+				case req.Method == http.MethodGet && req.URL.Path == "/api/event":
+					sse := "data: {\"type\":\"session.viewed\",\"data\":{\"sessionID\":\"ses_view_1\",\"idle\":1795550000000}}\n\n"
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+						Body:       io.NopCloser(strings.NewReader(sse)),
+					}, nil
+				default:
+					return &http.Response{StatusCode: http.StatusNotFound, Body: http.NoBody}, nil
+				}
+			}),
+		},
+	}
+
+	if err := client.ViewSession(ctx, "ses_view_1", 1795550000000); err != nil {
+		t.Fatalf("ViewSession failed: %v", err)
+	}
+	if capturedPath != "/api/session/ses_view_1/view" {
+		t.Errorf("capturedPath = %q, want /api/session/ses_view_1/view", capturedPath)
+	}
+	if len(capturedBody) != 1 || int64(capturedBody["idle"].(float64)) != 1795550000000 {
+		t.Errorf("capturedBody = %+v (raw=%s), want {\"idle\":1795550000000}", capturedBody, rawBody)
+	}
+
+	if err := client.ViewSession(ctx, "ses_missing", 1795550000000); err == nil {
+		t.Fatal("expected error for 404 response, got nil")
+	}
+
+	var gotEvents []Event
+	if err := client.SubscribeEvents(ctx, func(ev Event) {
+		gotEvents = append(gotEvents, ev)
+	}); err != nil {
+		t.Fatalf("SubscribeEvents failed: %v", err)
+	}
+	if len(gotEvents) != 1 || gotEvents[0].Type != "session.viewed" {
+		t.Fatalf("gotEvents = %+v, want 1 session.viewed event", gotEvents)
+	}
+	var viewed SessionViewedEvent
+	if err := json.Unmarshal(gotEvents[0].Data, &viewed); err != nil {
+		t.Fatalf("unmarshal SessionViewedEvent: %v", err)
+	}
+	if viewed.SessionID != "ses_view_1" || viewed.Idle != 1795550000000 {
+		t.Errorf("viewed = %+v, want ses_view_1 @ 1795550000000", viewed)
 	}
 }
 

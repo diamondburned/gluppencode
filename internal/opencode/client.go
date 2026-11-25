@@ -505,6 +505,17 @@ func (c *Client) CompactSession(ctx context.Context, sessionID string) error {
 	return c.doJSON(ctx, http.MethodPost, path, map[string]any{}, nil)
 }
 
+// ViewSession acknowledges an idle transition for a session (POST /api/session/{sessionID}/view).
+func (c *Client) ViewSession(ctx context.Context, sessionID string, idle int64) error {
+	path := fmt.Sprintf("/api/session/%s/view", url.PathEscape(sessionID))
+	body := struct {
+		Idle int64 `json:"idle"`
+	}{
+		Idle: idle,
+	}
+	return c.doJSON(ctx, http.MethodPost, path, body, nil)
+}
+
 // ActiveStatus describes an active session's execution state.
 type ActiveStatus struct {
 	Type string `json:"type"`
