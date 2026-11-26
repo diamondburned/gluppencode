@@ -564,7 +564,11 @@ func TestClientEndpointsSynctest(t *testing.T) {
 							respBody = `{"data":{"messageID":"msg_u1"}}`
 						}
 					case req.Method == http.MethodGet && req.URL.Path == "/api/session/ses_123/diff":
-						respBody = `{"data":[{"file":"internal/opencode/client.go","patch":"--- a/internal/opencode/client.go\n+++ b/internal/opencode/client.go\n@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1,"status":"modified"}]}`
+						if req.URL.Query().Get("from") == "msg_u1" && req.URL.Query().Get("to") == "msg_u2" && req.URL.Query().Get("context") == "3" {
+							respBody = `{"data":[{"file":"sed_target.go","patch":"--- a/sed_target.go\n+++ b/sed_target.go\n@@ -1 +1 @@\n-foo\n+bar","additions":2,"deletions":1,"status":"modified"}]}`
+						} else {
+							respBody = `{"data":[{"file":"internal/opencode/client.go","patch":"--- a/internal/opencode/client.go\n+++ b/internal/opencode/client.go\n@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1,"status":"modified"}]}`
+						}
 					default:
 						return &http.Response{
 							StatusCode: http.StatusNotFound,
@@ -641,7 +645,48 @@ func TestClientEndpointsSynctest(t *testing.T) {
 		if len(diffs) != 1 || diffs[0].File != "internal/opencode/client.go" || diffs[0].Additions != 1 {
 			t.Errorf("SessionDiff = %+v", diffs)
 		}
+
+		ctxLines := 3
+		turnDiffs, err := client.SessionDiffTurn(ctx, "ses_123", SessionDiffOptions{
+			From:    "msg_u1",
+			To:      "msg_u2",
+			Context: &ctxLines,
+		})
+		if err != nil {
+			t.Fatalf("SessionDiffTurn: %v", err)
+		}
+		if len(turnDiffs) != 1 || turnDiffs[0].File != "sed_target.go" || turnDiffs[0].Additions != 2 {
+			t.Errorf("SessionDiffTurn = %+v", turnDiffs)
+		}
 	})
+}
+
+func TestMessageSnapshotUnmarshal(t *testing.T) {
+	t.Parallel()
+
+	var withFiles Message
+	if err := json.Unmarshal([]byte(`{"id":"m1","type":"assistant","snapshot":{"start":"t1","end":"t2","files":["a.go"]}}`), &withFiles); err != nil {
+		t.Fatalf("unmarshal withFiles: %v", err)
+	}
+	if withFiles.Snapshot == nil || withFiles.Snapshot.Start != "t1" || withFiles.Snapshot.End != "t2" || len(withFiles.Snapshot.Files) != 1 || withFiles.Snapshot.Files[0] != "a.go" {
+		t.Fatalf("withFiles.Snapshot = %+v", withFiles.Snapshot)
+	}
+
+	var emptyFiles Message
+	if err := json.Unmarshal([]byte(`{"id":"m2","type":"assistant","snapshot":{"start":"t1","end":"t2","files":[]}}`), &emptyFiles); err != nil {
+		t.Fatalf("unmarshal emptyFiles: %v", err)
+	}
+	if emptyFiles.Snapshot == nil || emptyFiles.Snapshot.Files == nil || len(emptyFiles.Snapshot.Files) != 0 {
+		t.Fatalf("expected non-nil empty Files slice, got %+v", emptyFiles.Snapshot)
+	}
+
+	var omittedFiles Message
+	if err := json.Unmarshal([]byte(`{"id":"m3","type":"assistant","snapshot":{"start":"t1","end":"t2"}}`), &omittedFiles); err != nil {
+		t.Fatalf("unmarshal omittedFiles: %v", err)
+	}
+	if omittedFiles.Snapshot == nil || omittedFiles.Snapshot.Files != nil {
+		t.Fatalf("expected nil Files slice when omitted, got %+v", omittedFiles.Snapshot)
+	}
 }
 
 func TestListMessagesPage(t *testing.T) {

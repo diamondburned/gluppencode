@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -18,10 +19,36 @@ type FileDiff struct {
 	Status    string `json:"status"`
 }
 
-// SessionDiff fetches structured file diffs for a session (GET /api/session/{sessionID}/diff).
+// SessionDiffOptions configures optional query parameters for SessionDiffTurn.
+type SessionDiffOptions struct {
+	From    string
+	To      string
+	Context *int
+}
+
+// SessionDiff fetches structured file diffs for a session's latest turn (GET /api/session/{sessionID}/diff).
 func (c *Client) SessionDiff(ctx context.Context, sessionID string) ([]FileDiff, error) {
+	return c.SessionDiffTurn(ctx, sessionID, SessionDiffOptions{})
+}
+
+// SessionDiffTurn fetches structured file diffs for a turn or range of turns
+// (GET /api/session/{sessionID}/diff).
+func (c *Client) SessionDiffTurn(ctx context.Context, sessionID string, opts SessionDiffOptions) ([]FileDiff, error) {
 	var raw json.RawMessage
 	path := fmt.Sprintf("/api/session/%s/diff", url.PathEscape(sessionID))
+	q := url.Values{}
+	if opts.From != "" {
+		q.Set("from", opts.From)
+	}
+	if opts.To != "" && opts.To != opts.From {
+		q.Set("to", opts.To)
+	}
+	if opts.Context != nil {
+		q.Set("context", strconv.Itoa(*opts.Context))
+	}
+	if len(q) > 0 {
+		path += "?" + q.Encode()
+	}
 	if err := c.doJSON(ctx, http.MethodGet, path, nil, &raw); err != nil {
 		return nil, err
 	}

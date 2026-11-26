@@ -4981,3 +4981,237 @@ func derefOrZeroModel(m *opencode.ModelRef) opencode.ModelRef {
 	}
 	return *m
 }
+
+func TestComputeTurnDiffTargets(t *testing.T) {
+	t.Run("legacy turns and empty snapshot files skip diff fetch", func(t *testing.T) {
+		msgs := []opencode.Message{
+			{ID: "u1", Type: "user"},
+			{ID: "a1", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s1", End: "s2", Files: []string{}}},
+			{ID: "u2", Type: "user"},
+			{ID: "a2", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s2", End: "s3", Files: []string{"main.go"}}},
+			{ID: "u3", Type: "user"},
+			{ID: "a3", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s3", End: "s4"}},
+			{ID: "u4", Type: "user"},
+			{ID: "a4", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s4", End: "s4"}},
+		}
+
+		got := computeTurnDiffTargets(msgs, "", false, nil)
+		if len(got) != 4 {
+			t.Fatalf("len(targets) = %d, want 4: %+v", len(got), got)
+		}
+		if got[0].FromID != "u1" || got[0].ToID != "u1" || got[0].TargetID != "a1" || got[0].HasChanges {
+			t.Errorf("turn 0 = %+v, want HasChanges=false", got[0])
+		}
+		if got[1].FromID != "u2" || got[1].ToID != "u2" || got[1].TargetID != "a2" || !got[1].HasChanges {
+			t.Errorf("turn 1 = %+v, want HasChanges=true", got[1])
+		}
+		if got[2].FromID != "u3" || got[2].ToID != "u3" || got[2].TargetID != "a3" || !got[2].HasChanges {
+			t.Errorf("turn 2 = %+v, want HasChanges=true when Files omitted and Start!=End", got[2])
+		}
+		if got[3].FromID != "u4" || got[3].ToID != "u4" || got[3].TargetID != "a4" || got[3].HasChanges {
+			t.Errorf("turn 3 = %+v, want HasChanges=false when Start==End", got[3])
+		}
+
+		activeGot := computeTurnDiffTargets(msgs, "", true, nil)
+		if len(activeGot) != 3 {
+			t.Fatalf("active len(targets) = %d, want 3", len(activeGot))
+		}
+	})
+
+	t.Run("idle markers group steered prompts and stop before revert", func(t *testing.T) {
+		msgs := []opencode.Message{
+			{ID: "u1", Type: "user"},
+			{ID: "a1", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s1", End: "s2", Files: []string{}}},
+			{ID: "u2", Type: "user"},
+			{ID: "a2", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s2", End: "s3", Files: []string{"foo.go"}}},
+			{ID: "idle1", Type: "idle"},
+			{ID: "u3", Type: "user"},
+			{ID: "a3", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s3", End: "s4", Files: []string{"bar.go"}}},
+		}
+
+		activeGot := computeTurnDiffTargets(msgs, "", true, nil)
+		if len(activeGot) != 1 {
+			t.Fatalf("active steered len(targets) = %d, want 1: %+v", len(activeGot), activeGot)
+		}
+		if activeGot[0].FromID != "u1" || activeGot[0].ToID != "u2" || activeGot[0].TargetID != "a2" || !activeGot[0].HasChanges {
+			t.Errorf("steered turn = %+v, want from=u1 to=u2 target=a2 HasChanges=true", activeGot[0])
+		}
+
+		revertedGot := computeTurnDiffTargets(msgs, "u3", false, nil)
+		if len(revertedGot) != 1 || revertedGot[0].TargetID != "a2" {
+			t.Errorf("revertedGot = %+v, want only turn ending at a2", revertedGot)
+		}
+	})
+}
+
+func TestTurnDiffLazyFetchAndDisplay(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/session/ses_diff/diff" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, r.URL.RawQuery)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("from") {
+		case "u2":
+			_ = json.NewEncoder(w).Encode([]opencode.FileDiff{
+				{
+					File:      "internal/app.go",
+					Patch:     "@@ -1,4 +1,6 @@\n line1\n-old\n+new1\n+new2\n+new3\n+new4\n+new5",
+					Additions: 5,
+					Deletions: 1,
+					Status:    "modified",
+				},
+			})
+		case "u3":
+			_ = json.NewEncoder(w).Encode([]opencode.FileDiff{})
+		default:
+			_ = json.NewEncoder(w).Encode([]opencode.FileDiff{})
+		}
+	}))
+	defer srv.Close()
+
+	maxLines := 4
+	ctx := WithDiffMaxLines(t.Context(), func() int { return maxLines })
+	win := &Window{
+		ctx:       ctx,
+		client:    &opencode.Client{BaseURL: srv.URL, HTTP: srv.Client()},
+		viewStack: adw.NewViewStack(),
+		tabs:      make(map[string]*sessionTab),
+	}
+
+	tab := win.addSessionTab(opencode.Session{ID: "ses_diff", Title: "Turn Diff Test"})
+	conv := tab.main
+	conv.loaded = true
+
+	aw1 := NewAssistantMessageWidget(ctx, "", "", nil)
+	aw2 := NewAssistantMessageWidget(ctx, "", "", nil)
+	aw3 := NewAssistantMessageWidget(ctx, "", "", nil)
+	conv.assistantMap["a1"] = aw1
+	conv.assistantMap["a2"] = aw2
+	conv.assistantMap["a3"] = aw3
+	conv.messageWidgets["a1"] = aw1
+	conv.messageWidgets["a2"] = aw2
+	conv.messageWidgets["a3"] = aw3
+
+	conv.messages = []opencode.Message{
+		{ID: "u1", Type: "user", Text: "no edits"},
+		{ID: "a1", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s1", End: "s2", Files: []string{}}},
+		{ID: "u2", Type: "user", Text: "sed edit"},
+		{ID: "a2", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s2", End: "s3", Files: []string{"internal/app.go"}}},
+		{ID: "u3", Type: "user", Text: "empty diff fallback"},
+		{ID: "a3", Type: "assistant", Snapshot: &opencode.MessageSnapshot{Start: "s3", End: "s4"}},
+	}
+
+	// Default ShowTurnDiffs == false skips fetching and keeps turn diff boxes hidden.
+	win.updateTurnDiffs(conv)
+	mu.Lock()
+	defaultReqs := len(requests)
+	mu.Unlock()
+	if defaultReqs != 0 || aw2.turnDiffBox.Visible() {
+		t.Fatalf("expected 0 diff requests and hidden turnDiffBox when ShowTurnDiffs is disabled, got reqs=%d visible=%v", defaultReqs, aw2.turnDiffBox.Visible())
+	}
+
+	// Enabling ShowTurnDiffs triggers live fetch and display.
+	win.prefs.ShowTurnDiffs = true
+	win.applyShowTurnDiffs()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(requests)
+		mu.Unlock()
+		if n >= 2 && len(conv.turnDiffPending) == 0 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	gotReqs := slices.Clone(requests)
+	mu.Unlock()
+	if len(gotReqs) != 2 {
+		t.Fatalf("expected 2 SessionDiffTurn requests (skipping u1 with empty files), got %d: %v", len(gotReqs), gotReqs)
+	}
+	for _, q := range gotReqs {
+		if !strings.Contains(q, "context=3") {
+			t.Errorf("expected context=3 in query %q", q)
+		}
+	}
+
+	if aw1.turnDiffBox.Visible() {
+		t.Errorf("expected aw1 turnDiffBox hidden when Files is empty")
+	}
+	if aw3.turnDiffBox.Visible() {
+		t.Errorf("expected aw3 turnDiffBox hidden when server returns empty diff list")
+	}
+	if !aw2.turnDiffBox.Visible() {
+		t.Fatalf("expected aw2 turnDiffBox visible when turn has diffs")
+	}
+	if aw2.turnDiffExpander == nil || aw2.turnDiffExpander.Expanded() {
+		t.Fatalf("expected aw2 turnDiffExpander to be collapsed by default")
+	}
+	if aw2.turnDiffTitleLabel.Label() != "1 file changed" {
+		t.Errorf("aw2 title = %q, want %q", aw2.turnDiffTitleLabel.Label(), "1 file changed")
+	}
+	if aw2.turnDiffRendered || len(aw2.turnDiffFileWidgets) != 0 {
+		t.Errorf("expected lazy diff rendering until expanded (rendered=%v, widgets=%d)", aw2.turnDiffRendered, len(aw2.turnDiffFileWidgets))
+	}
+
+	// Expanding lazily populates file rows and respects DiffTruncationLines.
+	aw2.turnDiffExpander.SetExpanded(true)
+	for glib.MainContextDefault().Pending() {
+		glib.MainContextDefault().Iteration(false)
+	}
+	if !aw2.turnDiffRendered || len(aw2.turnDiffFileWidgets) != 1 {
+		t.Fatalf("expected 1 rendered file diff widget on expand, got rendered=%v len=%d", aw2.turnDiffRendered, len(aw2.turnDiffFileWidgets))
+	}
+
+	// Cached diffs should not trigger extra HTTP requests on repeated updateTurnDiffs calls.
+	win.updateTurnDiffs(conv)
+	mu.Lock()
+	reqCountAfterCache := len(requests)
+	mu.Unlock()
+	if reqCountAfterCache != 2 {
+		t.Fatalf("expected cached turn diff to avoid extra HTTP request, got %d requests", reqCountAfterCache)
+	}
+
+	// Updating DiffMaxLines live re-renders expanded turn diff without clearing it.
+	maxLines = 20
+	aw2.SetDiffMaxLines(20)
+	if len(aw2.TurnDiff()) != 1 {
+		t.Fatalf("expected TurnDiff() to remain populated after SetDiffMaxLines")
+	}
+
+	// Reverting before u2 clears and hides aw2's turn diff.
+	conv.session.Revert = &opencode.SessionRevert{MessageID: "u2"}
+	win.updateTurnDiffs(conv)
+	if aw2.turnDiffBox.Visible() || len(aw2.TurnDiff()) != 0 {
+		t.Errorf("expected aw2 turnDiffBox hidden and cleared after revert")
+	}
+
+	// Disabling ShowTurnDiffs clears any shown turn diffs without extra HTTP requests.
+	conv.session.Revert = nil
+	win.updateTurnDiffs(conv) // restores from cache
+	if !aw2.turnDiffBox.Visible() || len(aw2.TurnDiff()) != 1 {
+		t.Fatalf("expected cached turn diff restored when revert cleared")
+	}
+	win.prefs.ShowTurnDiffs = false
+	win.applyShowTurnDiffs()
+	if aw2.turnDiffBox.Visible() || len(aw2.TurnDiff()) != 0 {
+		t.Errorf("expected aw2 turnDiffBox hidden and cleared when ShowTurnDiffs disabled")
+	}
+	mu.Lock()
+	finalReqCount := len(requests)
+	mu.Unlock()
+	if finalReqCount != 2 {
+		t.Errorf("expected no extra HTTP requests on cache restore/disable, got %d", finalReqCount)
+	}
+}

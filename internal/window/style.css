@@ -457,6 +457,23 @@ label.glup-diff-toggle link:active {
 	margin: 2px 0;
 }
 
+.glup-turn-diff-box {
+	margin: 2px 0;
+}
+
+.glup-turn-diff-files {
+	margin-top: 4px;
+}
+
+.glup-turn-diff-file-row {
+	margin-top: 2px;
+}
+
+.glup-turn-diff-file-path {
+	font-family: monospace;
+	font-size: 0.85em;
+}
+
 .glup-turn-duration {
 	margin-top: 4px;
 }

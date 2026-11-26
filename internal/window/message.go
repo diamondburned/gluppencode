@@ -1387,31 +1387,45 @@ func (t *ToolWidget) SetDiffMaxLines(maxLines int) {
 func (t *ToolWidget) renderInlineDiff(diffText string) {
 	t.rawDiffText = diffText
 	t.diffRendered = true
-	for _, lbl := range t.diffWidgets {
-		t.diffBox.Remove(lbl)
-	}
-	t.diffWidgets = nil
-	diffText = strings.TrimSpace(diffText)
-	if diffText == "" {
-		t.diffBox.SetVisible(false)
-		return
-	}
-
-	lines := strings.Split(diffText, "\n")
 	maxLines := defaultDiffTruncationLines
 	if t.diffMaxLines != nil {
 		if m := t.diffMaxLines(); m > 0 {
 			maxLines = m
 		}
 	}
+	t.diffWidgets = renderUnifiedDiffBox(t.diffBox, t.diffWidgets, diffText, maxLines, t.diffExpanded, t.setDiffExpanded)
+}
+
+func renderUnifiedDiffBox(
+	box *gtk.Box,
+	existing []*gtk.Label,
+	diffText string,
+	maxLines int,
+	expanded bool,
+	onToggle func(bool),
+) []*gtk.Label {
+	for _, lbl := range existing {
+		box.Remove(lbl)
+	}
+	diffText = strings.TrimSpace(diffText)
+	if diffText == "" {
+		box.SetVisible(false)
+		return nil
+	}
+
+	if maxLines <= 0 {
+		maxLines = defaultDiffTruncationLines
+	}
+	lines := strings.Split(diffText, "\n")
 	totalLines := len(lines)
 	canCollapse := totalLines > maxLines
 	truncated := 0
-	if canCollapse && !t.diffExpanded {
+	if canCollapse && !expanded {
 		truncated = totalLines - maxLines
 		lines = lines[:maxLines]
 	}
 
+	var widgets []*gtk.Label
 	for _, line := range lines {
 		lbl := gtk.NewLabel(line)
 		lbl.SetXAlign(0)
@@ -1427,8 +1441,8 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 		case strings.HasPrefix(line, "-"):
 			lbl.AddCSSClass("glup-diff-line-del")
 		}
-		t.diffBox.Append(lbl)
-		t.diffWidgets = append(t.diffWidgets, lbl)
+		box.Append(lbl)
+		widgets = append(widgets, lbl)
 	}
 	if truncated > 0 {
 		lineWord := "lines"
@@ -1443,12 +1457,14 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 		more.AddCSSClass("glup-diff-toggle")
 		more.SetMarkup(fmt.Sprintf(`… (%d more %s) - <a href="expand">show more</a>`, truncated, lineWord))
 		more.ConnectActivateLink(func(uri string) bool {
-			t.setDiffExpanded(true)
+			if onToggle != nil {
+				onToggle(true)
+			}
 			return true
 		})
-		t.diffBox.Append(more)
-		t.diffWidgets = append(t.diffWidgets, more)
-	} else if canCollapse && t.diffExpanded {
+		box.Append(more)
+		widgets = append(widgets, more)
+	} else if canCollapse && expanded {
 		less := gtk.NewLabel("")
 		less.SetXAlign(0)
 		less.SetWrap(true)
@@ -1457,13 +1473,16 @@ func (t *ToolWidget) renderInlineDiff(diffText string) {
 		less.AddCSSClass("glup-diff-toggle")
 		less.SetMarkup(`<a href="collapse">show less</a>`)
 		less.ConnectActivateLink(func(uri string) bool {
-			t.setDiffExpanded(false)
+			if onToggle != nil {
+				onToggle(false)
+			}
 			return true
 		})
-		t.diffBox.Append(less)
-		t.diffWidgets = append(t.diffWidgets, less)
+		box.Append(less)
+		widgets = append(widgets, less)
 	}
-	t.diffBox.SetVisible(true)
+	box.SetVisible(true)
+	return widgets
 }
 
 func (t *ToolWidget) setDiffExpanded(expanded bool) {
@@ -1806,8 +1825,21 @@ type AssistantMessageWidget struct {
 	ctx context.Context
 
 	partsBox          *gtk.Box
+	turnDiffBox       *gtk.Box
 	turnDurationLabel *gtk.Label
 	turnDurationText  string
+
+	turnDiffs            []opencode.FileDiff
+	turnDiffExpander     *gtk.Expander
+	turnDiffTitleLabel   *gtk.Label
+	turnDiffSubLabel     *gtk.Label
+	turnDiffBadgesBox    *gtk.Box
+	turnDiffBadgeWidgets []gtk.Widgetter
+	turnDiffFilesBox     *gtk.Box
+	turnDiffFileWidgets  []gtk.Widgetter
+	turnDiffRendered     bool
+	turnDiffFileExpanded map[string]bool
+	turnDiffMaxLines     func() int
 
 	reasoningViews map[int]*mdstream.View
 	textViews      map[int]*mdstream.View
@@ -1824,13 +1856,16 @@ func NewAssistantMessageWidget(ctx context.Context, agent, model string, onOpenS
 	builder := gtk.NewBuilderFromString(messageUI)
 	root := builder.GetObject("rootContent").Cast().(*gtk.Box)
 	partsBox := builder.GetObject("partsBox").Cast().(*gtk.Box)
+	turnDiffBox := builder.GetObject("turnDiffBox").Cast().(*gtk.Box)
 	turnDurationLabel := builder.GetObject("turnDurationLabel").Cast().(*gtk.Label)
 
 	w := &AssistantMessageWidget{
 		Box:               root,
 		ctx:               ctx,
 		partsBox:          partsBox,
+		turnDiffBox:       turnDiffBox,
 		turnDurationLabel: turnDurationLabel,
+		turnDiffMaxLines:  diffMaxLinesFromContext(ctx),
 		reasoningViews:    make(map[int]*mdstream.View),
 		textViews:         make(map[int]*mdstream.View),
 		tools:             make(map[string]*ToolWidget),
@@ -1859,6 +1894,300 @@ func (w *AssistantMessageWidget) TurnDuration() string {
 		return ""
 	}
 	return w.turnDurationText
+}
+
+// SetDiffMaxLines updates the diff truncation limit for the turn diff view.
+func (w *AssistantMessageWidget) SetDiffMaxLines(maxLines int) {
+	if w == nil {
+		return
+	}
+	w.turnDiffMaxLines = func() int { return maxLines }
+	if w.turnDiffRendered && w.turnDiffExpander != nil && w.turnDiffExpander.Expanded() && len(w.turnDiffs) > 0 {
+		w.renderTurnDiffFiles()
+	}
+}
+
+// TurnDiff returns the currently attached end-of-turn file diffs.
+func (w *AssistantMessageWidget) TurnDiff() []opencode.FileDiff {
+	if w == nil || len(w.turnDiffs) == 0 {
+		return nil
+	}
+	out := make([]opencode.FileDiff, len(w.turnDiffs))
+	copy(out, w.turnDiffs)
+	return out
+}
+
+// SetTurnDiff updates or hides the end-of-turn workspace diff box on this assistant message.
+func (w *AssistantMessageWidget) SetTurnDiff(diffs []opencode.FileDiff) {
+	if w == nil {
+		return
+	}
+	if len(diffs) == 0 {
+		if len(w.turnDiffs) == 0 {
+			if w.turnDiffBox != nil {
+				w.turnDiffBox.SetVisible(false)
+			}
+			return
+		}
+		w.turnDiffs = nil
+		w.turnDiffRendered = false
+		w.clearTurnDiffFileWidgets()
+		if w.turnDiffExpander != nil {
+			w.turnDiffExpander.SetExpanded(false)
+		}
+		if w.turnDiffFilesBox != nil {
+			w.turnDiffFilesBox.SetVisible(false)
+		}
+		if w.turnDiffBox != nil {
+			w.turnDiffBox.SetVisible(false)
+		}
+		return
+	}
+	if fileDiffsEqual(w.turnDiffs, diffs) {
+		return
+	}
+
+	copied := make([]opencode.FileDiff, len(diffs))
+	copy(copied, diffs)
+	w.turnDiffs = copied
+	w.ensureTurnDiffUI()
+
+	if len(copied) == 1 {
+		w.turnDiffTitleLabel.SetLabel("1 file changed")
+		w.turnDiffSubLabel.SetLabel(shortPath(copied[0].File))
+	} else {
+		w.turnDiffTitleLabel.SetLabel(fmt.Sprintf("%d files changed", len(copied)))
+		w.turnDiffSubLabel.SetLabel("")
+	}
+	w.turnDiffSubLabel.SetVisible(true)
+
+	for _, bw := range w.turnDiffBadgeWidgets {
+		w.turnDiffBadgesBox.Remove(bw)
+	}
+	w.turnDiffBadgeWidgets = nil
+
+	var totalAdded, totalDeleted int
+	for _, fd := range copied {
+		totalAdded += fd.Additions
+		totalDeleted += fd.Deletions
+	}
+	if totalAdded > 0 {
+		lbl := newDiffBadgeLabel(fmt.Sprintf("+%d", totalAdded), "glup-diff-badge-add")
+		w.turnDiffBadgesBox.Append(lbl)
+		w.turnDiffBadgeWidgets = append(w.turnDiffBadgeWidgets, lbl)
+	}
+	if totalDeleted > 0 {
+		lbl := newDiffBadgeLabel(fmt.Sprintf("-%d", totalDeleted), "glup-diff-badge-del")
+		w.turnDiffBadgesBox.Append(lbl)
+		w.turnDiffBadgeWidgets = append(w.turnDiffBadgeWidgets, lbl)
+	}
+
+	w.turnDiffRendered = false
+	if w.turnDiffExpander != nil && w.turnDiffExpander.Expanded() {
+		w.renderTurnDiffFiles()
+	} else {
+		w.clearTurnDiffFileWidgets()
+	}
+	if w.turnDiffBox != nil {
+		w.turnDiffBox.SetVisible(true)
+	}
+}
+
+func (w *AssistantMessageWidget) ensureTurnDiffUI() {
+	if w.turnDiffBox == nil {
+		box := gtk.NewBox(gtk.OrientationVertical, 2)
+		box.AddCSSClass("glup-tool-inline")
+		box.AddCSSClass("glup-turn-diff-box")
+		box.SetVisible(false)
+		if w.Box != nil {
+			if w.partsBox != nil {
+				w.Box.InsertChildAfter(box, w.partsBox)
+			} else {
+				w.Box.Append(box)
+			}
+		}
+		w.turnDiffBox = box
+	}
+	if w.turnDiffExpander != nil {
+		return
+	}
+
+	summaryRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	summaryRow.SetHExpand(true)
+
+	icon := gtk.NewImageFromIconName("document-edit-symbolic")
+	icon.AddCSSClass("glup-tool-icon")
+	icon.SetVAlign(gtk.AlignCenter)
+	summaryRow.Append(icon)
+
+	title := gtk.NewLabel("")
+	title.SetXAlign(0)
+	title.SetVAlign(gtk.AlignCenter)
+	title.SetEllipsize(pango.EllipsizeEnd)
+	title.AddCSSClass("glup-tool-title")
+	summaryRow.Append(title)
+
+	sub := gtk.NewLabel("")
+	sub.SetXAlign(0)
+	sub.SetVAlign(gtk.AlignCenter)
+	sub.SetEllipsize(pango.EllipsizeMiddle)
+	sub.SetHExpand(true)
+	sub.AddCSSClass("glup-tool-subtitle")
+	summaryRow.Append(sub)
+
+	exp := gtk.NewExpander("")
+	exp.SetHExpand(true)
+	exp.SetVAlign(gtk.AlignCenter)
+	exp.AddCSSClass("glup-tool-expander")
+	exp.SetLabelWidget(summaryRow)
+
+	badges := gtk.NewBox(gtk.OrientationHorizontal, 4)
+	badges.SetVAlign(gtk.AlignCenter)
+	badges.AddCSSClass("glup-tool-badges")
+
+	headerRow := gtk.NewBox(gtk.OrientationHorizontal, 6)
+	headerRow.SetHExpand(true)
+	headerRow.Append(exp)
+	headerRow.Append(badges)
+
+	filesBox := gtk.NewBox(gtk.OrientationVertical, 6)
+	filesBox.AddCSSClass("glup-turn-diff-files")
+	filesBox.SetVisible(false)
+
+	exp.NotifyProperty("expanded", func() {
+		expanded := exp.Expanded()
+		filesBox.SetVisible(expanded)
+		if expanded && !w.turnDiffRendered && len(w.turnDiffs) > 0 {
+			w.renderTurnDiffFiles()
+		}
+	})
+
+	w.turnDiffBox.Append(headerRow)
+	w.turnDiffBox.Append(filesBox)
+	w.turnDiffExpander = exp
+	w.turnDiffTitleLabel = title
+	w.turnDiffSubLabel = sub
+	w.turnDiffBadgesBox = badges
+	w.turnDiffFilesBox = filesBox
+}
+
+func (w *AssistantMessageWidget) clearTurnDiffFileWidgets() {
+	if w.turnDiffFilesBox == nil {
+		w.turnDiffFileWidgets = nil
+		return
+	}
+	for _, cw := range w.turnDiffFileWidgets {
+		w.turnDiffFilesBox.Remove(cw)
+	}
+	w.turnDiffFileWidgets = nil
+}
+
+func (w *AssistantMessageWidget) effectiveTurnDiffMaxLines() int {
+	if w.turnDiffMaxLines != nil {
+		if m := w.turnDiffMaxLines(); m > 0 {
+			return m
+		}
+	}
+	if fn := diffMaxLinesFromContext(w.ctx); fn != nil {
+		if m := fn(); m > 0 {
+			return m
+		}
+	}
+	return defaultDiffTruncationLines
+}
+
+func (w *AssistantMessageWidget) renderTurnDiffFiles() {
+	if w.turnDiffFilesBox == nil {
+		return
+	}
+	w.clearTurnDiffFileWidgets()
+	w.turnDiffRendered = true
+	if w.turnDiffFileExpanded == nil {
+		w.turnDiffFileExpanded = make(map[string]bool)
+	}
+	maxLines := w.effectiveTurnDiffMaxLines()
+
+	for _, fd := range w.turnDiffs {
+		entry := gtk.NewBox(gtk.OrientationVertical, 4)
+
+		row := gtk.NewBox(gtk.OrientationHorizontal, 6)
+		row.AddCSSClass("glup-turn-diff-file-row")
+		row.SetVAlign(gtk.AlignCenter)
+
+		fileIcon := gtk.NewImageFromIconName("text-x-generic-symbolic")
+		fileIcon.AddCSSClass("dim-label")
+		row.Append(fileIcon)
+
+		fileLbl := gtk.NewLabel(fd.File)
+		fileLbl.SetXAlign(0)
+		fileLbl.SetSelectable(true)
+		fileLbl.SetEllipsize(pango.EllipsizeMiddle)
+		fileLbl.SetHExpand(true)
+		fileLbl.AddCSSClass("glup-turn-diff-file-path")
+		row.Append(fileLbl)
+
+		if fd.Status == "added" || fd.Status == "deleted" {
+			statusLbl := gtk.NewLabel(fd.Status)
+			statusLbl.AddCSSClass("dim-label")
+			statusLbl.AddCSSClass("caption")
+			row.Append(statusLbl)
+		}
+		if fd.Additions > 0 {
+			row.Append(newDiffBadgeLabel(fmt.Sprintf("+%d", fd.Additions), "glup-diff-badge-add"))
+		}
+		if fd.Deletions > 0 {
+			row.Append(newDiffBadgeLabel(fmt.Sprintf("-%d", fd.Deletions), "glup-diff-badge-del"))
+		}
+		entry.Append(row)
+
+		if strings.TrimSpace(fd.Patch) != "" {
+			patchBox := gtk.NewBox(gtk.OrientationVertical, 0)
+			patchBox.AddCSSClass("glup-diff-box")
+			fileKey := fd.File
+			patchText := fd.Patch
+			var patchWidgets []*gtk.Label
+			var renderPatch func()
+			renderPatch = func() {
+				patchWidgets = renderUnifiedDiffBox(
+					patchBox,
+					patchWidgets,
+					patchText,
+					maxLines,
+					w.turnDiffFileExpanded[fileKey],
+					func(expanded bool) {
+						w.turnDiffFileExpanded[fileKey] = expanded
+						renderPatch()
+					},
+				)
+			}
+			renderPatch()
+			entry.Append(patchBox)
+		}
+
+		w.turnDiffFilesBox.Append(entry)
+		w.turnDiffFileWidgets = append(w.turnDiffFileWidgets, entry)
+	}
+}
+
+func newDiffBadgeLabel(text, cssClass string) *gtk.Label {
+	lbl := gtk.NewLabel(text)
+	lbl.AddCSSClass("glup-tool-badge")
+	if cssClass != "" {
+		lbl.AddCSSClass(cssClass)
+	}
+	return lbl
+}
+
+func fileDiffsEqual(a, b []opencode.FileDiff) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // SetMeta updates the agent and model metadata on the assistant message.

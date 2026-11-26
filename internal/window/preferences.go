@@ -36,6 +36,10 @@ func (w *Window) effectiveDiffTruncationLines() int {
 	return clampDiffTruncationLines(w.prefs.DiffTruncationLines)
 }
 
+func (w *Window) effectiveShowTurnDiffs() bool {
+	return w != nil && w.prefs.ShowTurnDiffs
+}
+
 func (w *Window) effectiveTakeChargeDirective() string {
 	if s := strings.TrimSpace(w.prefs.TakeChargeDirective); s != "" {
 		return s
@@ -84,6 +88,9 @@ func (w *Window) applyPreferenceDelta(prev, next Preferences) {
 	}
 	if prev.DiffTruncationLines != next.DiffTruncationLines {
 		w.applyDiffTruncationLines()
+	}
+	if prev.ShowTurnDiffs != next.ShowTurnDiffs {
+		w.applyShowTurnDiffs()
 	}
 	if prev.CtrlEnterToSend != next.CtrlEnterToSend {
 		w.applySendShortcutUI()
@@ -232,6 +239,7 @@ func (w *Window) applyDiffTruncationLines() {
 			return
 		}
 		for _, aw := range conv.assistantMap {
+			aw.SetDiffMaxLines(maxLines)
 			for _, tw := range aw.tools {
 				tw.SetDiffMaxLines(maxLines)
 			}
@@ -244,6 +252,22 @@ func (w *Window) applyDiffTruncationLines() {
 		applyConv(tab.main)
 		for _, sub := range tab.subTimelines {
 			applyConv(sub)
+		}
+	}
+}
+
+func (w *Window) applyShowTurnDiffs() {
+	for _, tab := range w.tabs {
+		if tab == nil {
+			continue
+		}
+		if tab.main != nil && tab.main.loaded {
+			w.updateTurnDiffs(tab.main)
+		}
+		for _, sub := range tab.subTimelines {
+			if sub != nil && sub.loaded {
+				w.updateTurnDiffs(sub)
+			}
 		}
 	}
 }
@@ -414,6 +438,22 @@ func (w *Window) openPreferencesDialog() {
 		w.applyDiffTruncationLines()
 	})
 	layoutGroup.Add(diffLinesRow)
+
+	showTurnDiffsRow := adw.NewSwitchRow()
+	showTurnDiffsRow.SetTitle("Per-Turn Workspace Diffs")
+	showTurnDiffsRow.SetSubtitle("Show a summary of workspace file changes at the end of each turn")
+	showTurnDiffsRow.SetActive(w.effectiveShowTurnDiffs())
+	showTurnDiffsRow.NotifyProperty("active", func() {
+		active := showTurnDiffsRow.Active()
+		if w.prefs.ShowTurnDiffs == active {
+			return
+		}
+		prev := clonePreferences(w.prefs)
+		w.prefs.ShowTurnDiffs = active
+		w.saveAndSyncPreferences(prev)
+		w.applyShowTurnDiffs()
+	})
+	layoutGroup.Add(showTurnDiffsRow)
 	appearancePage.Add(layoutGroup)
 
 	// Group: Greeter

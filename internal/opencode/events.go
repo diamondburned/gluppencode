@@ -31,6 +31,7 @@ type StepStartedEvent struct {
 	AssistantMessageID string   `json:"assistantMessageID"`
 	Agent              string   `json:"agent"`
 	Model              ModelRef `json:"model"`
+	Snapshot           string   `json:"snapshot,omitempty"`
 }
 
 // StepStreamedEvent is emitted on "session.step.streamed".
@@ -46,12 +47,16 @@ type StepEndedEvent struct {
 	Cost               float64    `json:"cost,omitempty"`
 	Tokens             TokenUsage `json:"tokens,omitempty"`
 	Finish             string     `json:"finish,omitempty"`
+	Snapshot           string     `json:"snapshot,omitempty"`
+	Files              []string   `json:"files,omitempty"`
 }
 
 // StepFailedEvent is emitted on "session.step.failed".
 type StepFailedEvent struct {
-	SessionID          string `json:"sessionID"`
-	AssistantMessageID string `json:"assistantMessageID"`
+	SessionID          string   `json:"sessionID"`
+	AssistantMessageID string   `json:"assistantMessageID"`
+	Snapshot           string   `json:"snapshot,omitempty"`
+	Files              []string `json:"files,omitempty"`
 }
 
 // ToolEvent is emitted on "session.tool.*".

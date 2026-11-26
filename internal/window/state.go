@@ -104,6 +104,7 @@ type Preferences struct {
 	SyntaxTheme           string `json:"syntaxTheme,omitempty"` // "" (auto), or GtkSourceView scheme ID
 	ShellTailLines        int    `json:"shellTailLines,omitempty"`
 	DiffTruncationLines   int    `json:"diffTruncationLines,omitempty"`
+	ShowTurnDiffs         bool   `json:"showTurnDiffs,omitempty"`
 	CtrlEnterToSend       bool   `json:"ctrlEnterToSend,omitempty"`
 	TakeChargeDirective   string `json:"takeChargeDirective,omitempty"`
 	GreeterModelOverride  string `json:"greeterModelOverride,omitempty"` // "" (auto), or "providerID/modelID"

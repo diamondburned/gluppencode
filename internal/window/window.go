@@ -114,6 +114,9 @@ type convTimeline struct {
 	activeBgShellTools  map[string]*ToolWidget
 	subagentToolsByID   map[string]map[string]*ToolWidget
 	turnDurationTargets map[string]string
+	turnDiffTargets     map[string]string
+	turnDiffCache       map[string][]opencode.FileDiff
+	turnDiffPending     map[string]bool
 	streamStart         time.Time
 	streamEnd           time.Time
 	streamedChars       int
@@ -623,6 +626,8 @@ func (c *convTimeline) resetTimelineWidgets() {
 	c.activeBgShellTools = make(map[string]*ToolWidget)
 	c.subagentToolsByID = make(map[string]map[string]*ToolWidget)
 	c.turnDurationTargets = make(map[string]string)
+	c.turnDiffTargets = make(map[string]string)
+	c.turnDiffPending = make(map[string]bool)
 	c.trimmedHead = false
 }
 
@@ -632,6 +637,7 @@ func (c *convTimeline) unload() {
 	}
 	c.activityGen++
 	c.resetTimelineWidgets()
+	c.turnDiffCache = make(map[string][]opencode.FileDiff)
 	c.loaded = false
 	c.loadingInitial = false
 	c.loadingOlder = false
@@ -702,6 +708,7 @@ func (c *convTimeline) trimTimelineHead(maxKeep, keep int) int {
 		delete(c.compactionMap, msg.ID)
 		delete(c.seenMsgIDs, msg.ID)
 		delete(c.turnDurationTargets, msg.ID)
+		delete(c.turnDiffTargets, msg.ID)
 	}
 	kept := make([]opencode.Message, keep)
 	copy(kept, c.messages[trimCount:])
@@ -3205,6 +3212,9 @@ func (w *Window) newConvTimeline(sess opencode.Session) *convTimeline {
 		activeBgShellTools:  make(map[string]*ToolWidget),
 		subagentToolsByID:   make(map[string]map[string]*ToolWidget),
 		turnDurationTargets: make(map[string]string),
+		turnDiffTargets:     make(map[string]string),
+		turnDiffCache:       make(map[string][]opencode.FileDiff),
+		turnDiffPending:     make(map[string]bool),
 	}
 
 	vadj := scroll.VAdjustment()
@@ -7371,6 +7381,7 @@ func (w *Window) reconcileTail(sessionID string) {
 			)
 			conv.keepPendingAtBottom()
 			w.updateTurnDurations(conv)
+			w.updateTurnDiffs(conv)
 			conv.maybeTrimTimelineHead()
 
 			if appended {
@@ -9953,6 +9964,9 @@ func mergeAuthoritativeMessage(msgs []opencode.Message, msg opencode.Message) {
 		if len(msg.Content) > 0 {
 			msgs[i].Content = msg.Content
 		}
+		if msg.Snapshot != nil {
+			msgs[i].Snapshot = msg.Snapshot
+		}
 		if msg.Agent != "" {
 			msgs[i].Agent = msg.Agent
 		}
@@ -10161,6 +10175,237 @@ func (w *Window) updateTurnDurations(conv *convTimeline) {
 			aw.SetTurnDuration(text)
 			conv.turnDurationTargets[id] = text
 		}
+	}
+}
+
+type turnDiffTarget struct {
+	FromID     string
+	ToID       string
+	TargetID   string
+	ChangedKey string
+	HasChanges bool
+}
+
+// computeTurnDiffTargets finds completed user-anchored turns and determines which assistant
+// message widget hosts each turn's diff and whether snapshot metadata indicates file changes.
+func computeTurnDiffTargets(
+	messages []opencode.Message,
+	revertMessageID string,
+	active bool,
+	hasWidget func(id string) bool,
+) []turnDiffTarget {
+	if revertMessageID != "" {
+		for i, msg := range messages {
+			if msg.ID == revertMessageID {
+				messages = messages[:i]
+				break
+			}
+		}
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+
+	hasIdleMarkers := false
+	for _, msg := range messages {
+		if msg.Type == "idle" {
+			hasIdleMarkers = true
+			break
+		}
+	}
+
+	type turnSegment struct {
+		fromID string
+		toID   string
+		closed bool
+		msgs   []opencode.Message
+	}
+
+	var turns []turnSegment
+	var cur *turnSegment
+	for _, msg := range messages {
+		if msg.Type == "user" {
+			if hasIdleMarkers {
+				if cur == nil {
+					turns = append(turns, turnSegment{fromID: msg.ID, toID: msg.ID})
+					cur = &turns[len(turns)-1]
+				} else if cur.fromID == "" {
+					cur.fromID = msg.ID
+					cur.toID = msg.ID
+				} else {
+					cur.toID = msg.ID
+				}
+			} else {
+				turns = append(turns, turnSegment{fromID: msg.ID, toID: msg.ID})
+				cur = &turns[len(turns)-1]
+			}
+			continue
+		}
+		if hasIdleMarkers && msg.Type == "idle" {
+			if cur != nil {
+				cur.closed = true
+				cur = nil
+			}
+			continue
+		}
+		if cur != nil {
+			cur.msgs = append(cur.msgs, msg)
+		}
+	}
+
+	if active && len(turns) > 0 {
+		last := turns[len(turns)-1]
+		if !hasIdleMarkers || !last.closed {
+			turns = turns[:len(turns)-1]
+		}
+	}
+
+	var out []turnDiffTarget
+	for _, seg := range turns {
+		if seg.fromID == "" {
+			continue
+		}
+		var (
+			targetID   string
+			fallbackID string
+			hasChanges bool
+			keyBuf     strings.Builder
+		)
+		keyBuf.WriteString(seg.fromID)
+		keyBuf.WriteByte('|')
+		keyBuf.WriteString(seg.toID)
+		for _, m := range seg.msgs {
+			if m.Type != "assistant" {
+				continue
+			}
+			if m.ID != "" {
+				fallbackID = m.ID
+				if hasWidget == nil || hasWidget(m.ID) {
+					targetID = m.ID
+				}
+			}
+			keyBuf.WriteByte('|')
+			keyBuf.WriteString(m.ID)
+			if m.Snapshot != nil {
+				keyBuf.WriteByte(':')
+				keyBuf.WriteString(m.Snapshot.Start)
+				keyBuf.WriteByte(':')
+				keyBuf.WriteString(m.Snapshot.End)
+				keyBuf.WriteByte(':')
+				keyBuf.WriteString(strings.Join(m.Snapshot.Files, ","))
+				if len(m.Snapshot.Files) > 0 {
+					hasChanges = true
+				} else if m.Snapshot.Files == nil && m.Snapshot.Start != "" && m.Snapshot.End != "" && m.Snapshot.Start != m.Snapshot.End {
+					hasChanges = true
+				}
+			}
+		}
+		if targetID == "" {
+			targetID = fallbackID
+		}
+		if targetID == "" {
+			continue
+		}
+		out = append(out, turnDiffTarget{
+			FromID:     seg.fromID,
+			ToID:       seg.toID,
+			TargetID:   targetID,
+			ChangedKey: keyBuf.String(),
+			HasChanges: hasChanges,
+		})
+	}
+	return out
+}
+
+func (w *Window) updateTurnDiffs(conv *convTimeline) {
+	if conv == nil || len(conv.assistantMap) == 0 {
+		return
+	}
+	if !w.effectiveShowTurnDiffs() {
+		for id := range conv.turnDiffTargets {
+			if aw := conv.assistantMap[id]; aw != nil {
+				aw.SetTurnDiff(nil)
+			}
+			delete(conv.turnDiffTargets, id)
+		}
+		return
+	}
+	var revertID string
+	if conv.session.Revert != nil {
+		revertID = conv.session.Revert.MessageID
+	}
+	targets := computeTurnDiffTargets(conv.messages, revertID, conv.active, func(id string) bool {
+		return conv.assistantMap[id] != nil
+	})
+	if conv.turnDiffTargets == nil {
+		conv.turnDiffTargets = make(map[string]string)
+	}
+	if conv.turnDiffCache == nil {
+		conv.turnDiffCache = make(map[string][]opencode.FileDiff)
+	}
+	if conv.turnDiffPending == nil {
+		conv.turnDiffPending = make(map[string]bool)
+	}
+
+	byTarget := make(map[string]turnDiffTarget, len(targets))
+	for _, t := range targets {
+		byTarget[t.TargetID] = t
+	}
+	for id := range conv.turnDiffTargets {
+		t, ok := byTarget[id]
+		if !ok || !t.HasChanges {
+			if aw := conv.assistantMap[id]; aw != nil {
+				aw.SetTurnDiff(nil)
+			}
+			delete(conv.turnDiffTargets, id)
+		}
+	}
+
+	if w.client == nil {
+		return
+	}
+	sessionID := conv.session.ID
+	for _, t := range targets {
+		if !t.HasChanges {
+			continue
+		}
+		if conv.turnDiffTargets[t.TargetID] == t.ChangedKey {
+			continue
+		}
+		if diffs, cached := conv.turnDiffCache[t.ChangedKey]; cached {
+			if aw := conv.assistantMap[t.TargetID]; aw != nil {
+				aw.SetTurnDiff(diffs)
+				conv.turnDiffTargets[t.TargetID] = t.ChangedKey
+				if len(diffs) > 0 && conv.scroll != nil {
+					conv.scroll.ScrollToBottomIfBottomed()
+				}
+			}
+			continue
+		}
+		if conv.turnDiffPending[t.ChangedKey] {
+			continue
+		}
+		conv.turnDiffPending[t.ChangedKey] = true
+		target := t
+		gtkutil.Async(w.ctx, func() func() {
+			ctxLines := 3
+			diffs, err := w.client.SessionDiffTurn(w.ctx, sessionID, opencode.SessionDiffOptions{
+				From:    target.FromID,
+				To:      target.ToID,
+				Context: &ctxLines,
+			})
+			return func() {
+				delete(conv.turnDiffPending, target.ChangedKey)
+				if err != nil {
+					slog.Debug("failed to fetch session turn diff", "sessionID", sessionID, "from", target.FromID, "err", err)
+					return
+				}
+				conv.turnDiffCache[target.ChangedKey] = diffs
+				if conv.loaded {
+					w.updateTurnDiffs(conv)
+				}
+			}
+		})
 	}
 }
 
@@ -10423,6 +10668,7 @@ func (w *Window) applyRevertState(tab *sessionTab, conv *convTimeline) {
 			conv.revertBanner.SetVisible(false)
 		}
 		w.updateTurnDurations(conv)
+		w.updateTurnDiffs(conv)
 		return
 	}
 
@@ -10453,6 +10699,7 @@ func (w *Window) applyRevertState(tab *sessionTab, conv *convTimeline) {
 	conv.revertBanner.Update(userCount, revert, fallbackFiles)
 	conv.revertBanner.SetVisible(true)
 	w.updateTurnDurations(conv)
+	w.updateTurnDiffs(conv)
 	conv.keepPendingAtBottom()
 	if conv.scroll != nil {
 		conv.scroll.ScrollToBottom()
@@ -10483,6 +10730,7 @@ func (w *Window) commitRevertState(tab *sessionTab, conv *convTimeline) {
 					conv.removeAssistantToolIndexes(aw)
 				}
 				delete(conv.turnDurationTargets, id)
+				delete(conv.turnDiffTargets, id)
 				if widget, ok := conv.messageWidgets[id]; ok {
 					conv.timelineBox.Remove(widget)
 					delete(conv.messageWidgets, id)
@@ -10501,6 +10749,7 @@ func (w *Window) commitRevertState(tab *sessionTab, conv *convTimeline) {
 	conv.session.Revert = nil
 	conv.revertFilesRolled = false
 	w.updateTurnDurations(conv)
+	w.updateTurnDiffs(conv)
 }
 
 func (w *Window) clipboardHasImage() bool {
@@ -10920,6 +11169,7 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 			}
 		}
 		w.updateTurnDurations(conv)
+		w.updateTurnDiffs(conv)
 		conv.keepPendingAtBottom()
 		if !active {
 			conv.maybeTrimTimelineHead()
@@ -11789,6 +12039,17 @@ func (w *Window) handleEvent(ev opencode.Event) {
 				}
 				if conv.loaded {
 					w.ensureAssistantWidget(tab, conv, d.AssistantMessageID, d.Agent, d.Model.String())
+					if d.Snapshot != "" {
+						for i := len(conv.messages) - 1; i >= 0; i-- {
+							if conv.messages[i].ID == d.AssistantMessageID {
+								if conv.messages[i].Snapshot == nil {
+									conv.messages[i].Snapshot = &opencode.MessageSnapshot{}
+								}
+								conv.messages[i].Snapshot.Start = d.Snapshot
+								break
+							}
+						}
+					}
 					w.reconcileTail(d.SessionID)
 				}
 				if w.currentTab() == tab {
@@ -11842,6 +12103,17 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						if conv.messages[i].Time.Completed == 0 {
 							conv.messages[i].Time.Completed = time.Now().UnixMilli()
 						}
+						if d.Snapshot != "" || d.Files != nil {
+							if conv.messages[i].Snapshot == nil {
+								conv.messages[i].Snapshot = &opencode.MessageSnapshot{}
+							}
+							if d.Snapshot != "" {
+								conv.messages[i].Snapshot.End = d.Snapshot
+							}
+							if d.Files != nil {
+								conv.messages[i].Snapshot.Files = d.Files
+							}
+						}
 						found = true
 						break
 					}
@@ -11853,6 +12125,12 @@ func (w *Window) handleEvent(ev opencode.Event) {
 					msg.Tokens = d.Tokens
 					msg.Cost = d.Cost
 					msg.Time.Completed = time.Now().UnixMilli()
+					if d.Snapshot != "" || d.Files != nil {
+						msg.Snapshot = &opencode.MessageSnapshot{
+							End:   d.Snapshot,
+							Files: d.Files,
+						}
+					}
 					conv.messages = append(conv.messages, msg)
 				}
 				if authoritative := opencode.FormatMessageTokPerSec(conv.messages); authoritative != "" {
@@ -11873,6 +12151,22 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		var d opencode.StepFailedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
 			if _, conv := w.resolveEventConv(d.SessionID); conv != nil {
+				if d.AssistantMessageID != "" && (d.Snapshot != "" || d.Files != nil) {
+					for i := len(conv.messages) - 1; i >= 0; i-- {
+						if conv.messages[i].ID == d.AssistantMessageID {
+							if conv.messages[i].Snapshot == nil {
+								conv.messages[i].Snapshot = &opencode.MessageSnapshot{}
+							}
+							if d.Snapshot != "" {
+								conv.messages[i].Snapshot.End = d.Snapshot
+							}
+							if d.Files != nil {
+								conv.messages[i].Snapshot.Files = d.Files
+							}
+							break
+						}
+					}
+				}
 				if len(conv.executingTools) == 0 && conv.activityPhase != activityRetrying {
 					conv.activityPhase = activityWaitingModel
 					conv.syncActivityLabel()

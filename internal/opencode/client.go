@@ -1030,6 +1030,13 @@ type MessageRetry struct {
 	At      int64 `json:"at,omitempty"`
 }
 
+// MessageSnapshot records the step-level workspace snapshot bounds and changed paths on an assistant message.
+type MessageSnapshot struct {
+	Start string   `json:"start,omitempty"`
+	End   string   `json:"end,omitempty"`
+	Files []string `json:"files,omitempty"`
+}
+
 // Message represents a timeline entry in a session.
 type Message struct {
 	ID            string           `json:"id"`
@@ -1049,6 +1056,7 @@ type Message struct {
 	Description   string           `json:"description,omitempty"` // for type == "synthetic" or "system"
 	Metadata      map[string]any   `json:"metadata,omitempty"`    // for type == "synthetic", "system", or "compaction"
 	Content       []ContentPart    `json:"content,omitempty"`
+	Snapshot      *MessageSnapshot `json:"snapshot,omitempty"`
 	Cost          float64          `json:"cost,omitempty"`
 	Tokens        TokenUsage       `json:"tokens,omitempty"`
 	Retry         *MessageRetry    `json:"retry,omitempty"`
