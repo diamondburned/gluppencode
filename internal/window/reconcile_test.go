@@ -3834,7 +3834,7 @@ func TestRevertUserMessageCountAndFileRollbackBanner(t *testing.T) {
 	conv.messages = messages
 
 	// Revert with files rollback = true.
-	win.stageRevertToMessage(tab, conv, "u2", "second prompt", true)
+	win.stageRevertToMessage(tab, conv, "u2", "second prompt", nil, true)
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		glib.MainContextDefault().Iteration(false)
@@ -3864,7 +3864,7 @@ func TestRevertUserMessageCountAndFileRollbackBanner(t *testing.T) {
 
 	// Revert with files rollback = false -> no files listed in banner.
 	conv.session.Revert = nil
-	win.stageRevertToMessage(tab, conv, "u2", "second prompt", false)
+	win.stageRevertToMessage(tab, conv, "u2", "second prompt", nil, false)
 	deadline = time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		glib.MainContextDefault().Iteration(false)
@@ -5520,5 +5520,210 @@ func TestModelSwitchedWidgetWithVariants(t *testing.T) {
 	lblDefault := wDefault.FirstChild().(*gtk.Label)
 	if got := lblDefault.Label(); got != "Switched model to hackadoll3/inkling-2-mini-unbound" {
 		t.Fatalf("NewModelSwitchedWidget default label = %q", got)
+	}
+}
+
+func TestSessionContextMenuAndDeletion(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+	t.Setenv("GLUPPENCODE_STATE_FILE", filepath.Join(t.TempDir(), "state.json"))
+
+	var (
+		mu          sync.Mutex
+		deletedIDs  []string
+		renamedReqs []struct{ id, title string }
+		copiedText  string
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/"):
+			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+			mu.Lock()
+			deletedIDs = append(deletedIDs, id)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/api/session/"):
+			id := strings.TrimPrefix(r.URL.Path, "/api/session/")
+			var body struct {
+				Title string `json:"title"`
+			}
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			renamedReqs = append(renamedReqs, struct{ id, title string }{id: id, title: body.Title})
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+			return
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`[]`))
+		}
+	}))
+	defer srv.Close()
+
+	dir := "/home/diamond/proj_ctx"
+	s1 := opencode.Session{
+		ID:       "ses_ctx_1",
+		Title:    "First Session",
+		Location: opencode.Location{Directory: dir},
+		Time:     opencode.SessionTime{Created: 100, Updated: 200},
+	}
+	s2 := opencode.Session{
+		ID:       "ses_ctx_2",
+		Title:    "Second Session",
+		Location: opencode.Location{Directory: dir},
+		Time:     opencode.SessionTime{Created: 150, Updated: 250},
+	}
+	sArch := opencode.Session{
+		ID:       "ses_ctx_arch",
+		Title:    "Archived Session",
+		Location: opencode.Location{Directory: dir},
+		Time:     opencode.SessionTime{Created: 50, Updated: 60},
+	}
+
+	vs := adw.NewViewStack()
+	headerStack := gtk.NewStack()
+	titleBtn := gtk.NewMenuButton()
+	headerStack.AddNamed(titleBtn, "title")
+	sidebarList := gtk.NewListBox()
+	win := &Window{
+		ctx:                   t.Context(),
+		client:                &opencode.Client{BaseURL: srv.URL},
+		viewStack:             vs,
+		sidebarList:           sidebarList,
+		headerTitleStack:      headerStack,
+		windowTitleBtn:        titleBtn,
+		windowTitle:           adw.NewWindowTitle("Gluppencode", ""),
+		tabs:                  make(map[string]*sessionTab),
+		childToRoot:           make(map[string]string),
+		visibleSessions:       map[string]bool{s1.ID: true, s2.ID: true},
+		archivedSessions:      map[string]bool{sArch.ID: true},
+		collapsedProjects:     make(map[string]bool),
+		projectSessions:       map[string][]opencode.Session{dir: {s1, s2}},
+		projectOrder:          []string{dir},
+		allSessions:           []opencode.Session{s1, s2, sArch},
+		resolvedSessionTitles: make(map[string]string),
+		lastViewAcked:         make(map[string]int64),
+		clipboardSetter: func(s string) {
+			copiedText = s
+		},
+	}
+	win.setupHeaderSessionContextMenu()
+
+	tab1 := win.ensureSessionTab(s1)
+	tab2 := win.ensureSessionTab(s2)
+	tab1.subagents = []opencode.Session{{ID: "ses_sub_1", ParentID: s1.ID, Title: "Subagent 1"}}
+	win.childToRoot["ses_sub_1"] = s1.ID
+	vs.SetVisibleChildName(s1.ID)
+	win.syncSidebar()
+
+	// 1. Sidebar row menu copies ID, toggles archive visibility, and renames.
+	if tab1.sidebarIndicator == nil || tab1.sidebarIndicator.menu == nil {
+		t.Fatalf("expected sidebarIndicator.menu to be initialized")
+	}
+	sbMenu := tab1.sidebarIndicator.menu
+	sbMenu.openAt(tab1.sidebarIndicator.row, 10, 10)
+	if !sbMenu.archiveBtn.Visible() {
+		t.Fatalf("expected archiveBtn to be visible for non-archived session")
+	}
+	sbMenu.onCopyID()
+	if copiedText != s1.ID {
+		t.Fatalf("copiedText = %q, want %q", copiedText, s1.ID)
+	}
+
+	win.renameSession(s1.ID, s1.Title, "Renamed First")
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(renamedReqs)
+		mu.Unlock()
+		if n == 1 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	if len(renamedReqs) != 1 || renamedReqs[0].id != s1.ID || renamedReqs[0].title != "Renamed First" {
+		mu.Unlock()
+		t.Fatalf("unexpected rename requests: %+v", renamedReqs)
+	}
+	mu.Unlock()
+	if tab1.Title() != "Renamed First" {
+		t.Fatalf("tab1.Title() = %q, want 'Renamed First'", tab1.Title())
+	}
+
+	// 2. Headerbar menu targets current tab and hides Archive when archived.
+	if win.headerSessionMenu == nil {
+		t.Fatalf("expected headerSessionMenu to be initialized")
+	}
+	win.headerSessionMenu.onCopyID()
+	if copiedText != s1.ID {
+		t.Fatalf("header copiedText = %q, want %q", copiedText, s1.ID)
+	}
+	archMenu := win.newSessionContextMenu(nil, func() (string, string) {
+		return sArch.ID, sArch.Title
+	}, sessionContextMenuOpts{})
+	archMenu.openAt(nil, 0, 0)
+	if archMenu.archiveBtn.Visible() {
+		t.Fatalf("expected archiveBtn to be hidden for already archived session")
+	}
+
+	// 3. Subagent deletion removes child without deleting parent session.
+	if !win.applySessionDeleted("ses_sub_1") {
+		t.Fatalf("expected applySessionDeleted on subagent to return true")
+	}
+	if _, ok := win.childToRoot["ses_sub_1"]; ok {
+		t.Fatalf("expected ses_sub_1 removed from childToRoot")
+	}
+	if win.tabs[s1.ID] == nil || len(tab1.subagents) != 0 {
+		t.Fatalf("expected parent tab intact with 0 subagents, got tab=%v subs=%d", win.tabs[s1.ID], len(tab1.subagents))
+	}
+
+	// 4. Root deletion calls DELETE /api/session/{id}, switches to remaining tab, and is idempotent on replay.
+	var onDeletedID string
+	win.deleteSession(s1.ID, func(id string) {
+		onDeletedID = id
+	})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(deletedIDs)
+		mu.Unlock()
+		if n == 1 && onDeletedID == s1.ID && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	if len(deletedIDs) != 1 || deletedIDs[0] != s1.ID {
+		mu.Unlock()
+		t.Fatalf("deletedIDs = %v, want [%s]", deletedIDs, s1.ID)
+	}
+	mu.Unlock()
+	if win.tabs[s1.ID] != nil {
+		t.Fatalf("expected ses_ctx_1 tab removed after delete")
+	}
+	if win.currentRootSessionID() != tab2.main.session.ID {
+		t.Fatalf("currentRootSessionID() = %q, want %q", win.currentRootSessionID(), tab2.main.session.ID)
+	}
+	if win.visibleSessions[s1.ID] || win.archivedSessions[s1.ID] {
+		t.Fatalf("expected ses_ctx_1 cleared from visible/archived maps")
+	}
+	for _, s := range win.allSessions {
+		if s.ID == s1.ID {
+			t.Fatalf("expected ses_ctx_1 removed from allSessions")
+		}
+	}
+	if win.applySessionDeleted(s1.ID) {
+		t.Fatalf("expected duplicate applySessionDeleted(%q) to be a no-op returning false", s1.ID)
+	}
+
+	// 5. Archiving via menu marks session archived and removes its tab.
+	tab2.sidebarIndicator.menu.onArchive()
+	if !win.archivedSessions[s2.ID] || win.tabs[s2.ID] != nil {
+		t.Fatalf("expected ses_ctx_2 archived and tab removed, archived=%v tab=%v", win.archivedSessions[s2.ID], win.tabs[s2.ID])
 	}
 }

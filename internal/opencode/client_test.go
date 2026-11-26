@@ -2482,6 +2482,42 @@ func TestSessionCreatedEventAndIsRunning(t *testing.T) {
 	}
 }
 
+func TestDeleteSession(t *testing.T) {
+	t.Parallel()
+
+	var deletedPath string
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				deletedPath = req.URL.Path
+				if req.Method != http.MethodDelete {
+					t.Errorf("expected DELETE, got %s", req.Method)
+				}
+				if req.URL.Path == "/api/session/ses_missing" {
+					return &http.Response{
+						StatusCode: http.StatusNotFound,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"Session not found"}}`)),
+					}, nil
+				}
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+			}),
+		},
+	}
+
+	if err := client.DeleteSession(context.Background(), "ses_root_1"); err != nil {
+		t.Fatalf("DeleteSession failed: %v", err)
+	}
+	if deletedPath != "/api/session/ses_root_1" {
+		t.Errorf("DeleteSession sent %q, want /api/session/ses_root_1", deletedPath)
+	}
+
+	if err := client.DeleteSession(context.Background(), "ses_missing"); err == nil {
+		t.Fatal("DeleteSession on missing session succeeded, want error")
+	}
+}
+
 func TestPermissionEndpointsAndEvents(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

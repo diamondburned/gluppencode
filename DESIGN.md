@@ -11,7 +11,7 @@ The following requirements serve as the design source of truth for Gluppencode:
    - **Resizable Project-Grouped Sidebar**:
      - Custom `GtkListBox` (`sidebarList`) in the split-view sidebar, drag-resizable on desktop (`sidebarResizeHandle`, clamped to `180–600px`, persisted as `sidebarWidth`), pinned side-by-side when wide (no hide button), and collapsed into an overlay with headerbar toggle buttons via a dynamic `AdwBreakpoint` (`max(600px, sidebarWidth*2)`) on narrow screens.
      - Sessions are grouped under project section headers (collapse chevron, `folder-symbolic`, basename title, shortened path subtitle, collapsed count, hover `+` New Session button, and subtle separator) supporting drag-and-drop project reordering (`projectOrder`), collapse/expand state (`collapsedProjects`), and a project context menu (New Session, Open in Files, Copy Path, Collapse/Expand Project, Archive Project).
-     - Conversation rows sit indented beneath their project header with hover close/archive actions.
+     - Conversation rows sit indented beneath their project header with hover close/archive actions and a right-click / long-press session context menu (`Rename Session…`, `Copy Session ID`, `Archive Session`, and `Delete Session…` with `AdwAlertDialog` confirmation backed by `DELETE /api/session/{sessionID}`).
    - **Per-Project Conversation Limits**:
      - Configurable max visible conversations per project (default `5`, range `1–50` via Preferences `MaxVisibleSessions`), sorted newest-first.
      - Projects exceeding the limit render a clickable `"Show N more…"` footer row to expand all sessions; the currently active session remains visible even if outside the top N.
@@ -27,7 +27,7 @@ The following requirements serve as the design source of truth for Gluppencode:
    - Sidebar header includes a search button (`searchSessionsBtn`) on the left and main menu (`appMenuSidebarBtn`: Preferences, MCP Servers, About) on the right, with `Ctrl+K` bound globally for search.
    - Opens a modal dialog with a `GtkSearchEntry` querying recent sessions (`ListSessions`) plus live server session search (`SearchSessions`), known project directories, and matching filesystem paths (`matchFilesystemDirs`).
    - Uses token-based, substring, and subsequence fuzzy matching (`fuzzyMatchScore`) with bonuses for word boundaries, consecutive characters, and active status.
-   - Activating a session switches to it immediately (unarchiving/revealing it in the sidebar if needed); activating a directory starts a new session there.
+   - Activating a session switches to it immediately (unarchiving/revealing it in the sidebar if needed); right-clicking or long-pressing a session row opens the session context menu (`Rename Session…`, `Copy Session ID`, `Archive Session`, `Delete Session…`); activating a directory starts a new session there.
 
 3. **Material Icons & Embedded Assets**:
    - Bundle Material symbolic action SVGs, app icons (`so.libdb.gluppencode`), and assets via `glib-compile-resources` into an embedded `GResource` (`internal/icons`), exposed on the display icon theme path `/so/libdb/gluppencode/icons`.
@@ -50,7 +50,7 @@ The following requirements serve as the design source of truth for Gluppencode:
        - **Session & Context**: copyable conversation ID and token/cost/model metadata grid.
    - **Headerbar Subagent Breadcrumbs & Take Charge**:
      - Viewing a subagent switches `headerTitleStack` to `Main Conv > Subagent Conv` breadcrumbs while the sidebar keeps the parent root session highlighted.
-     - Headerbar includes a `Take Charge` toggle (`takeChargeBtn`) that autonomously answers incoming `FormInfo` questions using a configurable directive and auto-approves `PermissionRequest` prompts (`Allow Once`) while away, plus a `New Window` button (`Ctrl+Shift+N`), `Refresh`, and session rename popover.
+     - Headerbar includes a `Take Charge` toggle (`takeChargeBtn`) that autonomously answers incoming `FormInfo` questions using a configurable directive and auto-approves `PermissionRequest` prompts (`Allow Once`) while away, plus a `New Window` button (`Ctrl+Shift+N`), `Refresh`, and session title button (`windowTitleBtn`, left-click rename popover and right-click / long-press session context menu).
 
 5. **GtkBuilder `.ui` Files & Styling**:
    - Define widget hierarchies declaratively in embedded `.ui` XML files (`window.ui`, `message.ui`, `tool.ui`) and application CSS in `style.css`.

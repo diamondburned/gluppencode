@@ -782,6 +782,7 @@ type switcherIndicator struct {
 	box          *gtk.Box
 	label        *gtk.Label
 	closeBtn     *gtk.Button
+	menu         *sessionContextMenu
 	rowPtr       uintptr
 	lastTimemark string
 }
@@ -972,6 +973,7 @@ type Window struct {
 	renameSessionPopover  *gtk.Popover
 	renameSessionEntry    *gtk.Entry
 	renameSessionSaveBtn  *gtk.Button
+	headerSessionMenu     *sessionContextMenu
 	breadcrumbParentBtn   *gtk.Button
 	breadcrumbParentLabel *gtk.Label
 	breadcrumbChildLabel  *gtk.Label
@@ -1480,6 +1482,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 
 	w.renameSessionPopover.ConnectShow(func() {
+		if w.headerSessionMenu != nil && w.headerSessionMenu.popover != nil && w.headerSessionMenu.popover.Visible() {
+			w.headerSessionMenu.popover.Popdown()
+		}
 		if tab := w.currentTab(); tab != nil {
 			w.renameSessionEntry.SetText(tab.main.session.Title)
 			w.renameSessionEntry.GrabFocus()
@@ -1487,6 +1492,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	w.renameSessionEntry.ConnectActivate(w.submitRenameSession)
 	w.renameSessionSaveBtn.ConnectClicked(w.submitRenameSession)
+	w.setupHeaderSessionContextMenu()
 	w.searchSessionsBtn.ConnectClicked(w.openSessionSearchDialog)
 	w.setupAppMenuButton(w.appMenuSidebarBtn)
 	w.newWindowBtn.ConnectClicked(w.openNewWindow)
@@ -1883,6 +1889,10 @@ func (w *Window) cleanupTabSidebarState(tab *sessionTab) {
 		return
 	}
 	ind := tab.sidebarIndicator
+	if ind.menu != nil && ind.menu.popover != nil && ind.menu.popover.Visible() {
+		ind.menu.popover.Popdown()
+	}
+	ind.menu = nil
 	if ind.closeBtn != nil {
 		delete(w.closeBtnSessID, ind.closeBtn.Object.Native())
 	}
@@ -2249,6 +2259,239 @@ func (w *Window) archiveSession(sessID string) {
 		w.updateWindowManagerTitle()
 	}
 	w.syncSidebar()
+}
+
+func (w *Window) promptDeleteSession(parent gtk.Widgetter, sessID, title string, onDeleted func(string)) {
+	if w == nil || sessID == "" {
+		return
+	}
+	if parent == nil && w.ApplicationWindow != nil {
+		parent = w.ApplicationWindow
+	}
+	if parent == nil {
+		w.deleteSession(sessID, onDeleted)
+		return
+	}
+
+	displayTitle := strings.TrimSpace(title)
+	if displayTitle == "" {
+		displayTitle = w.lookupCachedSessionTitle(sessID)
+	}
+	if displayTitle == "" {
+		displayTitle = "Untitled Session"
+	}
+
+	body := fmt.Sprintf("Delete %q and all of its subagent sessions from the server? This cannot be undone.", displayTitle)
+	dlg := adw.NewAlertDialog("Delete Session?", body)
+	dlg.AddResponse("cancel", "Cancel")
+	dlg.AddResponse("delete", "Delete")
+	dlg.SetResponseAppearance("delete", adw.ResponseDestructive)
+	dlg.SetDefaultResponse("cancel")
+	dlg.SetCloseResponse("cancel")
+	dlg.ConnectResponse(func(response string) {
+		if response == "delete" {
+			w.deleteSession(sessID, onDeleted)
+		}
+	})
+	dlg.Present(parent)
+}
+
+func (w *Window) deleteSession(sessID string, onDeleted func(string)) {
+	if w == nil || sessID == "" {
+		return
+	}
+	if w.client == nil {
+		w.applySessionDeleted(sessID)
+		if onDeleted != nil {
+			onDeleted(sessID)
+		}
+		return
+	}
+	gtkutil.Async(w.ctx, func() func() {
+		err := w.client.DeleteSession(w.ctx, sessID)
+		return func() {
+			if err != nil {
+				slog.Error("failed to delete session", "sessionID", sessID, "err", err)
+				app.Error(w.ctx, err)
+				return
+			}
+			w.applySessionDeleted(sessID)
+			if onDeleted != nil {
+				onDeleted(sessID)
+			}
+		}
+	})
+}
+
+func (w *Window) applySessionDeleted(delID string) bool {
+	if w == nil || delID == "" {
+		return false
+	}
+	if parentID, ok := w.childToRoot[delID]; ok {
+		delete(w.childToRoot, delID)
+		delete(w.resolvedSessionTitles, delID)
+		w.deleteDraft(delID)
+		if parentTab, ok := w.tabs[parentID]; ok {
+			filtered := parentTab.subagents[:0]
+			for _, s := range parentTab.subagents {
+				if s.ID != delID {
+					filtered = append(filtered, s)
+				}
+			}
+			parentTab.subagents = filtered
+			if parentTab.activeSubID == delID {
+				w.closeSubagent(parentTab)
+			}
+			if subConv, ok := parentTab.subTimelines[delID]; ok {
+				subConv.closeStreams()
+				delete(parentTab.subTimelines, delID)
+			}
+			w.refreshTabActionAttention(parentTab)
+			w.maybeScheduleRootTurnCompletion(parentTab)
+			if w.currentTab() == parentTab {
+				w.updateBottomBar(parentTab)
+				w.rebuildSubagentList(parentTab)
+			}
+		}
+		w.withdrawSessionNotifications(delID)
+		w.pruneSessionAuxiliaryState(delID, nil)
+		delete(w.lastViewAcked, delID)
+		w.syncSidebar()
+		return true
+	}
+
+	var normDir string
+	var hadAny bool
+	allFiltered := w.allSessions[:0]
+	for _, s := range w.allSessions {
+		if s.ID == delID {
+			hadAny = true
+			if normDir == "" {
+				normDir = normalizeProjectDir(s.Location.Directory)
+			}
+			continue
+		}
+		allFiltered = append(allFiltered, s)
+	}
+	w.allSessions = allFiltered
+
+	if tab, ok := w.tabs[delID]; ok {
+		hadAny = true
+		if normDir == "" && tab.main != nil {
+			normDir = normalizeProjectDir(tab.main.session.Location.Directory)
+		}
+	}
+	if w.projectSessions != nil {
+		for dir, list := range w.projectSessions {
+			filtered := list[:0]
+			removed := false
+			for _, s := range list {
+				if s.ID == delID {
+					removed = true
+					hadAny = true
+					if normDir == "" {
+						normDir = dir
+					}
+					continue
+				}
+				filtered = append(filtered, s)
+			}
+			if removed {
+				if len(filtered) == 0 {
+					delete(w.projectSessions, dir)
+				} else {
+					w.projectSessions[dir] = filtered
+				}
+			}
+		}
+	}
+	stateDirty := false
+	if w.visibleSessions[delID] {
+		delete(w.visibleSessions, delID)
+		stateDirty = true
+		hadAny = true
+	}
+	if w.archivedSessions[delID] {
+		delete(w.archivedSessions, delID)
+		stateDirty = true
+		hadAny = true
+	}
+	if stateDirty {
+		w.saveState()
+	}
+
+	if _, ok := w.lastViewAcked[delID]; ok {
+		hadAny = true
+	}
+
+	if tab, ok := w.tabs[delID]; ok {
+		wasCurrent := (w.currentRootSessionID() == delID)
+		var nextID string
+		if wasCurrent {
+			nextID = w.nextVisibleTabID(delID, normDir, nil)
+		}
+
+		prevPopulating := w.populating
+		w.populating = true
+		w.deleteSessionDraftsForTab(delID, tab)
+		w.cancelCompletionSettle(tab)
+		tab.main.closeStreams()
+		for subID, c := range tab.subTimelines {
+			c.closeStreams()
+			delete(w.childToRoot, subID)
+		}
+		for _, sub := range tab.subagents {
+			delete(w.childToRoot, sub.ID)
+		}
+		w.cleanupTabSidebarState(tab)
+		if w.viewStack != nil && tab.stack != nil {
+			w.viewStack.Remove(tab.stack)
+		}
+		delete(w.tabs, delID)
+		if idx := slices.Index(w.tabOrder, delID); idx >= 0 {
+			w.tabOrder = slices.Delete(w.tabOrder, idx, idx+1)
+		}
+		if normDir != "" && w.projectSessions != nil && !w.expandedProjects[normDir] {
+			maxVis := w.effectiveMaxVisibleSessions()
+			openCount := 0
+			for _, id := range w.tabOrder {
+				if t := w.tabs[id]; t != nil && t.main != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
+					openCount++
+				}
+			}
+			for _, candidate := range w.projectSessions[normDir] {
+				if openCount >= maxVis {
+					break
+				}
+				if _, exists := w.tabs[candidate.ID]; !exists {
+					w.ensureSessionTab(candidate)
+					openCount++
+				}
+			}
+		}
+		if wasCurrent && nextID == "" {
+			nextID = w.nextVisibleTabID(delID, normDir, nil)
+		}
+		w.populating = prevPopulating
+
+		if wasCurrent {
+			if nextID != "" && w.viewStack != nil {
+				w.viewStack.SetVisibleChildName(nextID)
+			}
+			w.onVisibleTabChanged()
+		} else {
+			w.updateWindowManagerTitle()
+		}
+	} else {
+		w.deleteSessionDraftsForTab(delID, nil)
+	}
+	w.withdrawSessionNotifications(delID)
+	w.pruneSessionAuxiliaryState(delID, nil)
+	delete(w.lastViewAcked, delID)
+	if hadAny {
+		w.syncSidebar()
+	}
+	return hadAny
 }
 
 func (w *Window) pruneSessionAuxiliaryState(rootID string, tab *sessionTab) {
@@ -2727,7 +2970,56 @@ func (w *Window) openSessionSearchDialog() {
 	copy(sessionPool, w.allSessions)
 	var activeMap map[string]opencode.ActiveStatus
 
-	var currentMatches []sessionSearchMatch
+	var (
+		currentMatches []sessionSearchMatch
+		updateList     func()
+		pendingRefresh bool
+		menuSessID     string
+		menuSessTitle  string
+		deletedIDs     = make(map[string]bool)
+	)
+
+	searchMenu := w.newSessionContextMenu(scrolled, func() (string, string) {
+		return menuSessID, menuSessTitle
+	}, sessionContextMenuOpts{
+		parentWin: searchWin,
+		onRenamed: func(sessID, newTitle string) {
+			sessionsLock.Lock()
+			for i := range sessionPool {
+				if sessionPool[i].ID == sessID {
+					sessionPool[i].Title = newTitle
+				}
+			}
+			sessionsLock.Unlock()
+			if updateList != nil {
+				updateList()
+			}
+		},
+		onArchived: func(string) {
+			if updateList != nil {
+				updateList()
+			}
+		},
+		onDeleted: func(deletedID string) {
+			sessionsLock.Lock()
+			deletedIDs[deletedID] = true
+			sessionPool = slices.DeleteFunc(sessionPool, func(s opencode.Session) bool {
+				return s.ID == deletedID
+			})
+			sessionsLock.Unlock()
+			if updateList != nil {
+				updateList()
+			}
+		},
+		onClosed: func() {
+			if pendingRefresh {
+				pendingRefresh = false
+				if updateList != nil {
+					updateList()
+				}
+			}
+		},
+	})
 
 	activateMatch := func(m sessionSearchMatch) {
 		searchWin.Close()
@@ -2756,6 +3048,16 @@ func (w *Window) openSessionSearchDialog() {
 	escCtrl := gtk.NewEventControllerKey()
 	escCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	escCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
+		if searchWin.VisibleDialog() != nil {
+			return false
+		}
+		if searchMenu != nil && searchMenu.popover != nil && searchMenu.popover.Visible() {
+			if keyval == gdk.KEY_Escape {
+				searchMenu.popover.Popdown()
+				return true
+			}
+			return false
+		}
 		if keyval == gdk.KEY_Escape {
 			searchWin.Close()
 			return true
@@ -2806,7 +3108,11 @@ func (w *Window) openSessionSearchDialog() {
 		}
 	})
 
-	updateList := func() {
+	updateList = func() {
+		if searchMenu != nil && searchMenu.popover != nil && searchMenu.popover.Visible() {
+			pendingRefresh = true
+			return
+		}
 		sessionsLock.Lock()
 		pool := make([]opencode.Session, len(sessionPool))
 		copy(pool, sessionPool)
@@ -2909,6 +3215,14 @@ func (w *Window) openSessionSearchDialog() {
 					timeLabel.SetVAlign(gtk.AlignCenter)
 					rowBox.Append(timeLabel)
 				}
+
+				targetID := m.sess.ID
+				targetTitle := titleText
+				attachContextMenuGestures(row, func(x, y float64) {
+					menuSessID = targetID
+					menuSessTitle = targetTitle
+					searchMenu.openAt(row, x, y)
+				})
 			}
 
 			row.SetChild(rowBox)
@@ -2929,6 +3243,9 @@ func (w *Window) openSessionSearchDialog() {
 			byID[s.ID] = i
 		}
 		for _, s := range incoming {
+			if deletedIDs[s.ID] {
+				continue
+			}
 			if idx, ok := byID[s.ID]; ok {
 				sessionPool[idx] = s
 			} else {
@@ -2940,6 +3257,10 @@ func (w *Window) openSessionSearchDialog() {
 	}
 
 	searchEntry.ConnectSearchChanged(func() {
+		pendingRefresh = false
+		if searchMenu != nil && searchMenu.popover != nil && searchMenu.popover.Visible() {
+			searchMenu.popover.Popdown()
+		}
 		updateList()
 		q := strings.TrimSpace(searchEntry.Text())
 		if q == "" || w.client == nil {
@@ -2958,37 +3279,39 @@ func (w *Window) openSessionSearchDialog() {
 	})
 	updateList()
 
-	gtkutil.Async(w.ctx, func() func() {
-		var (
-			sessions []opencode.Session
-			active   map[string]opencode.ActiveStatus
-			wg       sync.WaitGroup
-		)
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			sessions, _ = w.client.ListSessions(w.ctx, 200)
-		}()
-		go func() {
-			defer wg.Done()
-			active, _ = w.client.ActiveSessions(w.ctx)
-		}()
-		wg.Wait()
-		if len(sessions) == 0 && len(active) == 0 {
-			return func() {}
-		}
-		return func() {
-			if len(active) > 0 {
-				sessionsLock.Lock()
-				activeMap = active
-				sessionsLock.Unlock()
+	if w.client != nil {
+		gtkutil.Async(w.ctx, func() func() {
+			var (
+				sessions []opencode.Session
+				active   map[string]opencode.ActiveStatus
+				wg       sync.WaitGroup
+			)
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				sessions, _ = w.client.ListSessions(w.ctx, 200)
+			}()
+			go func() {
+				defer wg.Done()
+				active, _ = w.client.ActiveSessions(w.ctx)
+			}()
+			wg.Wait()
+			if len(sessions) == 0 && len(active) == 0 {
+				return func() {}
 			}
-			if len(sessions) > 0 {
-				mergeSessions(sessions)
+			return func() {
+				if len(active) > 0 {
+					sessionsLock.Lock()
+					activeMap = active
+					sessionsLock.Unlock()
+				}
+				if len(sessions) > 0 {
+					mergeSessions(sessions)
+				}
+				updateList()
 			}
-			updateList()
-		}
-	})
+		})
+	}
 
 	searchWin.Present()
 	glib.IdleAdd(func() {
@@ -3461,17 +3784,9 @@ func (w *Window) applySessionRename(sessionID, newTitle string) {
 	}
 }
 
-func (w *Window) submitRenameSession() {
-	if w.renameSessionPopover != nil {
-		w.renameSessionPopover.Popdown()
-	}
-	tab := w.currentTab()
-	if tab == nil || w.renameSessionEntry == nil {
-		return
-	}
-	newTitle := strings.TrimSpace(w.renameSessionEntry.Text())
-	sessID := tab.main.session.ID
-	if sessID == "" || newTitle == "" || newTitle == strings.TrimSpace(tab.main.session.Title) {
+func (w *Window) renameSession(sessID, currentTitle, newTitle string) {
+	newTitle = strings.TrimSpace(newTitle)
+	if w == nil || sessID == "" || newTitle == "" || newTitle == strings.TrimSpace(currentTitle) {
 		return
 	}
 	w.applySessionRename(sessID, newTitle)
@@ -3487,6 +3802,74 @@ func (w *Window) submitRenameSession() {
 			}
 		}
 	})
+}
+
+func (w *Window) promptRenameSession(parent gtk.Widgetter, sessID, currentTitle string, onRenamed func(newTitle string)) {
+	if w == nil || sessID == "" {
+		return
+	}
+	if parent == nil && w.ApplicationWindow != nil {
+		parent = w.ApplicationWindow
+	}
+	if parent == nil {
+		return
+	}
+
+	dlg := adw.NewAlertDialog("Rename Session", "")
+	entry := gtk.NewEntry()
+	entry.SetText(currentTitle)
+	entry.SetPlaceholderText("Session name…")
+	entry.SetWidthChars(28)
+	entry.SetHExpand(true)
+	dlg.SetExtraChild(entry)
+
+	dlg.AddResponse("cancel", "Cancel")
+	dlg.AddResponse("rename", "Rename")
+	dlg.SetResponseAppearance("rename", adw.ResponseSuggested)
+	dlg.SetDefaultResponse("rename")
+	dlg.SetCloseResponse("cancel")
+
+	submitted := false
+	submit := func() {
+		if submitted {
+			return
+		}
+		newTitle := strings.TrimSpace(entry.Text())
+		if newTitle == "" || newTitle == strings.TrimSpace(currentTitle) {
+			return
+		}
+		submitted = true
+		w.renameSession(sessID, currentTitle, newTitle)
+		if onRenamed != nil {
+			onRenamed(newTitle)
+		}
+	}
+
+	entry.ConnectActivate(func() {
+		submit()
+		dlg.Close()
+	})
+	dlg.ConnectResponse(func(response string) {
+		if response == "rename" {
+			submit()
+		}
+	})
+	dlg.Present(parent)
+	glib.IdleAdd(func() {
+		entry.GrabFocus()
+		entry.SelectRegion(0, -1)
+	})
+}
+
+func (w *Window) submitRenameSession() {
+	if w.renameSessionPopover != nil {
+		w.renameSessionPopover.Popdown()
+	}
+	tab := w.currentTab()
+	if tab == nil || w.renameSessionEntry == nil {
+		return
+	}
+	w.renameSession(tab.main.session.ID, tab.main.session.Title, w.renameSessionEntry.Text())
 }
 
 func (w *Window) currentRootSessionID() string {
@@ -3688,6 +4071,219 @@ func newProjectHeaderMenuButton(iconName, labelText string) (*gtk.Button, *gtk.L
 
 	btn.SetChild(row)
 	return btn, lbl
+}
+
+type sessionContextMenu struct {
+	popover    *gtk.Popover
+	renameBtn  *gtk.Button
+	copyIDBtn  *gtk.Button
+	archiveBtn *gtk.Button
+	deleteBtn  *gtk.Button
+	onRename   func()
+	onCopyID   func()
+	onArchive  func()
+	onDelete   func()
+	openAt     func(from gtk.Widgetter, x, y float64)
+}
+
+type sessionContextMenuOpts struct {
+	parentWin  gtk.Widgetter
+	onRenamed  func(sessID, newTitle string)
+	onArchived func(sessID string)
+	onDeleted  func(sessID string)
+	onClosed   func()
+}
+
+func attachContextMenuGestures(widget gtk.Widgetter, onTrigger func(x, y float64)) {
+	if widget == nil || onTrigger == nil {
+		return
+	}
+	base := gtk.BaseWidget(widget)
+	rightClick := gtk.NewGestureClick()
+	rightClick.SetButton(3)
+	rightClick.SetPropagationPhase(gtk.PhaseCapture)
+	rightClick.ConnectPressed(func(_ int, x, y float64) {
+		rightClick.SetState(gtk.EventSequenceClaimed)
+		onTrigger(x, y)
+	})
+	base.AddController(rightClick)
+
+	longPress := gtk.NewGestureLongPress()
+	longPress.SetTouchOnly(false)
+	longPress.SetPropagationPhase(gtk.PhaseCapture)
+	longPress.ConnectPressed(func(x, y float64) {
+		longPress.SetState(gtk.EventSequenceClaimed)
+		onTrigger(x, y)
+	})
+	base.AddController(longPress)
+}
+
+func (w *Window) newSessionContextMenu(anchor gtk.Widgetter, getTarget func() (sessID, title string), opts sessionContextMenuOpts) *sessionContextMenu {
+	menuBox := gtk.NewBox(gtk.OrientationVertical, 2)
+	menuBox.AddCSSClass("glup-popover-content")
+	menuBox.AddCSSClass("glup-project-menu")
+
+	popover := gtk.NewPopover()
+	popover.SetHasArrow(true)
+	popover.SetAutohide(true)
+	popover.SetPosition(gtk.PosBottom)
+	popover.SetChild(menuBox)
+	if anchor != nil {
+		baseAnchor := gtk.BaseWidget(anchor)
+		popover.SetParent(baseAnchor)
+		baseAnchor.ConnectDestroy(func() {
+			if popover.Parent() != nil {
+				popover.Unparent()
+			}
+		})
+	}
+	if opts.onClosed != nil {
+		popover.ConnectClosed(opts.onClosed)
+	}
+
+	onRename := func() {
+		popover.Popdown()
+		if getTarget == nil {
+			return
+		}
+		sessID, title := getTarget()
+		if sessID == "" {
+			return
+		}
+		w.promptRenameSession(opts.parentWin, sessID, title, func(newTitle string) {
+			if opts.onRenamed != nil {
+				opts.onRenamed(sessID, newTitle)
+			}
+		})
+	}
+	renameBtn, _ := newProjectHeaderMenuButton("document-edit-symbolic", "Rename Session…")
+	renameBtn.ConnectClicked(onRename)
+	menuBox.Append(renameBtn)
+
+	onCopyID := func() {
+		popover.Popdown()
+		if getTarget == nil {
+			return
+		}
+		sessID, _ := getTarget()
+		if sessID != "" {
+			w.copyTextToClipboard(sessID)
+		}
+	}
+	copyIDBtn, _ := newProjectHeaderMenuButton("edit-copy-symbolic", "Copy Session ID")
+	copyIDBtn.ConnectClicked(onCopyID)
+	menuBox.Append(copyIDBtn)
+
+	onArchive := func() {
+		popover.Popdown()
+		if getTarget == nil {
+			return
+		}
+		sessID, _ := getTarget()
+		if sessID == "" {
+			return
+		}
+		w.archiveSession(sessID)
+		if opts.onArchived != nil {
+			opts.onArchived(sessID)
+		}
+	}
+	archiveBtn, _ := newProjectHeaderMenuButton("window-close-symbolic", "Archive Session")
+	archiveBtn.ConnectClicked(onArchive)
+	menuBox.Append(archiveBtn)
+
+	menuSep := gtk.NewSeparator(gtk.OrientationHorizontal)
+	menuSep.SetMarginTop(3)
+	menuSep.SetMarginBottom(3)
+	menuBox.Append(menuSep)
+
+	onDelete := func() {
+		popover.Popdown()
+		if getTarget == nil {
+			return
+		}
+		sessID, title := getTarget()
+		if sessID == "" {
+			return
+		}
+		w.promptDeleteSession(opts.parentWin, sessID, title, func(deletedID string) {
+			if opts.onDeleted != nil {
+				opts.onDeleted(deletedID)
+			}
+		})
+	}
+	deleteBtn, _ := newProjectHeaderMenuButton("user-trash-symbolic", "Delete Session…")
+	deleteBtn.AddCSSClass("glup-project-menu-item-danger")
+	deleteBtn.ConnectClicked(onDelete)
+	menuBox.Append(deleteBtn)
+
+	m := &sessionContextMenu{
+		popover:    popover,
+		renameBtn:  renameBtn,
+		copyIDBtn:  copyIDBtn,
+		archiveBtn: archiveBtn,
+		deleteBtn:  deleteBtn,
+		onRename:   onRename,
+		onCopyID:   onCopyID,
+		onArchive:  onArchive,
+		onDelete:   onDelete,
+	}
+	m.openAt = func(from gtk.Widgetter, x, y float64) {
+		if getTarget == nil {
+			return
+		}
+		sessID, _ := getTarget()
+		if sessID == "" {
+			return
+		}
+		archiveBtn.SetVisible(!w.archivedSessions[sessID])
+		if anchor == nil {
+			return
+		}
+		baseAnchor := gtk.BaseWidget(anchor)
+		if x > 0 || y > 0 {
+			px, py := float32(x), float32(y)
+			if from != nil {
+				baseFrom := gtk.BaseWidget(from)
+				if baseFrom.Object.Native() != baseAnchor.Object.Native() {
+					if pt, ok := baseFrom.ComputePoint(baseAnchor, graphene.NewPointAlloc().Init(px, py)); ok {
+						px, py = pt.X(), pt.Y()
+					}
+				}
+			}
+			rect := gdk.NewRectangle(int(math.Round(float64(px))), int(math.Round(float64(py))), 1, 1)
+			popover.SetPointingTo(&rect)
+		} else {
+			popover.SetPointingTo(nil)
+		}
+		if baseAnchor.Root() != nil {
+			popover.Popup()
+		}
+	}
+	return m
+}
+
+func (w *Window) setupHeaderSessionContextMenu() {
+	if w == nil || w.windowTitleBtn == nil || w.headerTitleStack == nil || w.headerSessionMenu != nil {
+		return
+	}
+	menu := w.newSessionContextMenu(w.headerTitleStack, func() (string, string) {
+		tab := w.currentTab()
+		if tab == nil || tab.main == nil || tab.main.session.ID == "" {
+			return "", ""
+		}
+		return tab.main.session.ID, tab.Title()
+	}, sessionContextMenuOpts{})
+	w.headerSessionMenu = menu
+	attachContextMenuGestures(w.windowTitleBtn, func(x, y float64) {
+		if w.currentTab() == nil {
+			return
+		}
+		if w.renameSessionPopover != nil && w.renameSessionPopover.Visible() {
+			w.renameSessionPopover.Popdown()
+		}
+		menu.openAt(w.windowTitleBtn, x, y)
+	})
 }
 
 func (w *Window) openProjectInFiles(rawDir string) {
@@ -4862,6 +5458,20 @@ func (w *Window) buildConversationRow(sessID string, tab *sessionTab) *switcherI
 	row.AddController(motion)
 	w.attachProjectDropTarget(row)
 
+	menu := w.newSessionContextMenu(row, func() (string, string) {
+		id := w.sidebarRowSessID[rp]
+		if id == "" {
+			return "", ""
+		}
+		if t := w.tabs[id]; t != nil {
+			return id, t.Title()
+		}
+		return id, w.lookupCachedSessionTitle(id)
+	}, sessionContextMenuOpts{})
+	attachContextMenuGestures(row, func(x, y float64) {
+		menu.openAt(row, x, y)
+	})
+
 	return &switcherIndicator{
 		row:          row,
 		hBox:         hBox,
@@ -4873,6 +5483,7 @@ func (w *Window) buildConversationRow(sessID string, tab *sessionTab) *switcherI
 		box:          suffixBox,
 		label:        label,
 		closeBtn:     closeBtn,
+		menu:         menu,
 		rowPtr:       rp,
 	}
 }
@@ -5106,6 +5717,11 @@ func (w *Window) syncSidebar() {
 	}
 	for _, row := range toRemove {
 		delete(w.hoveredRow, row.Object.Native())
+		if sid := w.sidebarRowSessID[row.Object.Native()]; sid != "" {
+			if t := w.tabs[sid]; t != nil && t.sidebarIndicator != nil && t.sidebarIndicator.menu != nil && t.sidebarIndicator.menu.popover != nil {
+				t.sidebarIndicator.menu.popover.Popdown()
+			}
+		}
 		unselectIfSelected(row)
 		w.sidebarList.Remove(row)
 	}
@@ -5121,6 +5737,11 @@ func (w *Window) syncSidebar() {
 			if child := desired.Child(); child != nil {
 				if hw := w.headerWidgets[gtk.BaseWidget(child).Object.Native()]; hw != nil && hw.popover != nil {
 					hw.popover.Popdown()
+				}
+			}
+			if sid := w.sidebarRowSessID[desired.Object.Native()]; sid != "" {
+				if t := w.tabs[sid]; t != nil && t.sidebarIndicator != nil && t.sidebarIndicator.menu != nil && t.sidebarIndicator.menu.popover != nil {
+					t.sidebarIndicator.menu.popover.Popdown()
 				}
 			}
 			unselectIfSelected(desired)
@@ -6404,6 +7025,12 @@ func (w *Window) onVisibleTabChanged() {
 	if w.populating {
 		return
 	}
+	if w.headerSessionMenu != nil && w.headerSessionMenu.popover != nil && w.headerSessionMenu.popover.Visible() {
+		w.headerSessionMenu.popover.Popdown()
+	}
+	if w.renameSessionPopover != nil && w.renameSessionPopover.Visible() {
+		w.renameSessionPopover.Popdown()
+	}
 	prevRoot := w.shownRoot
 	w.noteVisibleRoot()
 	if prevRoot != "" && prevRoot != w.currentRootSessionID() {
@@ -7208,8 +7835,9 @@ func (w *Window) buildMessageWidget(tab *sessionTab, conv *convTimeline, msg ope
 		if msg.ID != "" {
 			msgID := msg.ID
 			msgText := msg.Text
+			msgFiles := slices.Clone(msg.Files)
 			uw.SetOnUndo(func() {
-				w.promptRevertToMessage(tab, conv, msgID, msgText)
+				w.promptRevertToMessage(tab, conv, msgID, msgText, msgFiles)
 			})
 		}
 		return uw
@@ -7408,12 +8036,19 @@ func (w *Window) reconcileTail(sessionID string) {
 					if matched != nil {
 						msgID := msg.ID
 						msgText := msg.Text
+						msgFiles := slices.Clone(msg.Files)
+						if len(msgFiles) == 0 && len(matched.files) > 0 {
+							msgFiles = slices.Clone(matched.files)
+							if insertIdx >= 0 && insertIdx < len(conv.messages) && conv.messages[insertIdx].ID == msgID {
+								conv.messages[insertIdx].Files = slices.Clone(matched.files)
+							}
+						}
 						matched.attached = false
 						if matched.widget != nil {
 							matched.widget.SetWaiting(false, "")
 							conv.messageWidgets[msgID] = matched.widget
 							matched.widget.SetOnUndo(func() {
-								w.promptRevertToMessage(tab, conv, msgID, msgText)
+								w.promptRevertToMessage(tab, conv, msgID, msgText, msgFiles)
 							})
 							conv.timelineBox.ReorderChildAfter(matched.widget, findPrevWidget(insertIdx))
 						}
@@ -9452,12 +10087,13 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 			if conv.seenMsgIDs[item.ID] {
 				msgID := item.ID
 				msgText := p.text
+				msgFiles := slices.Clone(p.files)
 				p.attached = false
 				if p.widget != nil {
 					p.widget.SetWaiting(false, "")
 					conv.messageWidgets[msgID] = p.widget
 					p.widget.SetOnUndo(func() {
-						w.promptRevertToMessage(tab, conv, msgID, msgText)
+						w.promptRevertToMessage(tab, conv, msgID, msgText, msgFiles)
 					})
 				}
 				for i, cur := range conv.pendingPrompts {
@@ -10199,6 +10835,9 @@ func mergeAuthoritativeMessage(msgs []opencode.Message, msg opencode.Message) {
 		if len(msg.Content) > 0 {
 			msgs[i].Content = msg.Content
 		}
+		if len(msg.Files) > 0 && len(msgs[i].Files) == 0 {
+			msgs[i].Files = slices.Clone(msg.Files)
+		}
 		if msg.Snapshot != nil {
 			msgs[i].Snapshot = msg.Snapshot
 		}
@@ -10781,15 +11420,15 @@ func (w *Window) undoLastMessage(tab *sessionTab, conv *convTimeline) {
 	if targetMsg == nil {
 		return
 	}
-	w.stageRevertToMessage(tab, conv, targetMsg.ID, targetMsg.Text, true)
+	w.stageRevertToMessage(tab, conv, targetMsg.ID, targetMsg.Text, targetMsg.Files, true)
 }
 
-func (w *Window) promptRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string) {
+func (w *Window) promptRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string, files []opencode.FileAttachment) {
 	if conv == nil || conv.session.ID == "" || messageID == "" {
 		return
 	}
 	if w.ApplicationWindow == nil {
-		w.stageRevertToMessage(tab, conv, messageID, messageText, true)
+		w.stageRevertToMessage(tab, conv, messageID, messageText, files, true)
 		return
 	}
 
@@ -10814,7 +11453,7 @@ func (w *Window) promptRevertToMessage(tab *sessionTab, conv *convTimeline, mess
 
 	dlg.ConnectResponse(func(response string) {
 		if response == "revert" {
-			w.stageRevertToMessage(tab, conv, messageID, messageText, rollbackCheck.Active())
+			w.stageRevertToMessage(tab, conv, messageID, messageText, files, rollbackCheck.Active())
 		}
 	})
 	dlg.Present(w.ApplicationWindow)
@@ -10859,14 +11498,14 @@ func (w *Window) compactCurrentSession(tab *sessionTab, conv *convTimeline) {
 	})
 }
 
-func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string, revertFiles bool) {
+func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messageID, messageText string, files []opencode.FileAttachment, revertFiles bool) {
 	if conv == nil || conv.session.ID == "" || messageID == "" {
 		return
 	}
 	sessionID := conv.session.ID
 
-	if messageText != "" {
-		w.restoreDraft(sessionID, messageText, nil)
+	if messageText != "" || len(files) > 0 {
+		w.restoreDraft(sessionID, messageText, files)
 	}
 
 	gtkutil.Async(w.ctx, func() func() {
@@ -11201,8 +11840,20 @@ func (w *Window) effectiveEscStopTimeoutMS() uint {
 }
 
 func (w *Window) hasVisibleComposerPopover() bool {
+	if w.ApplicationWindow != nil && w.ApplicationWindow.VisibleDialog() != nil {
+		return true
+	}
 	for _, pop := range []*gtk.Popover{w.agentPopover, w.modelPopover, w.variantPopover, w.renameSessionPopover} {
 		if pop != nil && pop.Visible() {
+			return true
+		}
+	}
+	if w.headerSessionMenu != nil && w.headerSessionMenu.popover != nil && w.headerSessionMenu.popover.Visible() {
+		return true
+	}
+	for _, tab := range w.tabs {
+		if tab != nil && tab.sidebarIndicator != nil && tab.sidebarIndicator.menu != nil &&
+			tab.sidebarIndicator.menu.popover != nil && tab.sidebarIndicator.menu.popover.Visible() {
 			return true
 		}
 	}
@@ -11799,152 +12450,7 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.deleted":
 		var d opencode.SessionCreatedEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
-			delID := d.SessionID
-			if parentID, ok := w.childToRoot[delID]; ok {
-				delete(w.childToRoot, delID)
-				delete(w.resolvedSessionTitles, delID)
-				w.deleteDraft(delID)
-				if parentTab, ok := w.tabs[parentID]; ok {
-					filtered := parentTab.subagents[:0]
-					for _, s := range parentTab.subagents {
-						if s.ID != delID {
-							filtered = append(filtered, s)
-						}
-					}
-					parentTab.subagents = filtered
-					if parentTab.activeSubID == delID {
-						w.closeSubagent(parentTab)
-					}
-					if subConv, ok := parentTab.subTimelines[delID]; ok {
-						subConv.closeStreams()
-						delete(parentTab.subTimelines, delID)
-					}
-					w.refreshTabActionAttention(parentTab)
-					w.maybeScheduleRootTurnCompletion(parentTab)
-					if w.currentTab() == parentTab {
-						w.updateBottomBar(parentTab)
-						w.rebuildSubagentList(parentTab)
-					}
-				}
-			} else {
-				var normDir string
-				allFiltered := w.allSessions[:0]
-				for _, s := range w.allSessions {
-					if s.ID == delID {
-						if normDir == "" {
-							normDir = normalizeProjectDir(s.Location.Directory)
-						}
-						continue
-					}
-					allFiltered = append(allFiltered, s)
-				}
-				w.allSessions = allFiltered
-
-				if tab, ok := w.tabs[delID]; ok && normDir == "" && tab.main != nil {
-					normDir = normalizeProjectDir(tab.main.session.Location.Directory)
-				}
-				if w.projectSessions != nil {
-					for dir, list := range w.projectSessions {
-						filtered := list[:0]
-						removed := false
-						for _, s := range list {
-							if s.ID == delID {
-								removed = true
-								if normDir == "" {
-									normDir = dir
-								}
-								continue
-							}
-							filtered = append(filtered, s)
-						}
-						if removed {
-							if len(filtered) == 0 {
-								delete(w.projectSessions, dir)
-							} else {
-								w.projectSessions[dir] = filtered
-							}
-						}
-					}
-				}
-				stateDirty := false
-				if w.visibleSessions[delID] {
-					delete(w.visibleSessions, delID)
-					stateDirty = true
-				}
-				if w.archivedSessions[delID] {
-					delete(w.archivedSessions, delID)
-					stateDirty = true
-				}
-				if stateDirty {
-					w.saveState()
-				}
-
-				if tab, ok := w.tabs[delID]; ok {
-					wasCurrent := (w.currentRootSessionID() == delID)
-					var nextID string
-					if wasCurrent {
-						nextID = w.nextVisibleTabID(delID, normDir, nil)
-					}
-
-					prevPopulating := w.populating
-					w.populating = true
-					w.deleteSessionDraftsForTab(delID, tab)
-					w.cancelCompletionSettle(tab)
-					tab.main.closeStreams()
-					for subID, c := range tab.subTimelines {
-						c.closeStreams()
-						delete(w.childToRoot, subID)
-					}
-					for _, sub := range tab.subagents {
-						delete(w.childToRoot, sub.ID)
-					}
-					w.cleanupTabSidebarState(tab)
-					if w.viewStack != nil && tab.stack != nil {
-						w.viewStack.Remove(tab.stack)
-					}
-					delete(w.tabs, delID)
-					if idx := slices.Index(w.tabOrder, delID); idx >= 0 {
-						w.tabOrder = slices.Delete(w.tabOrder, idx, idx+1)
-					}
-					if normDir != "" && w.projectSessions != nil && !w.expandedProjects[normDir] {
-						maxVis := w.effectiveMaxVisibleSessions()
-						openCount := 0
-						for _, id := range w.tabOrder {
-							if t := w.tabs[id]; t != nil && t.main != nil && normalizeProjectDir(t.main.session.Location.Directory) == normDir {
-								openCount++
-							}
-						}
-						for _, candidate := range w.projectSessions[normDir] {
-							if openCount >= maxVis {
-								break
-							}
-							if _, exists := w.tabs[candidate.ID]; !exists {
-								w.ensureSessionTab(candidate)
-								openCount++
-							}
-						}
-					}
-					if wasCurrent && nextID == "" {
-						nextID = w.nextVisibleTabID(delID, normDir, nil)
-					}
-					w.populating = prevPopulating
-
-					if wasCurrent {
-						if nextID != "" && w.viewStack != nil {
-							w.viewStack.SetVisibleChildName(nextID)
-						}
-						w.onVisibleTabChanged()
-					} else {
-						w.updateWindowManagerTitle()
-					}
-				} else {
-					w.deleteSessionDraftsForTab(delID, nil)
-				}
-				w.withdrawSessionNotifications(delID)
-				w.pruneSessionAuxiliaryState(delID, nil)
-				delete(w.lastViewAcked, delID)
-				w.syncSidebar()
-			}
+			w.applySessionDeleted(d.SessionID)
 		}
 
 	case "session.execution.started":

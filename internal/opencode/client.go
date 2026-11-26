@@ -461,6 +461,12 @@ func (c *Client) RenameSession(ctx context.Context, sessionID, title string) err
 	return c.doJSON(ctx, http.MethodPatch, path, body, nil)
 }
 
+// DeleteSession permanently deletes a session and its child sessions (DELETE /api/session/{sessionID}).
+func (c *Client) DeleteSession(ctx context.Context, sessionID string) error {
+	path := fmt.Sprintf("/api/session/%s", url.PathEscape(sessionID))
+	return c.doJSON(ctx, http.MethodDelete, path, nil, nil)
+}
+
 // MoveSession moves a session to a different working directory (POST /api/session/{sessionID}/move).
 func (c *Client) MoveSession(ctx context.Context, sessionID, directory string) error {
 	path := fmt.Sprintf("/api/session/%s/move", url.PathEscape(sessionID))
