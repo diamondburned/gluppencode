@@ -2794,9 +2794,9 @@ func NewModelSwitchedWidget(msg opencode.Message) *AgentSwitchedWidget {
 
 	var text string
 	if msg.PreviousModel != nil && msg.PreviousModel.ID != "" {
-		text = fmt.Sprintf("Switched model from %s to %s", msg.PreviousModel.String(), msg.Model.String())
+		text = fmt.Sprintf("Switched model from %s to %s", msg.PreviousModel.DisplayString(), msg.Model.DisplayString())
 	} else {
-		text = fmt.Sprintf("Switched model to %s", msg.Model.String())
+		text = fmt.Sprintf("Switched model to %s", msg.Model.DisplayString())
 	}
 
 	lbl := gtk.NewLabel(text)

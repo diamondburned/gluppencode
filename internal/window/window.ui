@@ -457,6 +457,52 @@
                                   </object>
                                 </child>
                                 <child>
+                                  <object class="GtkMenuButton" id="composerVariantBtn">
+                                    <property name="direction">up</property>
+                                    <property name="valign">center</property>
+                                    <property name="visible">false</property>
+                                    <property name="tooltip-text">Select Thinking Variant (Ctrl+T)</property>
+                                    <style>
+                                      <class name="flat"/>
+                                      <class name="glup-composer-selector-btn"/>
+                                    </style>
+                                    <property name="popover">
+                                      <object class="GtkPopover" id="variantPopover">
+                                        <property name="position">top</property>
+                                        <property name="has-arrow">false</property>
+                                        <property name="child">
+                                          <object class="GtkBox">
+                                            <property name="orientation">vertical</property>
+                                            <property name="spacing">8</property>
+                                            <property name="width-request">200</property>
+                                            <style>
+                                              <class name="glup-popover-content"/>
+                                            </style>
+                                            <child>
+                                              <object class="GtkListBox" id="variantListBox">
+                                                <property name="selection-mode">single</property>
+                                                <style>
+                                                  <class name="boxed-list"/>
+                                                </style>
+                                              </object>
+                                            </child>
+                                          </object>
+                                        </property>
+                                      </object>
+                                    </property>
+                                    <property name="child">
+                                      <object class="GtkLabel" id="variantStatusLabel">
+                                        <property name="label">Default</property>
+                                        <property name="valign">center</property>
+                                        <property name="ellipsize">end</property>
+                                        <style>
+                                          <class name="glup-variant-status-label"/>
+                                        </style>
+                                      </object>
+                                    </property>
+                                  </object>
+                                </child>
+                                <child>
                                   <object class="GtkBox">
                                     <property name="hexpand">true</property>
                                   </object>

@@ -543,11 +543,14 @@ func TestClientEndpointsSynctest(t *testing.T) {
 						}
 						return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
 					case req.Method == http.MethodGet && req.URL.Path == "/api/model":
-						respBody = `{"location":{"directory":"/workspace"},"data":[{"id":"gemini-4","modelID":"gemini-4","providerID":"google","name":"Gemini 4","family":"gemini","type":"chat","status":"active","enabled":true,"limit":{"context":1000000,"input":900000,"output":65536}}]}`
+						respBody = `{"location":{"directory":"/workspace"},"data":[{"id":"gemini-4","modelID":"gemini-4","providerID":"google","name":"Gemini 4","family":"gemini","type":"chat","status":"active","enabled":true,"variants":[{"id":"low"},{"id":"high"},{"id":"xhigh"}],"limit":{"context":1000000,"input":900000,"output":65536}}]}`
 					case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/model":
 						b, _ := io.ReadAll(req.Body)
 						if !strings.Contains(string(b), `"providerID":"google"`) {
 							t.Errorf("SwitchModel body = %s", string(b))
+						}
+						if strings.Contains(string(b), `"variant":"default"`) {
+							t.Errorf("SwitchModel must omit default variant, got %s", string(b))
 						}
 						return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
 					case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_123/move":
@@ -613,9 +616,20 @@ func TestClientEndpointsSynctest(t *testing.T) {
 		if len(models) != 1 || models[0].Limit.Context != 1000000 {
 			t.Errorf("ListModels = %+v", models)
 		}
+		if got := models[0].VariantIDs(); len(got) != 3 || got[0] != "low" || got[1] != "high" || got[2] != "xhigh" {
+			t.Errorf("VariantIDs = %v, want [low high xhigh]", got)
+		}
+		if !models[0].HasVariant("high") || models[0].HasVariant("default") || models[0].HasVariant("bogus") {
+			t.Errorf("HasVariant unexpected results on %+v", models[0].Variants)
+		}
 
 		if err := client.SwitchModel(ctx, "ses_123", models[0].Ref()); err != nil {
 			t.Fatalf("SwitchModel: %v", err)
+		}
+		withDefault := models[0].Ref()
+		withDefault.Variant = "default"
+		if err := client.SwitchModel(ctx, "ses_123", withDefault); err != nil {
+			t.Fatalf("SwitchModel(default): %v", err)
 		}
 
 		if err := client.MoveSession(ctx, "ses_123", "/workspace/sub"); err != nil {
@@ -659,6 +673,114 @@ func TestClientEndpointsSynctest(t *testing.T) {
 			t.Errorf("SessionDiffTurn = %+v", turnDiffs)
 		}
 	})
+}
+
+func TestModelVariantsAndSwitchPayload(t *testing.T) {
+	t.Parallel()
+
+	ref := ModelRef{ProviderID: "hackadoll3", ID: "inkling-2-mini-unbound", Variant: "xhigh"}
+	if ref.String() != "hackadoll3/inkling-2-mini-unbound" {
+		t.Fatalf("String() = %q", ref.String())
+	}
+	if ref.DisplayString() != "hackadoll3/inkling-2-mini-unbound (xhigh)" {
+		t.Fatalf("DisplayString() = %q", ref.DisplayString())
+	}
+	if (ModelRef{ProviderID: "hackadoll3", ID: "inkling-2-mini-unbound", Variant: "default"}).DisplayString() != "hackadoll3/inkling-2-mini-unbound" {
+		t.Fatalf("DisplayString() for default should omit variant")
+	}
+
+	var switchBodies []string
+	var createBodies []string
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var b []byte
+				if req.Body != nil {
+					b, _ = io.ReadAll(req.Body)
+				}
+				switch {
+				case req.Method == http.MethodGet && req.URL.Path == "/api/model":
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body: io.NopCloser(strings.NewReader(`{"data":[` +
+							`{"id":"inkling-2-mini-unbound","providerID":"hackadoll3","name":"Inkling 2 Mini","variants":[{"id":"low"},{"id":"high"},{"id":"xhigh"},{"id":"off"}]},` +
+							`{"id":"plain","providerID":"openai","name":"Plain"}` +
+							`]}`)),
+					}, nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session/ses_v1/model":
+					switchBodies = append(switchBodies, string(b))
+					return &http.Response{StatusCode: http.StatusNoContent, Body: io.NopCloser(strings.NewReader(""))}, nil
+				case req.Method == http.MethodPost && req.URL.Path == "/api/session":
+					createBodies = append(createBodies, string(b))
+					return &http.Response{
+						StatusCode: http.StatusOK,
+						Header:     http.Header{"Content-Type": []string{"application/json"}},
+						Body:       io.NopCloser(strings.NewReader(`{"data":{"id":"ses_v_new"}}`)),
+					}, nil
+				default:
+					return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader("not found"))}, nil
+				}
+			}),
+		},
+	}
+
+	ctx := t.Context()
+	models, err := client.ListModels(ctx)
+	if err != nil {
+		t.Fatalf("ListModels: %v", err)
+	}
+	if len(models) != 2 {
+		t.Fatalf("len(models) = %d, want 2", len(models))
+	}
+	if got := models[0].VariantIDs(); len(got) != 4 || got[0] != "low" || got[3] != "off" {
+		t.Fatalf("models[0].VariantIDs() = %v", got)
+	}
+	if len(models[1].VariantIDs()) != 0 {
+		t.Fatalf("models[1].VariantIDs() = %v, want empty", models[1].VariantIDs())
+	}
+
+	m := models[0].Ref()
+	m.Variant = "xhigh"
+	if err := client.SwitchModel(ctx, "ses_v1", m); err != nil {
+		t.Fatalf("SwitchModel(xhigh): %v", err)
+	}
+	m.Variant = "default"
+	if err := client.SwitchModel(ctx, "ses_v1", m); err != nil {
+		t.Fatalf("SwitchModel(default): %v", err)
+	}
+	m.Variant = ""
+	if err := client.SwitchModel(ctx, "ses_v1", m); err != nil {
+		t.Fatalf("SwitchModel(empty): %v", err)
+	}
+
+	if len(switchBodies) != 3 {
+		t.Fatalf("got %d switch bodies, want 3", len(switchBodies))
+	}
+	if !strings.Contains(switchBodies[0], `"variant":"xhigh"`) {
+		t.Fatalf("switchBodies[0] = %s, want variant xhigh", switchBodies[0])
+	}
+	if strings.Contains(switchBodies[1], `"variant"`) {
+		t.Fatalf("switchBodies[1] = %s, want variant omitted for default", switchBodies[1])
+	}
+	if strings.Contains(switchBodies[2], `"variant"`) {
+		t.Fatalf("switchBodies[2] = %s, want variant omitted for empty", switchBodies[2])
+	}
+
+	sess, err := client.CreateSessionWithOptions(ctx, CreateSessionRequest{
+		Directory: "/workspace",
+		Model:     &ModelRef{ProviderID: "hackadoll3", ID: "inkling-2-mini-unbound", Variant: "default"},
+	})
+	if err != nil {
+		t.Fatalf("CreateSessionWithOptions: %v", err)
+	}
+	if len(createBodies) != 1 || strings.Contains(createBodies[0], `"variant"`) {
+		t.Fatalf("createBodies = %v, want variant omitted for default", createBodies)
+	}
+	if sess.Model.Variant != "" {
+		t.Fatalf("sess.Model.Variant = %q, want empty", sess.Model.Variant)
+	}
 }
 
 func TestMessageSnapshotUnmarshal(t *testing.T) {

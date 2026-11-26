@@ -5215,3 +5215,310 @@ func TestTurnDiffLazyFetchAndDisplay(t *testing.T) {
 		t.Errorf("expected no extra HTTP requests on cache restore/disable, got %d", finalReqCount)
 	}
 }
+
+func TestModelVariantSelectionPersistenceAndSync(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var mu sync.Mutex
+	var switchModels []opencode.ModelRef
+	var switchRawBodies []string
+	var createdReqs []opencode.CreateSessionRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/session":
+			var req opencode.CreateSessionRequest
+			_ = json.NewDecoder(r.Body).Decode(&req)
+			mu.Lock()
+			createdReqs = append(createdReqs, req)
+			idx := len(createdReqs)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(opencode.Session{
+				ID:       fmt.Sprintf("ses_vnew_%d", idx),
+				Title:    fmt.Sprintf("Variant Session %d", idx),
+				Agent:    req.Agent,
+				Model:    derefOrZeroModel(req.Model),
+				Location: opencode.Location{Directory: "/tmp/proj"},
+			})
+		case "/api/session/ses_v1/model":
+			var body struct {
+				Model opencode.ModelRef `json:"model"`
+			}
+			buf := new(strings.Builder)
+			tmp := make([]byte, 4096)
+			for {
+				n, err := r.Body.Read(tmp)
+				if n > 0 {
+					buf.Write(tmp[:n])
+				}
+				if err != nil {
+					break
+				}
+			}
+			_ = json.Unmarshal([]byte(buf.String()), &body)
+			mu.Lock()
+			switchModels = append(switchModels, body.Model)
+			switchRawBodies = append(switchRawBodies, buf.String())
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+
+	stateFile := filepath.Join(t.TempDir(), "gluppencode.json")
+	coord := newNotificationCoordinator(nil)
+
+	thinkingModel := opencode.ModelInfo{
+		ID:         "inkling-2-mini-unbound",
+		ProviderID: "hackadoll3",
+		Name:       "Inkling 2 Mini",
+		Variants: []opencode.ModelVariant{
+			{ID: "low"},
+			{ID: "high"},
+			{ID: "xhigh"},
+		},
+	}
+	plainModel := opencode.ModelInfo{
+		ID:         "plain-chat",
+		ProviderID: "openai",
+		Name:       "Plain Chat",
+	}
+
+	makeWin := func() *Window {
+		w := &Window{
+			ctx:                t.Context(),
+			client:             &opencode.Client{BaseURL: srv.URL},
+			statePath:          stateFile,
+			viewStack:          adw.NewViewStack(),
+			agentPillLabel:     gtk.NewLabel("Build"),
+			modelStatusLabel:   gtk.NewLabel("Model"),
+			composerVariantBtn: gtk.NewMenuButton(),
+			variantStatusLabel: gtk.NewLabel("Default"),
+			variantPopover:     gtk.NewPopover(),
+			variantListBox:     gtk.NewListBox(),
+			agentListBox:       gtk.NewListBox(),
+			modelListBox:       gtk.NewListBox(),
+			modelSearchEntry:   gtk.NewSearchEntry(),
+			tabs:               make(map[string]*sessionTab),
+			childToRoot:        make(map[string]string),
+			visibleSessions:    make(map[string]bool),
+			archivedSessions:   make(map[string]bool),
+			projectSessions:    make(map[string][]opencode.Session),
+			models:             []opencode.ModelInfo{thinkingModel, plainModel},
+			modelNames: map[string]string{
+				"hackadoll3/inkling-2-mini-unbound": "Inkling 2 Mini",
+				"openai/plain-chat":                 "Plain Chat",
+			},
+			modelVariants: map[string][]string{
+				"hackadoll3/inkling-2-mini-unbound": {"low", "high", "xhigh"},
+				"inkling-2-mini-unbound":            {"low", "high", "xhigh"},
+			},
+			modelLastUsed:      make(map[string]int64),
+			modelLimits:        make(map[string]int),
+			branchCache:        make(map[string]string),
+			savedModelVariants: make(map[string]string),
+			notifyCoord:        coord,
+		}
+		w.composerVariantBtn.SetPopover(w.variantPopover)
+		coord.registerWindow(w)
+		return w
+	}
+
+	win := makeWin()
+	sibling := makeWin()
+
+	// 1. Selecting a model with variants on the empty greeter shows composerVariantBtn and Default.
+	win.selectModelInfo(thinkingModel)
+	if !win.composerVariantBtn.Visible() {
+		t.Fatalf("expected composerVariantBtn visible for model with variants")
+	}
+	if got := win.variantStatusLabel.Label(); got != "Default" {
+		t.Fatalf("variantStatusLabel = %q, want Default", got)
+	}
+	if win.variantStatusLabel.HasCSSClass("glup-variant-active") {
+		t.Fatalf("Default variant should not have glup-variant-active CSS class")
+	}
+
+	// 2. Switching variant on the empty greeter updates label, CSS class, state, and sibling.
+	win.switchVariant("xhigh")
+	if got := win.variantStatusLabel.Label(); got != "xhigh" {
+		t.Fatalf("variantStatusLabel = %q, want xhigh", got)
+	}
+	if !win.variantStatusLabel.HasCSSClass("glup-variant-active") {
+		t.Fatalf("xhigh variant should have glup-variant-active CSS class")
+	}
+	if win.lastSelectedModel.Variant != "xhigh" {
+		t.Fatalf("lastSelectedModel.Variant = %q, want xhigh", win.lastSelectedModel.Variant)
+	}
+	if sibling.lastSelectedModel.Variant != "xhigh" || sibling.variantStatusLabel.Label() != "xhigh" || !sibling.composerVariantBtn.Visible() {
+		t.Fatalf("sibling did not sync variant: model=%+v label=%q visible=%v",
+			sibling.lastSelectedModel, sibling.variantStatusLabel.Label(), sibling.composerVariantBtn.Visible())
+	}
+
+	// 3. Variant popover list starts with Default followed by variants, with checkmark on xhigh.
+	win.rebuildVariantList()
+	if len(win.variantRows) != 4 {
+		t.Fatalf("len(variantRows) = %d, want 4", len(win.variantRows))
+	}
+	if win.variantRows[0].variant != "" || win.variantRows[1].variant != "low" || win.variantRows[3].variant != "xhigh" {
+		t.Fatalf("unexpected variantRows order: %+v", win.variantRows)
+	}
+
+	// 4. Switching to a model without variants hides composerVariantBtn, but preserves savedModelVariants for thinkingModel.
+	win.selectModelInfo(plainModel)
+	if win.composerVariantBtn.Visible() {
+		t.Fatalf("expected composerVariantBtn hidden for model without variants")
+	}
+	if win.lastSelectedModel.Variant != "" {
+		t.Fatalf("plainModel should have empty variant, got %q", win.lastSelectedModel.Variant)
+	}
+	if win.savedModelVariants["hackadoll3/inkling-2-mini-unbound"] != "xhigh" {
+		t.Fatalf("savedModelVariants lost thinkingModel preference: %+v", win.savedModelVariants)
+	}
+
+	// 5. Switching back to thinkingModel restores "xhigh".
+	win.selectModelInfo(thinkingModel)
+	if !win.composerVariantBtn.Visible() || win.variantStatusLabel.Label() != "xhigh" {
+		t.Fatalf("switching back did not restore xhigh: visible=%v label=%q", win.composerVariantBtn.Visible(), win.variantStatusLabel.Label())
+	}
+
+	// 6. Invalid saved variant falls back to Default on selectModelInfo.
+	win.savedModelVariants["hackadoll3/inkling-2-mini-unbound"] = "removed-tier"
+	win.selectModelInfo(thinkingModel)
+	if win.lastSelectedModel.Variant != "" || win.variantStatusLabel.Label() != "Default" {
+		t.Fatalf("invalid saved variant should fall back to Default, got %q / %q", win.lastSelectedModel.Variant, win.variantStatusLabel.Label())
+	}
+
+	// 7. Cycling variants via cycleVariant (Ctrl+T) cycles Default -> low -> high -> xhigh -> Default.
+	wantCycle := []string{"low", "high", "xhigh", ""}
+	for _, want := range wantCycle {
+		if !win.cycleVariant() {
+			t.Fatalf("cycleVariant returned false")
+		}
+		if win.lastSelectedModel.Variant != want {
+			t.Fatalf("after cycleVariant, variant = %q, want %q", win.lastSelectedModel.Variant, want)
+		}
+	}
+
+	// 8. State persistence roundtrip preserves both lastSelectedModel.Variant and per-model savedModelVariants.
+	win.switchVariant("high")
+	reloaded := &Window{
+		ctx:       t.Context(),
+		statePath: stateFile,
+		viewStack: adw.NewViewStack(),
+		tabs:      make(map[string]*sessionTab),
+	}
+	reloaded.loadState()
+	if reloaded.lastSelectedModel.Variant != "high" {
+		t.Fatalf("reloaded.lastSelectedModel.Variant = %q, want high", reloaded.lastSelectedModel.Variant)
+	}
+	if reloaded.savedModelVariants["hackadoll3/inkling-2-mini-unbound"] != "high" {
+		t.Fatalf("reloaded.savedModelVariants = %+v, want high", reloaded.savedModelVariants)
+	}
+
+	// 9. Active session switchVariant POSTs to /api/session/{id}/model, and "default" omits variant.
+	sess := opencode.Session{
+		ID:       "ses_v1",
+		Title:    "Variant Session",
+		Agent:    "build",
+		Model:    opencode.ModelRef{ProviderID: "hackadoll3", ID: "inkling-2-mini-unbound", Variant: "high"},
+		Location: opencode.Location{Directory: "/tmp/proj"},
+	}
+	tab := win.addSessionTab(sess)
+	tab.main.loaded = true
+	win.viewStack.SetVisibleChildName("ses_v1")
+
+	win.switchVariant("low")
+	win.switchVariant("default")
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(switchModels)
+		mu.Unlock()
+		if n >= 2 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	if len(switchModels) != 2 {
+		mu.Unlock()
+		t.Fatalf("expected 2 SwitchModel calls, got %d", len(switchModels))
+	}
+	if switchModels[0].Variant != "low" {
+		mu.Unlock()
+		t.Fatalf("first SwitchModel variant = %q, want low", switchModels[0].Variant)
+	}
+	if switchModels[1].Variant != "" || strings.Contains(switchRawBodies[1], `"variant"`) {
+		mu.Unlock()
+		t.Fatalf("second SwitchModel (default) should omit variant, got %+v raw=%s", switchModels[1], switchRawBodies[1])
+	}
+	mu.Unlock()
+
+	// 10. New session inherits lastSelectedModel.Variant.
+	win.switchVariant("xhigh")
+	win.createNewSessionInDir("/tmp/proj")
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		n := len(createdReqs)
+		mu.Unlock()
+		if n >= 1 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(createdReqs) != 1 || createdReqs[0].Model == nil || createdReqs[0].Model.Variant != "xhigh" {
+		t.Fatalf("CreateSessionRequest.Model = %+v, want variant xhigh", createdReqs)
+	}
+}
+
+func TestModelSwitchedWidgetWithVariants(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	w := NewModelSwitchedWidget(opencode.Message{
+		ID:   "m_sw_1",
+		Type: "model-switched",
+		PreviousModel: &opencode.ModelRef{
+			ProviderID: "hackadoll3",
+			ID:         "inkling-2-mini-unbound",
+			Variant:    "low",
+		},
+		Model: opencode.ModelRef{
+			ProviderID: "hackadoll3",
+			ID:         "inkling-2-mini-unbound",
+			Variant:    "xhigh",
+		},
+	})
+	lbl := w.FirstChild().(*gtk.Label)
+	want := "Switched model from hackadoll3/inkling-2-mini-unbound (low) to hackadoll3/inkling-2-mini-unbound (xhigh)"
+	if got := lbl.Label(); got != want {
+		t.Fatalf("NewModelSwitchedWidget label = %q, want %q", got, want)
+	}
+
+	wDefault := NewModelSwitchedWidget(opencode.Message{
+		ID:   "m_sw_2",
+		Type: "model-switched",
+		Model: opencode.ModelRef{
+			ProviderID: "hackadoll3",
+			ID:         "inkling-2-mini-unbound",
+			Variant:    "default",
+		},
+	})
+	lblDefault := wDefault.FirstChild().(*gtk.Label)
+	if got := lblDefault.Label(); got != "Switched model to hackadoll3/inkling-2-mini-unbound" {
+		t.Fatalf("NewModelSwitchedWidget default label = %q", got)
+	}
+}

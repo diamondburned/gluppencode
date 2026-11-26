@@ -184,6 +184,7 @@ type persistedState struct {
 	SidebarWidth      int                `json:"sidebarWidth,omitempty"`
 	LastSelectedAgent string             `json:"lastSelectedAgent,omitempty"`
 	LastSelectedModel *opencode.ModelRef `json:"lastSelectedModel,omitempty"`
+	ModelVariants     map[string]string  `json:"modelVariants,omitempty"`
 	Greeter           *GreeterProfile    `json:"greeter,omitempty"`
 	Preferences       Preferences        `json:"preferences,omitempty"`
 }
@@ -253,11 +254,20 @@ func loadPersistedState(path string) persistedState {
 	if st.LastSelectedModel != nil {
 		st.LastSelectedModel.ID = strings.TrimSpace(st.LastSelectedModel.ID)
 		st.LastSelectedModel.ProviderID = strings.TrimSpace(st.LastSelectedModel.ProviderID)
-		st.LastSelectedModel.Variant = strings.TrimSpace(st.LastSelectedModel.Variant)
+		st.LastSelectedModel.Variant = opencode.NormalizeVariant(st.LastSelectedModel.Variant)
 		if st.LastSelectedModel.ID == "" {
 			st.LastSelectedModel = nil
 		}
 	}
+	cleanVariants := make(map[string]string, len(st.ModelVariants))
+	for k, v := range st.ModelVariants {
+		k = strings.TrimSpace(k)
+		v = opencode.NormalizeVariant(v)
+		if k != "" && v != "" {
+			cleanVariants[k] = v
+		}
+	}
+	st.ModelVariants = cleanVariants
 	st.Preferences = normalizePreferences(st.Preferences)
 	return st
 }
@@ -297,6 +307,11 @@ func (w *Window) loadState() {
 	} else {
 		w.lastSelectedModel = opencode.ModelRef{}
 	}
+	if st.ModelVariants != nil {
+		w.savedModelVariants = st.ModelVariants
+	} else {
+		w.savedModelVariants = make(map[string]string)
+	}
 	w.greeterProfile = st.Greeter
 	w.prefs = st.Preferences
 	w.applySidebarWidth()
@@ -328,7 +343,19 @@ func (w *Window) saveState() {
 	var lastModel *opencode.ModelRef
 	if w.lastSelectedModel.ID != "" {
 		m := w.lastSelectedModel
+		m.Variant = opencode.NormalizeVariant(m.Variant)
 		lastModel = &m
+	}
+	var savedVariants map[string]string
+	if len(w.savedModelVariants) > 0 {
+		savedVariants = make(map[string]string, len(w.savedModelVariants))
+		for k, v := range w.savedModelVariants {
+			k = strings.TrimSpace(k)
+			v = opencode.NormalizeVariant(v)
+			if k != "" && v != "" {
+				savedVariants[k] = v
+			}
+		}
 	}
 	st := persistedState{
 		VisibleSessions:   visible,
@@ -339,6 +366,7 @@ func (w *Window) saveState() {
 		SidebarWidth:      clampSidebarWidth(w.sidebarWidth),
 		LastSelectedAgent: strings.TrimSpace(w.lastSelectedAgent),
 		LastSelectedModel: lastModel,
+		ModelVariants:     savedVariants,
 		Greeter:           w.greeterProfile,
 		Preferences:       normalizePreferences(w.prefs),
 	}

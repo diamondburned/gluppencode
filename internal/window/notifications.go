@@ -462,17 +462,22 @@ func (c *notificationCoordinator) syncLastSelection(sender *Window, agent string
 	if c == nil {
 		return
 	}
+	model.Variant = opencode.NormalizeVariant(model.Variant)
 	for _, win := range c.windows {
 		if win == nil || win == sender {
 			continue
 		}
 		win.lastSelectedAgent = agent
 		win.lastSelectedModel = model
+		win.setSavedModelVariant(model, model.Variant)
 		if win.currentTab() == nil {
 			win.updateComposerAgentModel(agent, model)
 			win.rebuildAgentPills()
 			if len(win.models) > 0 {
 				win.rebuildModelList()
+			}
+			if win.variantPopover != nil && win.variantPopover.Visible() {
+				win.rebuildVariantList()
 			}
 		}
 	}

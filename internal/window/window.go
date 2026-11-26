@@ -929,6 +929,11 @@ type modelRowData struct {
 	text  string
 }
 
+type variantRowData struct {
+	row     *gtk.ListBoxRow
+	variant string
+}
+
 type subagentRowData struct {
 	row     *gtk.ListBoxRow
 	session opencode.Session
@@ -1000,8 +1005,10 @@ type Window struct {
 	composerPlaceholder *gtk.Label
 	composerAgentBtn    *gtk.MenuButton
 	composerModelBtn    *gtk.MenuButton
+	composerVariantBtn  *gtk.MenuButton
 	agentPopover        *gtk.Popover
 	modelPopover        *gtk.Popover
+	variantPopover      *gtk.Popover
 
 	commands           []opencode.CommandInfo
 	skills             []opencode.SkillInfo
@@ -1009,6 +1016,7 @@ type Window struct {
 
 	agentPillLabel      *gtk.Label
 	modelStatusLabel    *gtk.Label
+	variantStatusLabel  *gtk.Label
 	projectStatusBox    *gtk.Box
 	projectStatusLabel  *gtk.Label
 	branchStatusBox     *gtk.Box
@@ -1050,6 +1058,7 @@ type Window struct {
 	agentListBox          *gtk.ListBox
 	modelSearchEntry      *gtk.SearchEntry
 	modelListBox          *gtk.ListBox
+	variantListBox        *gtk.ListBox
 
 	activeShells      map[string]opencode.ShellItem
 	shellsLoaded      bool // a refreshShells listing has succeeded for every directory
@@ -1077,6 +1086,8 @@ type Window struct {
 	models         []opencode.ModelInfo
 	modelNames     map[string]string
 	modelRows      []modelRowData
+	variantRows    []variantRowData
+	modelVariants  map[string][]string
 	subagentRows   []subagentRowData
 	modelLimits    map[string]int
 	branchCache    map[string]string
@@ -1084,6 +1095,7 @@ type Window struct {
 	modelLastUsed      map[string]int64
 	lastSelectedAgent  string
 	lastSelectedModel  opencode.ModelRef
+	savedModelVariants map[string]string
 	showAllModels      bool
 	showAllModelsRow   *gtk.ListBoxRow
 	showAllModelsLabel *gtk.Label
@@ -1235,10 +1247,13 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		composerPlaceholder:   builder.GetObject("composerPlaceholder").Cast().(*gtk.Label),
 		composerAgentBtn:      builder.GetObject("composerAgentBtn").Cast().(*gtk.MenuButton),
 		composerModelBtn:      builder.GetObject("composerModelBtn").Cast().(*gtk.MenuButton),
+		composerVariantBtn:    builder.GetObject("composerVariantBtn").Cast().(*gtk.MenuButton),
 		agentPopover:          builder.GetObject("agentPopover").Cast().(*gtk.Popover),
 		modelPopover:          builder.GetObject("modelPopover").Cast().(*gtk.Popover),
+		variantPopover:        builder.GetObject("variantPopover").Cast().(*gtk.Popover),
 		agentPillLabel:        builder.GetObject("agentPillLabel").Cast().(*gtk.Label),
 		modelStatusLabel:      builder.GetObject("modelStatusLabel").Cast().(*gtk.Label),
+		variantStatusLabel:    builder.GetObject("variantStatusLabel").Cast().(*gtk.Label),
 		projectStatusBox:      builder.GetObject("projectStatusBox").Cast().(*gtk.Box),
 		projectStatusLabel:    builder.GetObject("projectStatusLabel").Cast().(*gtk.Label),
 		branchStatusBox:       builder.GetObject("branchStatusBox").Cast().(*gtk.Box),
@@ -1278,12 +1293,15 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		agentListBox:          builder.GetObject("agentListBox").Cast().(*gtk.ListBox),
 		modelSearchEntry:      builder.GetObject("modelSearchEntry").Cast().(*gtk.SearchEntry),
 		modelListBox:          builder.GetObject("modelListBox").Cast().(*gtk.ListBox),
+		variantListBox:        builder.GetObject("variantListBox").Cast().(*gtk.ListBox),
 		tabs:                  make(map[string]*sessionTab),
 		childToRoot:           make(map[string]string),
 		modelNames:            make(map[string]string),
+		modelVariants:         make(map[string][]string),
 		modelLimits:           make(map[string]int),
 		branchCache:           make(map[string]string),
 		modelLastUsed:         make(map[string]int64),
+		savedModelVariants:    make(map[string]string),
 		expandedProjects:      make(map[string]bool),
 		collapsedProjects:     make(map[string]bool),
 		visibleSessions:       make(map[string]bool),
@@ -1368,6 +1386,9 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.showAllModels = false
 		w.modelSearchEntry.SetText("")
 		w.filterModelList("")
+	})
+	w.variantPopover.ConnectMap(func() {
+		w.rebuildVariantList()
 	})
 	w.inputView.SetWrapMode(gtk.WrapWordChar)
 	w.inputView.SetAcceptsTab(true)
@@ -1474,7 +1495,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		w.setTakeCharge(w.takeChargeBtn.Active())
 	})
 
-	// Window-level shortcuts: Ctrl+, for Preferences, Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background.
+	// Window-level shortcuts: Ctrl+, for Preferences, Ctrl+Shift+N for New Window, Ctrl+K for Search Sessions, Ctrl+B to Background, Ctrl+T to cycle Variant.
 	winKeyCtrl := gtk.NewEventControllerKey()
 	winKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
 		if keyval == gdk.KEY_comma && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
@@ -1494,6 +1515,11 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 				return true
 			}
 		}
+		if (keyval == gdk.KEY_T || keyval == gdk.KEY_t) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) && !state.Has(gdk.AltMask) && !state.Has(gdk.SuperMask) {
+			if w.cycleVariant() {
+				return true
+			}
+		}
 		if keyval == gdk.KEY_Escape {
 			if w.bottomSheet != nil && w.bottomSheet.Open() {
 				return w.handleBottomSheetEscape()
@@ -1506,7 +1532,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	})
 	adwWin.AddController(winKeyCtrl)
 
-	// Composer Enter / Ctrl+Enter / Alt+Enter handling, Up/Down history navigation, Ctrl+B to background, and Ctrl+V clipboard image pasting.
+	// Composer Enter / Ctrl+Enter / Alt+Enter handling, Up/Down history navigation, Ctrl+B to background, Ctrl+T to cycle variant, and Ctrl+V clipboard image pasting.
 	steerKeyCtrl := gtk.NewEventControllerKey()
 	steerKeyCtrl.SetPropagationPhase(gtk.PhaseCapture)
 	steerKeyCtrl.ConnectKeyPressed(func(keyval, _ uint, state gdk.ModifierType) bool {
@@ -1516,6 +1542,11 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 		if (keyval == gdk.KEY_B || keyval == gdk.KEY_b) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) {
 			if w.backgroundCurrentSession() {
+				return true
+			}
+		}
+		if (keyval == gdk.KEY_T || keyval == gdk.KEY_t) && state.Has(gdk.ControlMask) && !state.Has(gdk.ShiftMask) && !state.Has(gdk.AltMask) && !state.Has(gdk.SuperMask) {
+			if w.cycleVariant() {
 				return true
 			}
 		}
@@ -1595,10 +1626,7 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 	w.modelSearchEntry.ConnectActivate(func() {
 		for _, mr := range w.modelRows {
 			if mr.row.Visible() {
-				w.switchModel(opencode.ModelRef{
-					ProviderID: mr.model.ProviderID,
-					ID:         mr.model.ID,
-				})
+				w.selectModelInfo(mr.model)
 				w.modelPopover.Popdown()
 				return
 			}
@@ -1615,11 +1643,20 @@ func NewWindow(ctx context.Context, client *opencode.Client) *Window {
 		}
 		for _, mr := range w.modelRows {
 			if mr.row.Object.Native() == row.Object.Native() {
-				w.switchModel(opencode.ModelRef{
-					ProviderID: mr.model.ProviderID,
-					ID:         mr.model.ID,
-				})
+				w.selectModelInfo(mr.model)
 				w.modelPopover.Popdown()
+				return
+			}
+		}
+	})
+	w.variantListBox.ConnectRowActivated(func(row *gtk.ListBoxRow) {
+		if row == nil {
+			return
+		}
+		for _, vr := range w.variantRows {
+			if vr.row.Object.Native() == row.Object.Native() {
+				w.switchVariant(vr.variant)
+				w.variantPopover.Popdown()
 				return
 			}
 		}
@@ -5327,6 +5364,7 @@ func (w *Window) loadAll() {
 			w.refreshShells()
 			if len(models) > 0 {
 				w.models = models
+				w.modelVariants = make(map[string][]string)
 				for _, m := range models {
 					key := m.ProviderID + "/" + m.ID
 					if m.Limit.Context > 0 {
@@ -5336,6 +5374,20 @@ func (w *Window) loadAll() {
 					if m.Name != "" {
 						w.modelNames[key] = m.Name
 						w.modelNames[m.ID] = m.Name
+					}
+					if ids := m.VariantIDs(); len(ids) > 0 {
+						w.modelVariants[key] = ids
+						if _, exists := w.modelVariants[m.ID]; !exists {
+							w.modelVariants[m.ID] = ids
+						}
+					}
+					if v, ok := w.savedModelVariants[key]; ok && !m.HasVariant(v) {
+						delete(w.savedModelVariants, key)
+					}
+				}
+				if w.lastSelectedModel.ID != "" {
+					if mi, ok := w.findModelInfo(w.lastSelectedModel); ok && !mi.HasVariant(w.lastSelectedModel.Variant) {
+						w.lastSelectedModel.Variant = ""
 					}
 				}
 				w.rebuildModelList()
@@ -7490,6 +7542,26 @@ func (w *Window) updateComposerAgentModel(agent string, model opencode.ModelRef)
 	if w.modelStatusLabel != nil {
 		w.modelStatusLabel.SetLabel(modelDisplay)
 	}
+
+	// Variant button visibility and label in composer row 2
+	variants := w.variantsForModel(model)
+	normVariant := opencode.NormalizeVariant(model.Variant)
+	showVariant := len(variants) > 0 || normVariant != ""
+	if w.composerVariantBtn != nil {
+		w.composerVariantBtn.SetVisible(showVariant)
+	}
+	if w.variantStatusLabel != nil {
+		if normVariant != "" {
+			w.variantStatusLabel.SetLabel(normVariant)
+			w.variantStatusLabel.AddCSSClass("glup-variant-active")
+		} else {
+			w.variantStatusLabel.SetLabel("Default")
+			w.variantStatusLabel.RemoveCSSClass("glup-variant-active")
+		}
+	}
+	if w.variantPopover != nil && w.variantPopover.Visible() {
+		w.rebuildVariantList()
+	}
 }
 
 func (w *Window) updateBottomBar(tab *sessionTab) {
@@ -8257,6 +8329,11 @@ func (w *Window) rebuildContextInfo(tab *sessionTab) {
 	if modelDisplay == "" {
 		modelDisplay = "Default Model"
 	}
+	if normVariant := opencode.NormalizeVariant(sess.Model.Variant); normVariant != "" {
+		modelDisplay = fmt.Sprintf("%s (%s)", modelDisplay, normVariant)
+	} else if len(w.variantsForModel(sess.Model)) > 0 {
+		modelDisplay = fmt.Sprintf("%s (Default)", modelDisplay)
+	}
 
 	limit := w.modelLimits[modelKey]
 	if limit == 0 {
@@ -8519,7 +8596,7 @@ func (w *Window) rebuildSubagentList(tab *sessionTab) {
 
 		meta := sub.Agent
 		if sub.Model.ID != "" {
-			meta += " · " + sub.Model.String()
+			meta += " · " + sub.Model.DisplayString()
 		}
 		subLbl := gtk.NewLabel(meta)
 		subLbl.SetXAlign(0)
@@ -8833,8 +8910,166 @@ func (w *Window) switchAgent(agentID string) {
 	})
 }
 
+func (w *Window) variantsForModel(model opencode.ModelRef) []string {
+	if model.ID == "" || len(w.modelVariants) == 0 {
+		return nil
+	}
+	if ids := w.modelVariants[model.String()]; len(ids) > 0 {
+		return ids
+	}
+	return w.modelVariants[model.ID]
+}
+
+func (w *Window) findModelInfo(ref opencode.ModelRef) (opencode.ModelInfo, bool) {
+	if ref.ID == "" {
+		return opencode.ModelInfo{}, false
+	}
+	for _, m := range w.models {
+		if m.ID != ref.ID && m.ModelID != ref.ID {
+			continue
+		}
+		if ref.ProviderID != "" && m.ProviderID != ref.ProviderID {
+			continue
+		}
+		return m, true
+	}
+	return opencode.ModelInfo{}, false
+}
+
+func (w *Window) activeModelRef() opencode.ModelRef {
+	if tab := w.currentTab(); tab != nil {
+		if conv := tab.activeConv(); conv != nil && conv.session.Model.ID != "" {
+			return conv.session.Model
+		}
+	}
+	return w.lastSelectedModel
+}
+
+func (w *Window) savedVariantForModel(m opencode.ModelInfo) string {
+	if len(w.savedModelVariants) == 0 {
+		return ""
+	}
+	key := m.Ref().String()
+	v := opencode.NormalizeVariant(w.savedModelVariants[key])
+	if v == "" && m.ID != "" {
+		v = opencode.NormalizeVariant(w.savedModelVariants[m.ID])
+	}
+	if m.HasVariant(v) {
+		return v
+	}
+	return ""
+}
+
+func (w *Window) setSavedModelVariant(model opencode.ModelRef, variant string) {
+	if model.ID == "" {
+		return
+	}
+	key := model.String()
+	if key == "" {
+		return
+	}
+	if w.savedModelVariants == nil {
+		w.savedModelVariants = make(map[string]string)
+	}
+	norm := opencode.NormalizeVariant(variant)
+	if norm == "" {
+		delete(w.savedModelVariants, key)
+		return
+	}
+	w.savedModelVariants[key] = norm
+}
+
+func (w *Window) rebuildVariantList() {
+	if w.variantListBox == nil {
+		return
+	}
+	w.variantListBox.RemoveAll()
+	w.variantRows = nil
+
+	activeModel := w.activeModelRef()
+	activeVariant := opencode.NormalizeVariant(activeModel.Variant)
+
+	options := []string{""}
+	options = append(options, w.variantsForModel(activeModel)...)
+	if activeVariant != "" && !slices.Contains(options, activeVariant) {
+		options = append(options, activeVariant)
+	}
+
+	for _, v := range options {
+		row := gtk.NewListBoxRow()
+		box := gtk.NewBox(gtk.OrientationHorizontal, 8)
+		box.SetMarginTop(6)
+		box.SetMarginBottom(6)
+		box.SetMarginStart(10)
+		box.SetMarginEnd(10)
+
+		labelText := "Default"
+		if v != "" {
+			labelText = v
+		}
+		lbl := gtk.NewLabel(labelText)
+		lbl.SetXAlign(0)
+		lbl.SetHExpand(true)
+		lbl.SetEllipsize(pango.EllipsizeEnd)
+		box.Append(lbl)
+
+		if v == activeVariant {
+			checkImg := gtk.NewImageFromIconName("object-select-symbolic")
+			checkImg.SetPixelSize(16)
+			checkImg.SetVAlign(gtk.AlignCenter)
+			checkImg.AddCSSClass("glup-model-selected-icon")
+			box.Append(checkImg)
+		}
+
+		row.SetChild(box)
+		w.variantListBox.Append(row)
+		w.variantRows = append(w.variantRows, variantRowData{
+			row:     row,
+			variant: v,
+		})
+	}
+}
+
+func (w *Window) switchVariant(variant string) {
+	nextVariant := opencode.NormalizeVariant(variant)
+	base := w.activeModelRef()
+	if base.ID == "" {
+		return
+	}
+	if opencode.NormalizeVariant(base.Variant) == nextVariant {
+		return
+	}
+	base.Variant = nextVariant
+	w.switchModel(base)
+}
+
+func (w *Window) cycleVariant() bool {
+	active := w.activeModelRef()
+	variants := w.variantsForModel(active)
+	if active.ID == "" || len(variants) == 0 {
+		return false
+	}
+	cycle := make([]string, 0, len(variants)+1)
+	cycle = append(cycle, "")
+	cycle = append(cycle, variants...)
+
+	cur := opencode.NormalizeVariant(active.Variant)
+	idx := slices.Index(cycle, cur)
+	next := cycle[(idx+1)%len(cycle)]
+	w.switchVariant(next)
+	return true
+}
+
+func (w *Window) selectModelInfo(m opencode.ModelInfo) {
+	ref := m.Ref()
+	ref.Variant = w.savedVariantForModel(m)
+	w.switchModel(ref)
+}
+
 func (w *Window) switchModel(model opencode.ModelRef) {
+	model.Variant = opencode.NormalizeVariant(model.Variant)
 	w.lastSelectedModel = model
+	w.setSavedModelVariant(model, model.Variant)
 	w.updateModelLastUsed(model, time.Now().UnixMilli())
 	w.saveState()
 	if w.notifyCoord != nil {
@@ -10966,7 +11201,7 @@ func (w *Window) effectiveEscStopTimeoutMS() uint {
 }
 
 func (w *Window) hasVisibleComposerPopover() bool {
-	for _, pop := range []*gtk.Popover{w.agentPopover, w.modelPopover, w.renameSessionPopover} {
+	for _, pop := range []*gtk.Popover{w.agentPopover, w.modelPopover, w.variantPopover, w.renameSessionPopover} {
 		if pop != nil && pop.Visible() {
 			return true
 		}

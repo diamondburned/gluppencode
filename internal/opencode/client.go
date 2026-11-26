@@ -281,6 +281,24 @@ func (m ModelRef) String() string {
 	return m.ID
 }
 
+// NormalizeVariant trims v and maps "default" (case-insensitive) to "".
+func NormalizeVariant(v string) string {
+	v = strings.TrimSpace(v)
+	if strings.EqualFold(v, "default") {
+		return ""
+	}
+	return v
+}
+
+// DisplayString returns ModelRef.String() with the active variant appended when non-default.
+func (m ModelRef) DisplayString() string {
+	base := m.String()
+	if v := NormalizeVariant(m.Variant); v != "" && base != "" {
+		return base + " (" + v + ")"
+	}
+	return base
+}
+
 // Location holds the working directory of a session.
 type Location struct {
 	Directory string `json:"directory"`
@@ -413,6 +431,11 @@ func (c *Client) CreateSession(ctx context.Context, directory string) (*Session,
 func (c *Client) CreateSessionWithOptions(ctx context.Context, req CreateSessionRequest) (*Session, error) {
 	if req.Location == nil && req.Directory != "" {
 		req.Location = &Location{Directory: req.Directory}
+	}
+	if req.Model != nil {
+		m := *req.Model
+		m.Variant = NormalizeVariant(m.Variant)
+		req.Model = &m
 	}
 	var raw json.RawMessage
 	if err := c.doJSON(ctx, http.MethodPost, "/api/session", req, &raw); err != nil {
@@ -674,16 +697,22 @@ func AgentColor(agentID, configuredColor string) string {
 	return defaultAgentPalette[idx]
 }
 
+// ModelVariant describes a thinking/reasoning variant supported by a model.
+type ModelVariant struct {
+	ID string `json:"id"`
+}
+
 // ModelInfo describes a model returned by GET /api/model.
 type ModelInfo struct {
-	ID         string `json:"id"`
-	ModelID    string `json:"modelID"`
-	ProviderID string `json:"providerID"`
-	Name       string `json:"name"`
-	Family     string `json:"family"`
-	Type       string `json:"type"`
-	Status     string `json:"status"`
-	Enabled    bool   `json:"enabled"`
+	ID         string         `json:"id"`
+	ModelID    string         `json:"modelID"`
+	ProviderID string         `json:"providerID"`
+	Name       string         `json:"name"`
+	Family     string         `json:"family"`
+	Type       string         `json:"type"`
+	Status     string         `json:"status"`
+	Enabled    bool           `json:"enabled"`
+	Variants   []ModelVariant `json:"variants,omitempty"`
 	Limit      struct {
 		Context int `json:"context"`
 		Input   int `json:"input"`
@@ -692,6 +721,38 @@ type ModelInfo struct {
 	Time struct {
 		Released int64 `json:"released"`
 	} `json:"time"`
+}
+
+// VariantIDs returns the deduplicated, non-default variant IDs supported by this model.
+func (m ModelInfo) VariantIDs() []string {
+	if len(m.Variants) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(m.Variants))
+	seen := make(map[string]bool, len(m.Variants))
+	for _, v := range m.Variants {
+		id := NormalizeVariant(v.ID)
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out
+}
+
+// HasVariant reports whether id is a non-default variant supported by this model.
+func (m ModelInfo) HasVariant(id string) bool {
+	norm := NormalizeVariant(id)
+	if norm == "" {
+		return false
+	}
+	for _, v := range m.Variants {
+		if NormalizeVariant(v.ID) == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // Ref returns the ModelRef for this ModelInfo.
@@ -721,6 +782,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 
 // SwitchModel switches the active model for a session (POST /api/session/{sessionID}/model).
 func (c *Client) SwitchModel(ctx context.Context, sessionID string, model ModelRef) error {
+	model.Variant = NormalizeVariant(model.Variant)
 	path := fmt.Sprintf("/api/session/%s/model", url.PathEscape(sessionID))
 	body := map[string]ModelRef{"model": model}
 	return c.doJSON(ctx, http.MethodPost, path, body, nil)

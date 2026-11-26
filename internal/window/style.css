@@ -603,6 +603,17 @@ menubutton.glup-composer-selector-btn > button:checked {
 	opacity: 0.9;
 }
 
+.glup-variant-status-label {
+	font-weight: 500;
+	font-size: 0.88em;
+	opacity: 0.78;
+}
+
+.glup-variant-status-label.glup-variant-active {
+	color: @accent_color;
+	opacity: 0.95;
+}
+
 .glup-composer-frame button.circular:not(.glup-composer-flat-btn),
 .glup-send-btn,
 #sendBtn,
