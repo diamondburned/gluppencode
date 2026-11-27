@@ -4643,6 +4643,268 @@ func TestTurnDurationAndScrollableInlineShellOutput(t *testing.T) {
 	}
 }
 
+func TestInterruptSessionStopsSubagentsAndSuppressesReports(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	var (
+		mu             sync.Mutex
+		interruptOrder []string
+		waitCalls      []string
+		cancelledInbox []string
+		rootInbox      = map[string]opencode.InboxItem{
+			"inb_user_keep": {
+				ID:       "inb_user_keep",
+				Type:     "user",
+				Delivery: opencode.DeliveryQueue,
+				Payload:  opencode.InboxPayload{Text: "keep user queued message"},
+			},
+		}
+		activeSessions = map[string]opencode.ActiveStatus{
+			"ses_root": {Type: "busy"},
+			"ses_sub1": {Type: "busy"},
+			"ses_sub2": {Type: "busy"},
+		}
+		childWaitReady = map[string]chan struct{}{
+			"ses_sub1": make(chan struct{}),
+			"ses_sub2": make(chan struct{}),
+		}
+		parentWaitSeq int
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/session/") && strings.HasSuffix(r.URL.Path, "/interrupt"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/session/"), "/interrupt")
+			mu.Lock()
+			interruptOrder = append(interruptOrder, id)
+			delete(activeSessions, id)
+			if ch := childWaitReady[id]; ch != nil {
+				select {
+				case <-ch:
+				default:
+					close(ch)
+				}
+			}
+			mu.Unlock()
+			_, _ = w.Write([]byte(`{"ok":true}`))
+
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/experimental/session/") && strings.HasSuffix(r.URL.Path, "/wait"):
+			id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/experimental/session/"), "/wait")
+			mu.Lock()
+			waitCalls = append(waitCalls, id)
+			ch := childWaitReady[id]
+			mu.Unlock()
+			if ch != nil {
+				<-ch
+				// Simulate OpenCode's SubagentReport.deliverReport admitting a synthetic
+				// steer message and waking the parent right as the child settles.
+				mu.Lock()
+				inbID := "inb_rep_" + id
+				rootInbox[inbID] = opencode.InboxItem{
+					ID:       inbID,
+					Type:     "synthetic",
+					Delivery: opencode.DeliverySteer,
+					Payload: opencode.InboxPayload{
+						Text:        fmt.Sprintf(`<subagent sessionID="%s" state="cancelled">Subagent cancelled</subagent>`, id),
+						Description: "Explore",
+						Metadata:    map[string]any{"source": "subagent", "childID": id, "state": "cancelled"},
+					},
+				}
+				activeSessions["ses_root"] = opencode.ActiveStatus{Type: "busy"}
+				mu.Unlock()
+			} else if id == "ses_root" {
+				// Simulate a tiny race on the first root wait where a child report
+				// arrives before the parent finishes settling.
+				mu.Lock()
+				parentWaitSeq++
+				if parentWaitSeq == 1 {
+					rootInbox["inb_rep_late"] = opencode.InboxItem{
+						ID:       "inb_rep_late",
+						Type:     "synthetic",
+						Delivery: opencode.DeliverySteer,
+						Payload: opencode.InboxPayload{
+							Text:     `<subagent sessionID="ses_sub2" state="completed">Subagent finished</subagent>`,
+							Metadata: map[string]any{"source": "subagent", "childID": "ses_sub2"},
+						},
+					}
+					activeSessions["ses_root"] = opencode.ActiveStatus{Type: "busy"}
+				}
+				mu.Unlock()
+			}
+			w.WriteHeader(http.StatusNoContent)
+
+		case r.Method == http.MethodGet && r.URL.Path == "/api/experimental/job":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []opencode.JobInfo{
+					{ID: "job_1", Kind: "subagent", Status: "running", SessionID: "ses_root", ChildSessionID: "ses_sub1"},
+					{ID: "job_2", Kind: "subagent", Status: "running", SessionID: "ses_sub1", ChildSessionID: "ses_sub2"},
+				},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/api/session/ses_root/children":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"data": []opencode.Session{
+					{ID: "ses_sub1", ParentID: "ses_root", Time: opencode.SessionTime{Busy: 100}},
+				},
+			})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/api/session/status":
+			mu.Lock()
+			snap := make(map[string]opencode.ActiveStatus, len(activeSessions))
+			for k, v := range activeSessions {
+				snap[k] = v
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": snap})
+
+		case r.Method == http.MethodGet && r.URL.Path == "/api/session/ses_root/inbox":
+			mu.Lock()
+			var items []opencode.InboxItem
+			for _, it := range rootInbox {
+				items = append(items, it)
+			}
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": items})
+
+		case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/api/session/ses_root/inbox/"):
+			inbID := strings.TrimPrefix(r.URL.Path, "/api/session/ses_root/inbox/")
+			mu.Lock()
+			cancelledInbox = append(cancelledInbox, inbID)
+			delete(rootInbox, inbID)
+			mu.Unlock()
+			w.WriteHeader(http.StatusNoContent)
+
+		default:
+			_, _ = w.Write([]byte(`{"data":[]}`))
+		}
+	}))
+	defer srv.Close()
+
+	builder := gtk.NewBuilderFromString(windowUI)
+	stopBtn := builder.GetObject("stopBtn").Cast().(*gtk.Button)
+	stopConfirmBtn := builder.GetObject("stopConfirmBtn").Cast().(*gtk.Button)
+
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:              t.Context(),
+		client:           &opencode.Client{BaseURL: srv.URL},
+		viewStack:        vs,
+		tabs:             make(map[string]*sessionTab),
+		childToRoot:      make(map[string]string),
+		stopBtn:          stopBtn,
+		stopConfirmBtn:   stopConfirmBtn,
+		stopSuppressTail: 2 * time.Second,
+	}
+
+	tab := win.addSessionTab(opencode.Session{ID: "ses_root"})
+	tab.main.loaded = true
+	tab.main.active = true
+	vs.SetVisibleChildName("ses_root")
+	win.childToRoot["ses_sub1"] = "ses_root"
+	win.upsertSubagent(tab, opencode.Session{
+		ID:       "ses_sub1",
+		ParentID: "ses_root",
+		Time:     opencode.SessionTime{Busy: 1000},
+	})
+
+	win.interruptSession()
+
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		_, hasRootActive := activeSessions["ses_root"]
+		_, hasRep1 := rootInbox["inb_rep_ses_sub1"]
+		_, hasRep2 := rootInbox["inb_rep_ses_sub2"]
+		_, hasRepLate := rootInbox["inb_rep_late"]
+		nWait := len(waitCalls)
+		mu.Unlock()
+		if !hasRootActive && !hasRep1 && !hasRep2 && !hasRepLate && nWait >= 3 && !glib.MainContextDefault().Pending() {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	gotInterrupts := slices.Clone(interruptOrder)
+	gotWaits := slices.Clone(waitCalls)
+	gotCancelled := slices.Clone(cancelledInbox)
+	_, keptUser := rootInbox["inb_user_keep"]
+	_, rootStillActive := activeSessions["ses_root"]
+	mu.Unlock()
+
+	if !slices.Contains(gotInterrupts, "ses_root") || !slices.Contains(gotInterrupts, "ses_sub1") || !slices.Contains(gotInterrupts, "ses_sub2") {
+		t.Fatalf("expected interrupts for root, local sub1, and server-discovered sub2; got %v", gotInterrupts)
+	}
+	if !slices.Contains(gotWaits, "ses_sub1") || !slices.Contains(gotWaits, "ses_sub2") {
+		t.Fatalf("expected WaitSession calls for children; got %v", gotWaits)
+	}
+	for _, wantCancel := range []string{"inb_rep_ses_sub1", "inb_rep_ses_sub2", "inb_rep_late"} {
+		if !slices.Contains(gotCancelled, wantCancel) {
+			t.Fatalf("expected synthetic subagent report %s to be cancelled, cancelled=%v", wantCancel, gotCancelled)
+		}
+	}
+	if !keptUser {
+		t.Fatal("expected user queued inbox item inb_user_keep to remain uncancelled")
+	}
+	if rootStillActive {
+		t.Fatal("expected ses_root to be re-interrupted and idle after child report wakeups")
+	}
+
+	// Late SSE session.inbox.enqueued + session.execution.started arriving during the
+	// suppression tail must also be cancelled/interrupted without triggering a response.
+	mu.Lock()
+	prevInterruptCount := len(interruptOrder)
+	rootInbox["inb_sse_late"] = opencode.InboxItem{ID: "inb_sse_late", Type: "synthetic"}
+	mu.Unlock()
+
+	win.handleEvent(opencode.Event{
+		Type: "session.inbox.enqueued",
+		Data: json.RawMessage(`{"sessionID":"ses_root","inboxID":"inb_sse_late","item":{"type":"synthetic","payload":{"text":"<subagent sessionID=\"ses_sub1\" state=\"cancelled\">Subagent cancelled</subagent>","metadata":{"source":"subagent","childID":"ses_sub1"}},"delivery":"steer"}}`),
+	})
+	win.handleEvent(opencode.Event{
+		Type: "session.execution.started",
+		Data: json.RawMessage(`{"sessionID":"ses_root"}`),
+	})
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		glib.MainContextDefault().Iteration(false)
+		mu.Lock()
+		_, stillThere := rootInbox["inb_sse_late"]
+		curInterrupts := len(interruptOrder)
+		mu.Unlock()
+		if !stillThere && curInterrupts > prevInterruptCount {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	mu.Lock()
+	_, sseLateStillThere := rootInbox["inb_sse_late"]
+	curInterrupts := len(interruptOrder)
+	mu.Unlock()
+	if sseLateStillThere {
+		t.Fatal("expected late SSE synthetic subagent report inb_sse_late to be cancelled")
+	}
+	if curInterrupts <= prevInterruptCount {
+		t.Fatalf("expected late SSE wakeup to re-interrupt ses_root, interrupts stayed at %d", curInterrupts)
+	}
+
+	// Starting a new user action clears suppression so subsequent subagent reports deliver normally.
+	win.clearStopSuppressionForSession("ses_root")
+	win.handleEvent(opencode.Event{
+		Type: "session.inbox.enqueued",
+		Data: json.RawMessage(`{"sessionID":"ses_root","inboxID":"inb_user_after","item":{"type":"user","payload":{"text":"next turn"},"delivery":"steer"}}`),
+	})
+	if len(tab.main.pendingPrompts) != 1 || tab.main.pendingPrompts[0].inboxID != "inb_user_after" {
+		t.Fatalf("expected normal inbox handling after clearing suppression, got %+v", tab.main.pendingPrompts)
+	}
+}
+
 func TestStartupUnvisitedSubagentSpinnerAndResolution(t *testing.T) {
 	if !gtk.InitCheck() {
 		t.Skip("no display")

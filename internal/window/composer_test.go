@@ -674,3 +674,84 @@ func TestComposerInputHistoryWrappedLines(t *testing.T) {
 			w.isInputCursorOnTopLine(), w.isInputCursorOnBottomLine())
 	}
 }
+
+func TestStopButtonVisibilityWithRunningSubagents(t *testing.T) {
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	builder := gtk.NewBuilderFromString(windowUI)
+	stopBtn := builder.GetObject("stopBtn").Cast().(*gtk.Button)
+	stopConfirmBtn := builder.GetObject("stopConfirmBtn").Cast().(*gtk.Button)
+
+	vs := adw.NewViewStack()
+	win := &Window{
+		ctx:            t.Context(),
+		viewStack:      vs,
+		tabs:           make(map[string]*sessionTab),
+		childToRoot:    make(map[string]string),
+		stopBtn:        stopBtn,
+		stopConfirmBtn: stopConfirmBtn,
+	}
+
+	tab := win.addSessionTab(opencode.Session{ID: "ses_root"})
+	vs.SetVisibleChildName("ses_root")
+
+	// Initially idle: stopBtn hidden.
+	win.refreshHeaderAndBottomBar(tab)
+	if stopBtn.Visible() {
+		t.Fatal("expected stopBtn hidden while main and subagents are idle")
+	}
+
+	// Main idle + running subagent -> stopBtn visible and Esc stop arming works.
+	win.childToRoot["ses_sub1"] = "ses_root"
+	win.upsertSubagent(tab, opencode.Session{
+		ID:       "ses_sub1",
+		ParentID: "ses_root",
+		Time:     opencode.SessionTime{Busy: 1000},
+	})
+	if !stopBtn.Visible() {
+		t.Fatal("expected stopBtn visible when a subagent is running even if main is idle")
+	}
+	if !win.handleEscapeStop(0) || win.escStopArmedSess != "ses_root" || !stopConfirmBtn.Visible() {
+		t.Fatalf("expected Esc to arm stop on root tab while subagent is running, armed=%q confirmVisible=%v",
+			win.escStopArmedSess, stopConfirmBtn.Visible())
+	}
+
+	// Main becomes active then goes idle while subagent is still running -> stopBtn stays visible and Esc stays armed.
+	win.setConvActive("ses_root", true)
+	win.setConvActive("ses_root", false)
+	if !stopBtn.Visible() {
+		t.Fatal("expected stopBtn to stay visible when main goes idle while subagent is still running")
+	}
+	if win.escStopArmedSess != "ses_root" {
+		t.Fatalf("expected escStopArmedSess to remain armed while subagent is running, got %q", win.escStopArmedSess)
+	}
+
+	// Subagent finishes -> stopBtn hides and Esc stop disarms.
+	win.setSubagentActive("ses_sub1", false, "succeeded")
+	if stopBtn.Visible() {
+		t.Fatal("expected stopBtn hidden after last running subagent finishes")
+	}
+	if win.escStopArmedSess != "" || stopConfirmBtn.Visible() {
+		t.Fatalf("expected Esc stop to disarm after last subagent finishes, armed=%q confirmVisible=%v",
+			win.escStopArmedSess, stopConfirmBtn.Visible())
+	}
+
+	// Viewing an idle subagent while main is active hides stopBtn; viewing an active subagent shows it.
+	win.setConvActive("ses_root", true)
+	tab.subTimelines["ses_sub1"] = &convTimeline{session: opencode.Session{ID: "ses_sub1"}, active: false}
+	tab.activeSubID = "ses_sub1"
+	win.refreshHeaderAndBottomBar(tab)
+	if stopBtn.Visible() {
+		t.Fatal("expected stopBtn hidden when viewing an idle subagent")
+	}
+	win.setConvActive("ses_sub1", true)
+	if !stopBtn.Visible() {
+		t.Fatal("expected stopBtn visible when viewing an active subagent")
+	}
+	win.setConvActive("ses_sub1", false)
+	if stopBtn.Visible() {
+		t.Fatal("expected stopBtn hidden once active subagent finishes")
+	}
+}

@@ -2208,6 +2208,31 @@ func TestInboxEndpoints(t *testing.T) {
 	}
 }
 
+func TestWaitSessionEndpoint(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	var waitedPath string
+	var waitedMethod string
+	client := &Client{
+		BaseURL: "http://opencode.local",
+		HTTP: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				waitedMethod = req.Method
+				waitedPath = req.URL.Path
+				return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+			}),
+		},
+	}
+
+	if err := client.WaitSession(ctx, "ses_123"); err != nil {
+		t.Fatalf("WaitSession failed: %v", err)
+	}
+	if waitedMethod != http.MethodPost || waitedPath != "/api/experimental/session/ses_123/wait" {
+		t.Errorf("WaitSession called %s %s, want POST /api/experimental/session/ses_123/wait", waitedMethod, waitedPath)
+	}
+}
+
 func TestInboxEventDecoding(t *testing.T) {
 	t.Parallel()
 
@@ -2224,6 +2249,21 @@ func TestInboxEventDecoding(t *testing.T) {
 	}
 	if ev.Item.Payload.Text != "hello queued" || ev.Item.Delivery != DeliveryQueue {
 		t.Errorf("unexpected item: %+v", ev.Item)
+	}
+
+	const synData = `{"inboxID":"msg_syn","sessionID":"ses_root","item":{"type":"synthetic","payload":{"text":"<subagent sessionID=\"ses_child\" state=\"cancelled\">Subagent cancelled</subagent>","description":"Explore repo","metadata":{"source":"subagent","childID":"ses_child","state":"cancelled"}},"delivery":"steer"}}`
+	var synEv InboxEvent
+	if err := json.Unmarshal([]byte(synData), &synEv); err != nil {
+		t.Fatalf("Unmarshal synthetic failed: %v", err)
+	}
+	if synEv.Item == nil || synEv.Item.Type != "synthetic" || synEv.Item.Payload.Description != "Explore repo" {
+		t.Fatalf("unexpected synthetic item: %+v", synEv.Item)
+	}
+	if src, _ := synEv.Item.Payload.Metadata["source"].(string); src != "subagent" {
+		t.Errorf("metadata.source = %q, want subagent", src)
+	}
+	if cid, _ := synEv.Item.Payload.Metadata["childID"].(string); cid != "ses_child" {
+		t.Errorf("metadata.childID = %q, want ses_child", cid)
 	}
 }
 

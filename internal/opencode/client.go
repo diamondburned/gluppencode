@@ -1329,10 +1329,12 @@ const (
 	DeliverySteer InboxDelivery = "steer"
 )
 
-// InboxPayload holds the text and file attachments of a user InboxItem.
+// InboxPayload holds the text, optional description/metadata, and file attachments of an InboxItem.
 type InboxPayload struct {
-	Text  string           `json:"text"`
-	Files []FileAttachment `json:"files,omitempty"`
+	Text        string           `json:"text"`
+	Description string           `json:"description,omitempty"`
+	Files       []FileAttachment `json:"files,omitempty"`
+	Metadata    map[string]any   `json:"metadata,omitempty"`
 }
 
 // InboxItem represents a pending item in a session's durable inbox. Its ID
@@ -1511,6 +1513,13 @@ func (c *Client) CancelInbox(ctx context.Context, sessionID, inboxID string) err
 func (c *Client) Interrupt(ctx context.Context, sessionID string) error {
 	path := fmt.Sprintf("/api/session/%s/interrupt", url.PathEscape(sessionID))
 	return c.doJSON(ctx, http.MethodPost, path, map[string]any{}, nil)
+}
+
+// WaitSession blocks until ongoing execution in a session becomes idle
+// (POST /api/experimental/session/{sessionID}/wait).
+func (c *Client) WaitSession(ctx context.Context, sessionID string) error {
+	path := fmt.Sprintf("/api/experimental/session/%s/wait", url.PathEscape(sessionID))
+	return c.doJSON(ctx, http.MethodPost, path, nil, nil)
 }
 
 // BackgroundSession moves active foreground backgroundable tools for a session into background observation

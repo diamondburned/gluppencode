@@ -940,6 +940,16 @@ type subagentRowData struct {
 	session opencode.Session
 }
 
+type stopSuppression struct {
+	gen                 uint64
+	rootID              string
+	allChildren         bool
+	childIDs            map[string]bool
+	interruptedChildren map[string]bool
+	interruptParent     bool
+	timer               *time.Timer
+}
+
 // Window is the main Gluppencode window.
 type Window struct {
 	*adw.ApplicationWindow
@@ -1174,6 +1184,10 @@ type Window struct {
 	escStopGen       uint64
 	escStopTimer     glib.SourceHandle
 	escStopTimeoutMS uint
+
+	stopSuppressions map[string]*stopSuppression
+	stopSuppressGen  uint64
+	stopSuppressTail time.Duration
 
 	populating bool
 }
@@ -2498,6 +2512,7 @@ func (w *Window) pruneSessionAuxiliaryState(rootID string, tab *sessionTab) {
 	if w == nil || rootID == "" {
 		return
 	}
+	w.clearStopSuppression(rootID)
 	delete(w.sessionTouched, rootID)
 	delete(w.resolvedSessionTitles, rootID)
 	for cid, rid := range w.childToRoot {
@@ -6745,6 +6760,7 @@ func (w *Window) ensureFormWidget(tab *sessionTab, conv *convTimeline, form open
 	qw = NewQuestionFormWidget(
 		form,
 		func(ans map[string]any) {
+			w.clearStopSuppressionForSession(sessID)
 			gtkutil.Async(w.ctx, func() func() {
 				err := w.client.ReplyForm(w.ctx, sessID, formID, ans)
 				return func() {
@@ -6965,6 +6981,7 @@ func (w *Window) ensurePermissionWidget(tab *sessionTab, conv *convTimeline, per
 		perm,
 		dir,
 		func(decision opencode.PermissionDecision) {
+			w.clearStopSuppressionForSession(sessID)
 			gtkutil.Async(w.ctx, func() func() {
 				err := w.client.ReplyPermission(w.ctx, sessID, reqID, decision, "")
 				return func() {
@@ -7289,7 +7306,7 @@ func (w *Window) refreshHeaderAndBottomBar(tab *sessionTab) {
 	}
 
 	w.syncNavigationChrome()
-	w.updateBusyState(conv.active)
+	w.updateBusyState(w.isTabStoppable(tab))
 	w.updateBottomBar(tab)
 	w.rebuildSubagentList(tab)
 	w.updateWindowManagerTitle()
@@ -7442,6 +7459,9 @@ func (w *Window) upsertSubagent(tab *sessionTab, sess opencode.Session) {
 			if s.IsRunning() {
 				w.cancelCompletionSettle(tab)
 			}
+			if w.currentTab() == tab {
+				w.updateBusyState(w.isTabStoppable(tab))
+			}
 			w.updateSwitcherIndicators()
 			return
 		}
@@ -7450,6 +7470,9 @@ func (w *Window) upsertSubagent(tab *sessionTab, sess opencode.Session) {
 		w.cancelCompletionSettle(tab)
 	}
 	tab.subagents = append([]opencode.Session{sess}, tab.subagents...)
+	if w.currentTab() == tab {
+		w.updateBusyState(w.isTabStoppable(tab))
+	}
 	w.updateSwitcherIndicators()
 }
 
@@ -7497,6 +7520,7 @@ func (w *Window) setSubagentActive(childID string, active bool, outcome string) 
 		}
 	}
 	if w.currentTab() == tab {
+		w.updateBusyState(w.isTabStoppable(tab))
 		w.updateBottomBar(tab)
 		w.rebuildSubagentList(tab)
 	}
@@ -7554,6 +7578,7 @@ func (w *Window) loadChildSubagents(rootSessionID string) {
 			}
 			tab.subagents = children
 			if w.currentRootSessionID() == rootSessionID {
+				w.updateBusyState(w.isTabStoppable(tab))
 				w.updateBottomBar(tab)
 				w.rebuildSubagentList(tab)
 			}
@@ -10028,6 +10053,7 @@ func (w *Window) sendPromptWithDelivery(delivery opencode.InboxDelivery) {
 	}
 
 	sessionID := conv.session.ID
+	w.clearStopSuppressionForSession(sessionID)
 	uw := NewUserMessageWidget(w.ctx, text, files...)
 	uw.SetWaiting(true, delivery)
 
@@ -10345,6 +10371,7 @@ func (w *Window) steerPendingPrompt(conv *convTimeline, p *pendingPrompt) {
 		return
 	}
 	sessionID := conv.session.ID
+	w.clearStopSuppressionForSession(sessionID)
 	inboxID := p.inboxID
 	gtkutil.Async(w.ctx, func() func() {
 		err := w.client.UpdateInboxDelivery(w.ctx, sessionID, inboxID, opencode.DeliverySteer)
@@ -11464,6 +11491,7 @@ func (w *Window) redoRevert(tab *sessionTab, conv *convTimeline) {
 		return
 	}
 	sessionID := conv.session.ID
+	w.clearStopSuppressionForSession(sessionID)
 	gtkutil.Async(w.ctx, func() func() {
 		sess, err := w.client.ClearRevert(w.ctx, sessionID)
 		return func() {
@@ -11487,6 +11515,7 @@ func (w *Window) compactCurrentSession(tab *sessionTab, conv *convTimeline) {
 		return
 	}
 	sessionID := conv.session.ID
+	w.clearStopSuppressionForSession(sessionID)
 	gtkutil.Async(w.ctx, func() func() {
 		err := w.client.CompactSession(w.ctx, sessionID)
 		return func() {
@@ -11503,6 +11532,7 @@ func (w *Window) stageRevertToMessage(tab *sessionTab, conv *convTimeline, messa
 		return
 	}
 	sessionID := conv.session.ID
+	w.clearStopSuppressionForSession(sessionID)
 
 	if messageText != "" || len(files) > 0 {
 		w.restoreDraft(sessionID, messageText, files)
@@ -11860,6 +11890,331 @@ func (w *Window) hasVisibleComposerPopover() bool {
 	return false
 }
 
+func isSubagentSyntheticInboxItem(item opencode.InboxItem) bool {
+	if item.Type != "synthetic" {
+		return false
+	}
+	if item.Payload.Metadata != nil {
+		if src, _ := item.Payload.Metadata["source"].(string); src == "subagent" {
+			return true
+		}
+		if childID, _ := item.Payload.Metadata["childID"].(string); childID != "" {
+			return true
+		}
+	}
+	return strings.HasPrefix(strings.TrimSpace(item.Payload.Text), "<subagent ")
+}
+
+func subagentInboxChildID(item opencode.InboxItem) string {
+	if item.Payload.Metadata != nil {
+		if childID, _ := item.Payload.Metadata["childID"].(string); childID != "" {
+			return childID
+		}
+	}
+	text := strings.TrimSpace(item.Payload.Text)
+	if strings.HasPrefix(text, "<subagent ") {
+		if _, rest, ok := strings.Cut(text, `sessionID="`); ok {
+			if id, _, ok := strings.Cut(rest, `"`); ok {
+				return id
+			}
+		}
+	}
+	return ""
+}
+
+func (w *Window) isSubagentRunningInTab(tab *sessionTab, subID string) bool {
+	if tab == nil || subID == "" {
+		return false
+	}
+	if subConv := tab.subTimelines[subID]; subConv != nil && subConv.active {
+		return true
+	}
+	for _, sub := range tab.subagents {
+		if sub.ID == subID && sub.IsRunning() {
+			return true
+		}
+	}
+	return false
+}
+
+func isSubagentDescendant(tab *sessionTab, childID, ancestorID string) bool {
+	if tab == nil || childID == "" || ancestorID == "" {
+		return false
+	}
+	if childID == ancestorID {
+		return true
+	}
+	parentByID := make(map[string]string, len(tab.subagents))
+	for _, sub := range tab.subagents {
+		if sub.ID != "" && sub.ParentID != "" {
+			parentByID[sub.ID] = sub.ParentID
+		}
+	}
+	cur := childID
+	for range 16 {
+		p := parentByID[cur]
+		if p == "" {
+			return false
+		}
+		if p == ancestorID {
+			return true
+		}
+		cur = p
+	}
+	return false
+}
+
+func (w *Window) isTabStoppable(tab *sessionTab) bool {
+	if tab == nil {
+		return false
+	}
+	if tab.activeSubID == "" {
+		if tab.main != nil && tab.main.active {
+			return true
+		}
+		return w.hasRunningSubagentLocal(tab)
+	}
+	if w.isSubagentRunningInTab(tab, tab.activeSubID) {
+		return true
+	}
+	for _, sub := range tab.subagents {
+		if sub.ID != "" && sub.IsRunning() && isSubagentDescendant(tab, sub.ID, tab.activeSubID) {
+			return true
+		}
+	}
+	for subID, subConv := range tab.subTimelines {
+		if subConv != nil && subConv.active && isSubagentDescendant(tab, subID, tab.activeSubID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) runningSubagentIDs(tab *sessionTab, ancestorID string) []string {
+	if tab == nil {
+		return nil
+	}
+	seen := make(map[string]bool)
+	var ids []string
+	add := func(id string) {
+		if id == "" || seen[id] || (ancestorID != "" && id == ancestorID) {
+			return
+		}
+		if ancestorID != "" && !isSubagentDescendant(tab, id, ancestorID) {
+			return
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	for _, sub := range tab.subagents {
+		if sub.IsRunning() {
+			add(sub.ID)
+		}
+	}
+	for subID, subConv := range tab.subTimelines {
+		if subConv != nil && subConv.active {
+			add(subID)
+		}
+	}
+	return ids
+}
+
+func (w *Window) effectiveStopSuppressionTail() time.Duration {
+	if w != nil && w.stopSuppressTail > 0 {
+		return w.stopSuppressTail
+	}
+	return 1500 * time.Millisecond
+}
+
+func (w *Window) rootSessionIDFor(sessionID string) string {
+	if w == nil || sessionID == "" {
+		return ""
+	}
+	if _, ok := w.tabs[sessionID]; ok {
+		return sessionID
+	}
+	if rootID, ok := w.childToRoot[sessionID]; ok && rootID != "" {
+		return rootID
+	}
+	return sessionID
+}
+
+func (w *Window) beginStopSuppression(rootID string, allChildren, interruptParent bool, childIDs ...string) uint64 {
+	if w == nil || rootID == "" {
+		return 0
+	}
+	if w.stopSuppressions == nil {
+		w.stopSuppressions = make(map[string]*stopSuppression)
+	}
+	if prev := w.stopSuppressions[rootID]; prev != nil && prev.timer != nil {
+		prev.timer.Stop()
+	}
+	w.stopSuppressGen++
+	gen := w.stopSuppressGen
+	childSet := make(map[string]bool, len(childIDs))
+	for _, cid := range childIDs {
+		if cid != "" {
+			childSet[cid] = true
+		}
+	}
+	sup := &stopSuppression{
+		gen:                 gen,
+		rootID:              rootID,
+		allChildren:         allChildren,
+		childIDs:            childSet,
+		interruptedChildren: make(map[string]bool),
+		interruptParent:     interruptParent,
+	}
+	sup.timer = time.AfterFunc(15*time.Second, func() {
+		glib.IdleAdd(func() {
+			if w.ctx != nil && w.ctx.Err() != nil {
+				return
+			}
+			if cur := w.stopSuppressions[rootID]; cur == sup && cur.gen == gen {
+				delete(w.stopSuppressions, rootID)
+			}
+		})
+	})
+	w.stopSuppressions[rootID] = sup
+	return gen
+}
+
+func (w *Window) clearStopSuppression(rootID string) {
+	if w == nil || rootID == "" || w.stopSuppressions == nil {
+		return
+	}
+	if sup := w.stopSuppressions[rootID]; sup != nil {
+		if sup.timer != nil {
+			sup.timer.Stop()
+		}
+		delete(w.stopSuppressions, rootID)
+	}
+}
+
+func (w *Window) clearStopSuppressionForSession(sessionID string) {
+	if w == nil || sessionID == "" {
+		return
+	}
+	if _, ok := w.tabs[sessionID]; ok {
+		w.clearStopSuppression(sessionID)
+		return
+	}
+	if rootID := w.childToRoot[sessionID]; rootID != "" {
+		if sup := w.stopSuppressions[rootID]; sup != nil {
+			delete(sup.childIDs, sessionID)
+			if !sup.allChildren && len(sup.childIDs) == 0 {
+				w.clearStopSuppression(rootID)
+			}
+		}
+		return
+	}
+	w.clearStopSuppression(sessionID)
+}
+
+func (w *Window) finishStopSuppressionSoon(rootID string, gen uint64, delay time.Duration) {
+	if w == nil || rootID == "" || gen == 0 || w.stopSuppressions == nil {
+		return
+	}
+	sup := w.stopSuppressions[rootID]
+	if sup == nil || sup.gen != gen {
+		return
+	}
+	if sup.timer != nil {
+		sup.timer.Stop()
+	}
+	if delay <= 0 {
+		delete(w.stopSuppressions, rootID)
+		return
+	}
+	sup.timer = time.AfterFunc(delay, func() {
+		glib.IdleAdd(func() {
+			if w.ctx != nil && w.ctx.Err() != nil {
+				return
+			}
+			if cur := w.stopSuppressions[rootID]; cur == sup && cur.gen == gen {
+				delete(w.stopSuppressions, rootID)
+			}
+		})
+	})
+}
+
+func (w *Window) handleSuppressedInboxEvent(ev opencode.InboxEvent) bool {
+	if w == nil || ev.SessionID == "" || ev.Item == nil || !isSubagentSyntheticInboxItem(*ev.Item) {
+		return false
+	}
+	rootID := w.rootSessionIDFor(ev.SessionID)
+	sup := w.stopSuppressions[rootID]
+	if sup == nil {
+		return false
+	}
+	isIntermediateParent := ev.SessionID != rootID
+	if !sup.allChildren {
+		childID := subagentInboxChildID(*ev.Item)
+		if isIntermediateParent {
+			if !sup.childIDs[ev.SessionID] && (childID == "" || !sup.childIDs[childID]) {
+				return false
+			}
+		} else if childID == "" || !sup.childIDs[childID] {
+			return false
+		}
+	}
+	inboxID := cmp.Or(ev.InboxID, ev.Item.ID)
+	interruptTarget := isIntermediateParent || sup.interruptParent
+	if w.client != nil && (inboxID != "" || interruptTarget) {
+		ctx := w.ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		sessionID := ev.SessionID
+		go func() {
+			if inboxID != "" {
+				if err := w.client.CancelInbox(ctx, sessionID, inboxID); err != nil {
+					slog.Debug("failed to cancel suppressed subagent inbox item", "sessionID", sessionID, "inboxID", inboxID, "err", err)
+				}
+			}
+			if interruptTarget {
+				_ = w.client.Interrupt(ctx, sessionID)
+			}
+		}()
+	}
+	return true
+}
+
+func (w *Window) shouldInterruptOnStart(sessionID string) bool {
+	if w == nil || sessionID == "" || len(w.stopSuppressions) == 0 {
+		return false
+	}
+	if sup := w.stopSuppressions[sessionID]; sup != nil && sup.interruptParent {
+		return true
+	}
+	if rootID := w.childToRoot[sessionID]; rootID != "" {
+		if sup := w.stopSuppressions[rootID]; sup != nil && (sup.allChildren || sup.childIDs[sessionID]) {
+			sup.interruptedChildren[sessionID] = true
+			return true
+		}
+	}
+	return false
+}
+
+func (w *Window) shouldInterruptChildDiscovery(childID string) bool {
+	if w == nil || childID == "" || len(w.stopSuppressions) == 0 {
+		return false
+	}
+	rootID := w.childToRoot[childID]
+	if rootID == "" {
+		return false
+	}
+	sup := w.stopSuppressions[rootID]
+	if sup == nil || (!sup.allChildren && !sup.childIDs[childID]) {
+		return false
+	}
+	if sup.interruptedChildren[childID] {
+		return false
+	}
+	sup.interruptedChildren[childID] = true
+	return true
+}
+
 func (w *Window) handleEscapeStop(state gdk.ModifierType) bool {
 	if state.Has(gdk.ControlMask) || state.Has(gdk.ShiftMask) || state.Has(gdk.AltMask) || state.Has(gdk.SuperMask) {
 		return false
@@ -11873,7 +12228,7 @@ func (w *Window) handleEscapeStop(state gdk.ModifierType) bool {
 		return false
 	}
 	conv := tab.activeConv()
-	if conv == nil || !conv.active || conv.session.ID == "" {
+	if conv == nil || conv.session.ID == "" || !w.isTabStoppable(tab) {
 		w.disarmEscStop()
 		return false
 	}
@@ -11921,8 +12276,8 @@ func (w *Window) disarmEscStop() {
 func (w *Window) syncEscStopUI() {
 	armed := false
 	if w.escStopArmedSess != "" {
-		if tab := w.currentTab(); tab != nil {
-			if conv := tab.activeConv(); conv != nil && conv.active && conv.session.ID == w.escStopArmedSess {
+		if tab := w.currentTab(); tab != nil && w.isTabStoppable(tab) {
+			if conv := tab.activeConv(); conv != nil && conv.session.ID == w.escStopArmedSess {
 				armed = true
 			}
 		}
@@ -11947,18 +12302,231 @@ func (w *Window) interruptSession() {
 		return
 	}
 	tab := w.currentTab()
-	if tab == nil {
+	if tab == nil || tab.main == nil {
 		return
 	}
-	sessionID := tab.activeConv().session.ID
-	if sessionID == "" {
+	conv := tab.activeConv()
+	if conv == nil || conv.session.ID == "" {
 		return
 	}
-	gtkutil.Async(w.ctx, func() func() {
-		err := w.client.Interrupt(w.ctx, sessionID)
+	rootID := tab.main.session.ID
+	sessionID := conv.session.ID
+	isRootTarget := tab.activeSubID == "" || sessionID == rootID
+
+	var targetChildren []string
+	var interruptParent bool
+	if isRootTarget {
+		targetChildren = w.runningSubagentIDs(tab, "")
+		interruptParent = true
+		tab.turnFailed = true
+		w.cancelCompletionSettle(tab)
+	} else {
+		targetChildren = w.runningSubagentIDs(tab, sessionID)
+		interruptParent = !tab.main.active
+	}
+
+	suppressChildren := append([]string(nil), targetChildren...)
+	if !isRootTarget {
+		suppressChildren = append(suppressChildren, sessionID)
+	}
+	gen := w.beginStopSuppression(rootID, isRootTarget, interruptParent, suppressChildren...)
+
+	baseCtx := w.ctx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	gtkutil.Async(baseCtx, func() func() {
+		stopCtx, cancel := context.WithTimeout(baseCtx, 15*time.Second)
+		defer cancel()
+
+		interrupted := make(map[string]bool)
+		waitedChildSet := make(map[string]bool)
+		var waitedChildren []string
+		addWaitedChild := func(id string) {
+			if id == "" || id == rootID || waitedChildSet[id] {
+				return
+			}
+			waitedChildSet[id] = true
+			waitedChildren = append(waitedChildren, id)
+		}
+
+		initialIDs := []string{sessionID}
+		if !isRootTarget {
+			addWaitedChild(sessionID)
+		}
+		for _, cid := range targetChildren {
+			if cid != "" && cid != sessionID {
+				initialIDs = append(initialIDs, cid)
+			}
+			addWaitedChild(cid)
+		}
+
+		var targetErr error
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, id := range initialIDs {
+			interrupted[id] = true
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				if err := w.client.Interrupt(stopCtx, id); err != nil {
+					mu.Lock()
+					if id == sessionID {
+						targetErr = err
+					}
+					mu.Unlock()
+					slog.Error("failed to interrupt session", "sessionID", id, "err", err)
+				}
+			}(id)
+		}
+
+		// Discover any running descendant subagents that were spawned just before Stop
+		// or not yet synced into the tab's local list.
+		var (
+			jobs       []opencode.JobInfo
+			childSess  []opencode.Session
+			activeSess map[string]opencode.ActiveStatus
+			discWG     sync.WaitGroup
+		)
+		discWG.Add(3)
+		go func() {
+			defer discWG.Done()
+			jobs, _ = w.client.ListJobs(stopCtx, opencode.ListJobsOptions{
+				SessionID:   sessionID,
+				Kind:        "subagent",
+				Status:      "running",
+				Descendants: true,
+			})
+		}()
+		go func() {
+			defer discWG.Done()
+			childSess, _ = w.client.ListChildSessions(stopCtx, sessionID)
+		}()
+		go func() {
+			defer discWG.Done()
+			activeSess, _ = w.client.ActiveSessions(stopCtx)
+		}()
+		discWG.Wait()
+		wg.Wait()
+
+		var extraChildren []string
+		for _, job := range jobs {
+			if job.ChildSessionID != "" {
+				addWaitedChild(job.ChildSessionID)
+				if !interrupted[job.ChildSessionID] {
+					interrupted[job.ChildSessionID] = true
+					extraChildren = append(extraChildren, job.ChildSessionID)
+				}
+			}
+		}
+		for _, ch := range childSess {
+			if ch.ID == "" {
+				continue
+			}
+			_, isActive := activeSess[ch.ID]
+			if isActive || ch.IsRunning() {
+				addWaitedChild(ch.ID)
+				if !interrupted[ch.ID] {
+					interrupted[ch.ID] = true
+					extraChildren = append(extraChildren, ch.ID)
+				}
+			}
+		}
+
+		if len(extraChildren) > 0 {
+			var extraWG sync.WaitGroup
+			for _, cid := range extraChildren {
+				extraWG.Add(1)
+				go func(cid string) {
+					defer extraWG.Done()
+					if err := w.client.Interrupt(stopCtx, cid); err != nil {
+						slog.Error("failed to interrupt child subagent", "sessionID", cid, "err", err)
+					}
+				}(cid)
+			}
+			extraWG.Wait()
+		}
+
+		// Wait for interrupted child subagents to settle so their SubagentReport
+		// delivery (synthetic steer admission + wake(rootID)) completes before we clean
+		// up the parent inbox and interrupt any triggered parent wake.
+		if len(waitedChildren) > 0 {
+			waitCtx, waitCancel := context.WithTimeout(stopCtx, 10*time.Second)
+			var waitWG sync.WaitGroup
+			for _, cid := range waitedChildren {
+				waitWG.Add(1)
+				go func(cid string) {
+					defer waitWG.Done()
+					_ = w.client.WaitSession(waitCtx, cid)
+				}(cid)
+			}
+			waitWG.Wait()
+			waitCancel()
+		}
+
+		cancelSubagentReports := func() int {
+			items, err := w.client.ListInbox(stopCtx, rootID)
+			if err != nil || len(items) == 0 {
+				return 0
+			}
+			var toCancel []string
+			for _, item := range items {
+				if !isSubagentSyntheticInboxItem(item) || item.ID == "" {
+					continue
+				}
+				if !isRootTarget {
+					cid := subagentInboxChildID(item)
+					if cid == "" || !waitedChildSet[cid] {
+						continue
+					}
+				}
+				toCancel = append(toCancel, item.ID)
+			}
+			if len(toCancel) == 0 {
+				return 0
+			}
+			var cancelWG sync.WaitGroup
+			for _, inboxID := range toCancel {
+				cancelWG.Add(1)
+				go func(inboxID string) {
+					defer cancelWG.Done()
+					if err := w.client.CancelInbox(stopCtx, rootID, inboxID); err != nil {
+						slog.Debug("failed to cancel subagent synthetic inbox item", "sessionID", rootID, "inboxID", inboxID, "err", err)
+					}
+				}(inboxID)
+			}
+			cancelWG.Wait()
+			return len(toCancel)
+		}
+
+		cancelled := cancelSubagentReports()
+		if interruptParent && (len(waitedChildren) > 0 || cancelled > 0) {
+			_ = w.client.Interrupt(stopCtx, rootID)
+			rootWaitCtx, rootWaitCancel := context.WithTimeout(stopCtx, 5*time.Second)
+			_ = w.client.WaitSession(rootWaitCtx, rootID)
+			rootWaitCancel()
+			if cancelSubagentReports() > 0 {
+				_ = w.client.Interrupt(stopCtx, rootID)
+			} else if curActive, err := w.client.ActiveSessions(stopCtx); err == nil {
+				if _, stillActive := curActive[rootID]; stillActive {
+					_ = w.client.Interrupt(stopCtx, rootID)
+				}
+			}
+		} else if !isRootTarget && !interruptParent && len(waitedChildren) > 0 {
+			// If the user stopped a subagent directly while the main agent was already
+			// running, run a brief second inbox sweep to catch late-settling reports.
+			cancelSubagentReports()
+		}
+
 		return func() {
-			if err != nil {
-				slog.Error("failed to interrupt session", "err", err)
+			if targetErr != nil {
+				slog.Error("failed to interrupt session", "sessionID", sessionID, "err", targetErr)
+			}
+			w.finishStopSuppressionSoon(rootID, gen, w.effectiveStopSuppressionTail())
+			w.loadChildSubagents(rootID)
+			w.reconcileTail(rootID)
+			if !isRootTarget {
+				w.reconcileTail(sessionID)
 			}
 		}
 	})
@@ -12064,13 +12632,11 @@ func (w *Window) setConvActive(sessionID string, active bool) {
 			conv.scroll.ScrollToBottomIfBottomed()
 		}
 	}
-	if !active && w.escStopArmedSess == sessionID {
+	if !active && w.escStopArmedSess == sessionID && (tab.activeSubID != "" || !w.isTabStoppable(tab)) {
 		w.disarmEscStop()
 	}
 	if w.currentTab() == tab {
-		if tab.activeConv() == conv {
-			w.updateBusyState(active)
-		}
+		w.updateBusyState(w.isTabStoppable(tab))
 		w.updateBottomBar(tab)
 	}
 	w.updateSwitcherIndicators()
@@ -12289,11 +12855,27 @@ func (w *Window) handleEvent(ev opencode.Event) {
 		if json.Unmarshal(ev.Data, &d) == nil {
 			applyCreated := func(sess opencode.Session) {
 				if sess.ParentID != "" {
-					if tab, ok := w.tabs[sess.ParentID]; ok {
-						w.upsertSubagent(tab, sess)
-						if w.currentTab() == tab {
-							w.updateBottomBar(tab)
-							w.rebuildSubagentList(tab)
+					parentTab := w.tabs[sess.ParentID]
+					if parentTab == nil {
+						if rootID := w.childToRoot[sess.ParentID]; rootID != "" {
+							parentTab = w.tabs[rootID]
+						}
+					}
+					if parentTab != nil {
+						w.upsertSubagent(parentTab, sess)
+						if w.currentTab() == parentTab {
+							w.updateBottomBar(parentTab)
+							w.rebuildSubagentList(parentTab)
+						}
+						if sess.IsRunning() && w.shouldInterruptChildDiscovery(sess.ID) && w.client != nil {
+							ctx := w.ctx
+							if ctx == nil {
+								ctx = context.Background()
+							}
+							childID := sess.ID
+							go func() {
+								_ = w.client.Interrupt(ctx, childID)
+							}()
 						}
 					}
 				} else if sess.ID != "" && !w.archivedSessions[sess.ID] {
@@ -12456,6 +13038,16 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.execution.started":
 		var d opencode.SessionIDEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if w.shouldInterruptOnStart(d.SessionID) && w.client != nil {
+				ctx := w.ctx
+				if ctx == nil {
+					ctx = context.Background()
+				}
+				sessID := d.SessionID
+				go func() {
+					_ = w.client.Interrupt(ctx, sessID)
+				}()
+			}
 			w.updateSessionActivityState(d.SessionID, true)
 			w.revealActiveSession(d.SessionID)
 			tab, conv := w.resolveEventConv(d.SessionID)
@@ -12591,6 +13183,9 @@ func (w *Window) handleEvent(ev opencode.Event) {
 	case "session.inbox.enqueued":
 		var d opencode.InboxEvent
 		if json.Unmarshal(ev.Data, &d) == nil && d.SessionID != "" {
+			if w.handleSuppressedInboxEvent(d) {
+				break
+			}
 			tab, conv := w.resolveEventConv(d.SessionID)
 			w.touchSessionUpdated(tab, conv, time.Now().UnixMilli())
 			if conv != nil {
@@ -13135,6 +13730,16 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						})
 						if st == "" || st == "running" {
 							w.setSubagentActive(childID, true, "")
+							if w.shouldInterruptChildDiscovery(childID) && w.client != nil {
+								ctx := w.ctx
+								if ctx == nil {
+									ctx = context.Background()
+								}
+								cid := childID
+								go func() {
+									_ = w.client.Interrupt(ctx, cid)
+								}()
+							}
 						} else {
 							w.setSubagentActive(childID, false, st)
 						}
@@ -13214,6 +13819,16 @@ func (w *Window) handleEvent(ev opencode.Event) {
 						if st == "running" {
 							w.setSubagentActive(childID, true, "")
 							w.loadChildSubagents(tab.main.session.ID)
+							if w.shouldInterruptChildDiscovery(childID) && w.client != nil {
+								ctx := w.ctx
+								if ctx == nil {
+									ctx = context.Background()
+								}
+								cid := childID
+								go func() {
+									_ = w.client.Interrupt(ctx, cid)
+								}()
+							}
 						} else {
 							w.setSubagentActive(childID, false, cmp.Or(st, "succeeded"))
 						}
