@@ -5989,3 +5989,109 @@ func TestSessionContextMenuAndDeletion(t *testing.T) {
 		t.Fatalf("expected ses_ctx_2 archived and tab removed, archived=%v tab=%v", win.archivedSessions[s2.ID], win.tabs[s2.ID])
 	}
 }
+
+func TestShellToolOutputStatsBadge(t *testing.T) {
+	// 1. Compact byte formatting (0 decimal places).
+	if got := formatCompactBytes(0); got != "0B" {
+		t.Fatalf("formatCompactBytes(0) = %q, want 0B", got)
+	}
+	if got := formatCompactBytes(23); got != "23B" {
+		t.Fatalf("formatCompactBytes(23) = %q, want 23B", got)
+	}
+	if got := formatCompactBytes(1024); got != "1KiB" {
+		t.Fatalf("formatCompactBytes(1024) = %q, want 1KiB", got)
+	}
+	if got := formatCompactBytes(3072); got != "3KiB" {
+		t.Fatalf("formatCompactBytes(3072) = %q, want 3KiB", got)
+	}
+	if got := formatCompactBytes(1536); got != "2KiB" {
+		t.Fatalf("formatCompactBytes(1536) = %q, want 2KiB", got)
+	}
+	if got := formatCompactBytes(1048575); got != "1MiB" {
+		t.Fatalf("formatCompactBytes(1048575) = %q, want 1MiB", got)
+	}
+
+	if !gtk.InitCheck() {
+		t.Skip("no display")
+	}
+
+	badgeLabels := func(tw *ToolWidget) []string {
+		out := make([]string, 0, len(tw.badgeWidgets))
+		for _, lbl := range tw.badgeWidgets {
+			out = append(out, lbl.Label())
+		}
+		return out
+	}
+
+	// 2. Foreground shell/bash shows byte-size badge only once done, even when collapsed.
+	tw := NewToolWidget(t.Context(), "call_sh_stats", "shell", nil)
+	tw.SetStatus("running")
+	tw.SetInput(map[string]any{"command": "ls"})
+	if got := badgeLabels(tw); len(got) != 0 {
+		t.Fatalf("expected no badges while running, got %v", got)
+	}
+
+	tw.SetStatus("completed")
+	tw.SetOutput([]opencode.ToolContentItem{
+		{Type: "text", Text: "alpha\nbeta\ngamma\n"},
+		{Type: "text", Text: "You will be notified automatically when the command finishes."},
+	}, nil)
+	if got := badgeLabels(tw); len(got) != 1 || got[0] != "17B" {
+		t.Fatalf("expected ['17B'] on completed collapsed shell, got %v", got)
+	}
+
+	// Re-applying input must preserve the shell output size badge.
+	tw.SetInput(map[string]any{"command": "ls -la"})
+	if got := badgeLabels(tw); len(got) != 1 || got[0] != "17B" {
+		t.Fatalf("expected size badge preserved after SetInput, got %v", got)
+	}
+
+	// Empty completed shell output displays 0B.
+	twEmpty := NewToolWidget(t.Context(), "call_sh_empty", "bash", nil)
+	twEmpty.SetStatus("completed")
+	twEmpty.SetInput(map[string]any{"command": "true"})
+	twEmpty.SetOutput(nil, nil)
+	if got := badgeLabels(twEmpty); len(got) != 1 || got[0] != "0B" {
+		t.Fatalf("expected ['0B'] on empty completed bash, got %v", got)
+	}
+
+	// 3. Background shell omits size badge while running (even though partStatus == "completed"),
+	// ignores background handoff/placeholder strings, and shows liveShellOutput size once completed.
+	twBg := NewToolWidget(t.Context(), "call_sh_bg", "shell", nil)
+	twBg.SetInput(map[string]any{"command": "sleep 1", "background": true})
+	twBg.SetStatus("completed")
+	twBg.SetOutput([]opencode.ToolContentItem{{
+		Type: "text",
+		Text: "Command moved to the background (shell ID: sh_bg1).\nOutput is streaming to: /tmp/bg1.out",
+	}}, nil)
+	twBg.SetMetadata(map[string]any{"shellID": "sh_bg1", "status": "running"})
+	twBg.SetShellLiveOutput("Waiting for output…")
+	if got := badgeLabels(twBg); len(got) != 1 || got[0] != "Background" {
+		t.Fatalf("expected only ['Background'] while background shell running, got %v", got)
+	}
+
+	twBg.SetShellLiveOutput("line 1\nline 2")
+	if got := badgeLabels(twBg); len(got) != 1 || got[0] != "Background" {
+		t.Fatalf("expected size badge hidden while background shell still running, got %v", got)
+	}
+
+	twBg.SetBackgroundStatus("completed")
+	if got := badgeLabels(twBg); len(got) != 2 || got[0] != "Background" || got[1] != "13B" {
+		t.Fatalf("expected ['Background', '13B'] once background shell completed, got %v", got)
+	}
+
+	// 4. Read tool shows offset:limit badge (e.g. "1:151") and non-shell execute shows no size badge.
+	twRead := NewToolWidget(t.Context(), "call_read_range", "read", nil)
+	twRead.SetInput(map[string]any{"path": "configuration.nix", "offset": 1, "limit": 150})
+	if got := badgeLabels(twRead); len(got) != 1 || got[0] != "1:151" {
+		t.Fatalf("expected ['1:151'] on read tool, got %v", got)
+	}
+
+	twExec := NewToolWidget(t.Context(), "call_exec", "execute", nil)
+	twExec.SetStatus("completed")
+	twExec.SetInput(map[string]any{"code": "1 + 1"})
+	twExec.SetOutput([]opencode.ToolContentItem{{Type: "text", Text: "2\n"}}, nil)
+	if got := badgeLabels(twExec); len(got) != 0 {
+		t.Fatalf("expected no shell size badge on execute tool, got %v", got)
+	}
+}

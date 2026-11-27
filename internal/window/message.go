@@ -310,6 +310,9 @@ type ToolWidget struct {
 	shellFile          string
 	liveShellOutput    string
 	appliedShellOutput string
+	shellOutputText    string
+	hasShellOutput     bool
+	shellStatsBadge    *gtk.Label
 	childSessionID     string
 	baseDir            string
 	rawFilePath        string
@@ -654,14 +657,20 @@ func setInitialToolIcon(icon *gtk.Image, name string) {
 }
 
 func (t *ToolWidget) clearBadges() {
-	for _, lbl := range t.badgeWidgets {
-		t.badgesBox.Remove(lbl)
+	if t.badgesBox != nil {
+		for _, lbl := range t.badgeWidgets {
+			t.badgesBox.Remove(lbl)
+		}
 	}
 	t.badgeWidgets = nil
 	t.hasBgBadge = false
+	t.shellStatsBadge = nil
 }
 
 func (t *ToolWidget) addBadge(text, cssClass string) {
+	if t.badgesBox == nil {
+		return
+	}
 	lbl := gtk.NewLabel(text)
 	lbl.AddCSSClass("glup-tool-badge")
 	if cssClass != "" {
@@ -677,6 +686,96 @@ func (t *ToolWidget) ensureBackgroundBadge() {
 	}
 	t.hasBgBadge = true
 	t.addBadge("Background", "glup-tool-badge-bg")
+}
+
+func formatCompactBytes(n int) string {
+	if n <= 0 {
+		return "0B"
+	}
+	if n < 1024 {
+		return fmt.Sprintf("%dB", n)
+	}
+	units := []string{"KiB", "MiB", "GiB", "TiB"}
+	val := float64(n) / 1024
+	for i, unit := range units {
+		if val < 1023.5 || i == len(units)-1 {
+			return fmt.Sprintf("%.0f%s", math.Round(val), unit)
+		}
+		val /= 1024
+	}
+	return fmt.Sprintf("%dB", n)
+}
+
+func (t *ToolWidget) removeShellStatsBadge() {
+	if t.shellStatsBadge == nil {
+		return
+	}
+	if t.badgesBox != nil {
+		t.badgesBox.Remove(t.shellStatsBadge)
+	}
+	t.badgeWidgets = slices.DeleteFunc(t.badgeWidgets, func(lbl *gtk.Label) bool {
+		return lbl == t.shellStatsBadge
+	})
+	t.shellStatsBadge = nil
+}
+
+func (t *ToolWidget) syncShellOutputBadge() {
+	if !isShellToolName(t.toolName) {
+		return
+	}
+	effective := t.partStatus
+	if effective == "completed" && t.metaStatus == "running" {
+		effective = "running"
+	}
+	done := effective == "completed" || effective == "error" || effective == "failed"
+	hasLive := t.liveShellOutput != "" && t.liveShellOutput != "Waiting for output…"
+	if !done || (!t.hasShellOutput && !hasLive) {
+		t.removeShellStatsBadge()
+		return
+	}
+	if t.badgesBox == nil {
+		return
+	}
+	var text string
+	if hasLive {
+		text = t.liveShellOutput
+	} else {
+		text = t.shellOutputText
+	}
+	label := formatCompactBytes(len(text))
+	if t.shellStatsBadge != nil {
+		if t.shellStatsBadge.Label() != label {
+			t.shellStatsBadge.SetLabel(label)
+		}
+		return
+	}
+	t.addBadge(label, "")
+	if n := len(t.badgeWidgets); n > 0 {
+		t.shellStatsBadge = t.badgeWidgets[n-1]
+	}
+}
+
+func (t *ToolWidget) recordShellOutputFromItems(items []opencode.ToolContentItem) {
+	var sb strings.Builder
+	for _, item := range items {
+		txt := strings.TrimSpace(item.Text)
+		if txt == "" {
+			continue
+		}
+		if strings.HasPrefix(txt, "You will be notified automatically when the command finishes.") {
+			continue
+		}
+		if strings.HasPrefix(txt, "Command moved to the background") {
+			continue
+		}
+		if sb.Len() > 0 && !strings.HasSuffix(sb.String(), "\n") {
+			sb.WriteByte('\n')
+		}
+		sb.WriteString(item.Text)
+	}
+	t.shellOutputText = sb.String()
+	t.hasShellOutput = true
+	t.syncShellOutputBadge()
 }
 
 func setViewSessionButtonContent(btn *gtk.Button) {
@@ -1000,13 +1099,16 @@ func (t *ToolWidget) SetShellLiveOutput(text string) {
 		}
 		t.liveShellOutput = text
 		t.lazyShellLiveDirty = true
+		t.syncShellOutputBadge()
 		return
 	}
 	if t.liveShellOutput == text && t.appliedShellOutput == text && t.outputScroll != nil && t.outputScroll.Visible() {
+		t.syncShellOutputBadge()
 		return
 	}
 	t.lazyShellLiveDirty = false
 	t.applyShellLiveOutput(text)
+	t.syncShellOutputBadge()
 }
 
 func (t *ToolWidget) applyShellLiveOutput(text string) {
@@ -1099,6 +1201,7 @@ func (t *ToolWidget) syncStatus() {
 		t.spinner.SetVisible(false)
 		t.statusLabel.SetVisible(false)
 	}
+	t.syncShellOutputBadge()
 }
 
 // SetInput sets and formats the tool's input parameters or diff view.
@@ -1184,6 +1287,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		} else {
 			t.setInputText("", false)
 		}
+		t.syncShellOutputBadge()
 
 	case "read":
 		path := firstToolInputString(m, "path", "filePath", "file_path", "file", "filename")
@@ -1193,7 +1297,7 @@ func (t *ToolWidget) SetInput(raw any) {
 		offset := toInt(m["offset"])
 		limit := toInt(m["limit"])
 		if offset > 0 && limit > 0 {
-			t.addBadge(fmt.Sprintf("lines %d–%d", offset, offset+limit), "")
+			t.addBadge(fmt.Sprintf("%d:%d", offset, offset+limit), "")
 		} else if limit > 0 {
 			t.addBadge(fmt.Sprintf("limit=%d", limit), "")
 		} else if offset > 0 {
@@ -1641,6 +1745,9 @@ func (t *ToolWidget) extractSubagentIDFromItems(items []opencode.ToolContentItem
 // does not shape/wrap large hidden outputs on session load.
 func (t *ToolWidget) SetOutput(items []opencode.ToolContentItem, errVal any) {
 	t.lazyShellLiveDirty = false
+	if isShellToolName(t.toolName) {
+		t.recordShellOutputFromItems(items)
+	}
 	if t.isDetailsCollapsed() && errVal == nil {
 		if isSubagentTool(t.toolName) {
 			t.extractSubagentIDFromItems(items)
